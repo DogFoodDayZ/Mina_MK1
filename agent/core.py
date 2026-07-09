@@ -433,55 +433,156 @@ REQUIRED OUTPUT FORMAT:
 
         return " ".join(parts[:max_sentences]).strip()
 
+    def _extract_memory_request_parts(self, user_query: str) -> List[str]:
+        q = (user_query or "").strip().lower()
+        if not q:
+            return []
+
+        q = q.replace("?", " ")
+        q = re.sub(r"\b(what is|what's|what are|tell me|do you remember|can you remember|recall)\b", " ", q)
+        q = re.sub(r"\b(my|the|a|an|please|about|for|to|of)\b", " ", q)
+        q = re.sub(r"\s+", " ", q).strip()
+
+        if " and " not in q:
+            return []
+
+        parts = [p.strip(" ,.;:") for p in q.split(" and ") if p.strip(" ,.;:")]
+        cleaned: List[str] = []
+        for p in parts:
+            p = re.sub(r"\b(is|are|was|were)\b", " ", p)
+            p = re.sub(r"\s+", " ", p).strip()
+            if p:
+                cleaned.append(p)
+        return cleaned[:3]
+
+    def _sanitize_memory_fact_line(self, line: str) -> str:
+        txt = (line or "").strip().lstrip("- ").strip()
+        if not txt:
+            return ""
+
+        if txt.lower().startswith("no matching memories found"):
+            return ""
+
+        txt = re.sub(r"^\s*(store|save|remember|note|add|keep)\s+", "", txt, flags=re.IGNORECASE)
+        txt = self._clean_response_text(txt)
+        txt = self._normalize_memory_reply_perspective("my", txt)
+
+        if not txt:
+            return ""
+
+        # Keep the first declarative sentence only.
+        for sent in re.split(r"(?<=[.!?])\s+", txt):
+            s = sent.strip()
+            if not s:
+                continue
+            if s.endswith("?"):
+                continue
+            low = s.lower()
+            if any(x in low for x in ["curiosity", "mystery", "wondering"]):
+                continue
+            if re.match(r"^(what|when|where|who|why|how|can|do|is|are)\b", low):
+                continue
+            if s[-1] not in ".!?":
+                s += "."
+            return s
+
+        return ""
+
+    def _select_memory_facts_for_parts(self, parts: List[str], facts: List[str]) -> Tuple[List[str], List[str]]:
+        if not parts:
+            picked = [facts[0]] if facts else []
+            return picked, []
+
+        selected: List[str] = []
+        missing: List[str] = []
+        used = set()
+        stop = {"color", "date", "birthdate", "birthday", "eyes", "eye"}
+
+        for part in parts:
+            tokens = [t for t in re.findall(r"[a-z0-9]+", part.lower()) if len(t) > 2 and t not in stop]
+            if not tokens:
+                tokens = [part.lower()]
+
+            hit = ""
+            for idx, fact in enumerate(facts):
+                if idx in used:
+                    continue
+                low = fact.lower()
+                def _tok_variants(tok: str) -> List[str]:
+                    base = tok[:-1] if tok.endswith("s") and len(tok) > 3 else tok
+                    return list({tok, base, f"{base}s"})
+
+                if any(any(v in low for v in _tok_variants(tok)) for tok in tokens) or part.lower() in low:
+                    hit = fact
+                    used.add(idx)
+                    break
+
+            if hit:
+                selected.append(hit)
+            else:
+                missing.append(part)
+
+        return selected, missing
+
     def _build_memory_read_reply(
         self,
         messages: List[Dict[str, str]],
         user_query: str,
         formatted: str,
     ) -> str:
-        fact_lines = [
-            ln.strip().lstrip("- ").strip()
+        raw_lines = [
+            ln.strip()
             for ln in (formatted or "").splitlines()
             if ln.strip()
         ]
 
-        if not fact_lines:
-            return "I do not have that in memory yet."
+        clean_facts: List[str] = []
+        seen = set()
+        for ln in raw_lines:
+            s = self._sanitize_memory_fact_line(ln)
+            if not s:
+                continue
+            norm = " ".join(s.lower().split())
+            if norm in seen:
+                continue
+            seen.add(norm)
+            clean_facts.append(s)
 
-        primary_fact = self._normalize_memory_reply_perspective(user_query, fact_lines[0])
-        primary_fact = self._clean_response_text(primary_fact)
-        if primary_fact and primary_fact[-1] not in ".!?":
-            primary_fact += "."
+        if not clean_facts:
+            return "Gremlin memory ping: I do not have that in memory yet."
 
-        memory_messages = list(messages)
-        memory_messages.append({
-            "role": "user",
-            "content": user_query,
-        })
-        memory_messages.append({
-            "role": "system",
-            "content": (
-                "You are Mina. Reply in a warm, natural Mina tone in at most two short sentences.\n"
-                "You must include this exact verified fact sentence once and exactly as written:\n"
-                f"{primary_fact}\n"
-                "Do not change the fact wording, names, numbers, or attributes.\n"
-                "You may add brief personality words before or after it.\n"
-                "No markdown, no bullets, no extra facts, no questions."
-            ),
-        })
+        parts = self._extract_memory_request_parts(user_query)
+        selected, missing = self._select_memory_facts_for_parts(parts, clean_facts)
+        if not selected:
+            selected = [clean_facts[0]]
 
-        try:
-            reply = self.model.chat(memory_messages)
-            styled = self._clean_response_text(self._extract_text(reply))
-            styled = self._normalize_memory_reply_perspective(user_query, styled)
-            styled = self._cap_sentences(styled, max_sentences=2)
+        if missing and selected:
+            selected_text = " ".join(selected).lower()
+            refined_missing: List[str] = []
+            for part in missing:
+                toks = [t for t in re.findall(r"[a-z0-9]+", part.lower()) if len(t) > 2]
+                covered = False
+                for tok in toks:
+                    base = tok[:-1] if tok.endswith("s") and len(tok) > 3 else tok
+                    variants = {tok, base, f"{base}s"}
+                    if any(v in selected_text for v in variants):
+                        covered = True
+                        break
+                if not covered:
+                    refined_missing.append(part)
+            missing = refined_missing
 
-            if primary_fact and primary_fact.lower() in styled.lower():
-                return styled
-        except Exception:
-            traceback.print_exc()
+        first_sentence = "Gremlin memory ping: " + " ".join(selected[:2]).strip()
+        if first_sentence and first_sentence[-1] not in ".!?":
+            first_sentence += "."
 
-        return primary_fact or "I do not have that in memory yet."
+        second_sentence = ""
+        if missing:
+            second_sentence = "I do not have your " + ", ".join(missing) + " in memory yet."
+
+        merged = " ".join([x for x in [first_sentence, second_sentence] if x]).strip()
+        merged = self._normalize_memory_reply_perspective(user_query, merged)
+        return self._cap_sentences(merged, max_sentences=2)
 
     def _generate_file_content_from_intent(
         self,

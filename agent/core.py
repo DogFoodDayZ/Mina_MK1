@@ -321,6 +321,10 @@ class MK1Core:
                 continue
             if low in {"---", "important rules:"}:
                 continue
+            if re.match(r"^\s*mina-style sentence", low):
+                ln = re.sub(r"^\s*mina-style sentence[^:]*:\s*", "", ln, flags=re.IGNORECASE)
+                if not ln.strip():
+                    continue
             kept.append(ln)
 
         out = "\n".join(kept).strip()
@@ -450,10 +454,65 @@ REQUIRED OUTPUT FORMAT:
         cleaned: List[str] = []
         for p in parts:
             p = re.sub(r"\b(is|are|was|were)\b", " ", p)
+            p = re.sub(r"\bhow old am i(?: today)?(?: down to the minute)?\b", " ", p)
             p = re.sub(r"\s+", " ", p).strip()
             if p:
                 cleaned.append(p)
         return cleaned[:3]
+
+    def _extract_memory_slots(self, user_query: str) -> Dict[str, bool]:
+        q = (user_query or "").lower()
+        return {
+            "birthdate": bool(re.search(r"\b(birthdate|birthday|date of birth|dob)\b", q)),
+            "eye_color": bool(re.search(r"\b(eye color|eyes color|eye|eyes)\b", q)),
+            "age": bool(re.search(r"\bhow old\b|\bage\b", q)),
+        }
+
+    def _pick_fact_for_keywords(self, facts: List[str], keywords: List[str], used: set) -> str:
+        for idx, fact in enumerate(facts):
+            if idx in used:
+                continue
+            low = fact.lower()
+            if any(k in low for k in keywords):
+                used.add(idx)
+                return fact
+        return ""
+
+    def _parse_birthdate_from_text(self, text: str) -> Optional[datetime]:
+        src = (text or "").strip().rstrip(".")
+        if not src:
+            return None
+
+        month_rx = r"(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)"
+        m = re.search(rf"{month_rx}\s+\d{{1,2}},?\s+\d{{4}}", src, re.IGNORECASE)
+        if m:
+            token = m.group(0)
+            for fmt in ["%B %d %Y", "%B %d, %Y", "%b %d %Y", "%b %d, %Y"]:
+                try:
+                    return datetime.strptime(token, fmt)
+                except Exception:
+                    pass
+
+        m2 = re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b", src)
+        if m2:
+            token = m2.group(0)
+            for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y", "%d-%m-%Y"]:
+                try:
+                    return datetime.strptime(token, fmt)
+                except Exception:
+                    pass
+
+        return None
+
+    def _compute_age_sentence(self, birth_dt: datetime) -> str:
+        now = datetime.now()
+        b = birth_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        if b > now:
+            return "I cannot compute age from a future birthdate."
+
+        years = now.year - b.year - ((now.month, now.day, now.hour, now.minute) < (b.month, b.day, 0, 0))
+        minutes = int((now - b).total_seconds() // 60)
+        return f"As of now, you are {years} years old, about {minutes:,} minutes old."
 
     def _sanitize_memory_fact_line(self, line: str) -> str:
         txt = (line or "").strip().lstrip("- ").strip()
@@ -464,6 +523,12 @@ REQUIRED OUTPUT FORMAT:
             return ""
 
         txt = re.sub(r"^\s*(store|save|remember|note|add|keep)\s+", "", txt, flags=re.IGNORECASE)
+        txt = re.sub(
+            r"[,;:\-]?\s*(?:save|store|remember|keep)(?:\s+(?:this|that))?(?:\s+please)?[.!?]*$",
+            "",
+            txt,
+            flags=re.IGNORECASE,
+        ).strip()
         txt = self._clean_response_text(txt)
         txt = self._normalize_memory_reply_perspective("my", txt)
 
@@ -551,35 +616,77 @@ REQUIRED OUTPUT FORMAT:
         if not clean_facts:
             return "Gremlin memory ping: I do not have that in memory yet."
 
-        parts = self._extract_memory_request_parts(user_query)
-        selected, missing = self._select_memory_facts_for_parts(parts, clean_facts)
-        if not selected:
-            selected = [clean_facts[0]]
+        slots = self._extract_memory_slots(user_query)
+        used = set()
+        selected: List[str] = []
+        missing: List[str] = []
 
-        if missing and selected:
-            selected_text = " ".join(selected).lower()
-            refined_missing: List[str] = []
-            for part in missing:
-                toks = [t for t in re.findall(r"[a-z0-9]+", part.lower()) if len(t) > 2]
-                covered = False
-                for tok in toks:
-                    base = tok[:-1] if tok.endswith("s") and len(tok) > 3 else tok
-                    variants = {tok, base, f"{base}s"}
-                    if any(v in selected_text for v in variants):
-                        covered = True
-                        break
-                if not covered:
-                    refined_missing.append(part)
-            missing = refined_missing
+        if any(slots.values()):
+            birth_fact = ""
+            eye_fact = ""
 
-        first_sentence = "Gremlin memory ping: " + " ".join(selected[:2]).strip()
-        if first_sentence and first_sentence[-1] not in ".!?":
-            first_sentence += "."
+            if slots.get("birthdate") or slots.get("age"):
+                birth_fact = self._pick_fact_for_keywords(
+                    clean_facts,
+                    ["birthdate", "birthday", "date of birth", "dob"],
+                    used,
+                )
+                if birth_fact and slots.get("birthdate"):
+                    selected.append(birth_fact)
+                if not birth_fact and slots.get("birthdate"):
+                    missing.append("birthdate")
 
-        second_sentence = ""
+            if slots.get("eye_color"):
+                eye_fact = self._pick_fact_for_keywords(
+                    clean_facts,
+                    ["eye color", "eyes", "eye"],
+                    used,
+                )
+                if eye_fact:
+                    selected.append(eye_fact)
+                else:
+                    missing.append("eye color")
+
+            age_sentence = ""
+            if slots.get("age"):
+                if birth_fact:
+                    bdt = self._parse_birthdate_from_text(birth_fact)
+                    if bdt:
+                        age_sentence = self._compute_age_sentence(bdt)
+                    else:
+                        missing.append("enough birthdate detail to compute age")
+                else:
+                    missing.append("birthdate to compute age")
+        else:
+            parts = self._extract_memory_request_parts(user_query)
+            selected, missing = self._select_memory_facts_for_parts(parts, clean_facts)
+            if not selected:
+                selected = [clean_facts[0]]
+            age_sentence = ""
+
+        selected_for_sentence = [re.sub(r"[.!?]+$", "", s).strip() for s in selected[:2] if s.strip()]
+        if len(selected_for_sentence) >= 2:
+            first_sentence = "Gremlin memory ping: " + " and ".join(selected_for_sentence[:2]).strip() + "."
+        elif selected_for_sentence:
+            first_sentence = "Gremlin memory ping: " + selected_for_sentence[0] + "."
+        else:
+            first_sentence = "Gremlin memory ping: I do not have that in memory yet."
+
+        second_chunks: List[str] = []
+        if age_sentence:
+            second_chunks.append(age_sentence)
         if missing:
-            second_sentence = "I do not have your " + ", ".join(missing) + " in memory yet."
+            uniq_missing = []
+            seen_missing = set()
+            for m in missing:
+                k = m.strip().lower()
+                if not k or k in seen_missing:
+                    continue
+                seen_missing.add(k)
+                uniq_missing.append(m)
+            second_chunks.append("I do not have your " + ", ".join(uniq_missing) + " in memory yet.")
 
+        second_sentence = " ".join(second_chunks).strip()
         merged = " ".join([x for x in [first_sentence, second_sentence] if x]).strip()
         merged = self._normalize_memory_reply_perspective(user_query, merged)
         return self._cap_sentences(merged, max_sentences=2)
@@ -2807,6 +2914,13 @@ IMPORTANT RULES:
 
             cleaned = re.sub(
                 r"\b(?:please\s+)?(?:save|store|remember|keep)\s+(?:this|that)\b[.!?]*$",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            cleaned = re.sub(
+                r"[,;:\-]?\s*(?:save|store|remember|keep)(?:\s+(?:this|that))?(?:\s+please)?[.!?]*$",
                 "",
                 cleaned,
                 flags=re.IGNORECASE,

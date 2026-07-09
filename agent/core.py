@@ -346,6 +346,71 @@ class MK1Core:
 
         return f"{out}\n\n{flair}"
 
+    def _render_tool_response_as_mina(
+        self,
+        messages: List[Dict[str, Any]],
+        user_input: str,
+        tool_name: str,
+        formatted: str,
+        tool_ok: bool,
+    ) -> str:
+        convo = list(messages)
+        convo.append({
+            "role": "user",
+            "content": user_input,
+        })
+
+        status = "success" if tool_ok else "failure"
+        convo.append({
+            "role": "assistant",
+            "content": f"""A tool was executed.
+
+Tool Name:
+{tool_name}
+
+Tool Status:
+{status}
+
+Verified Tool Output:
+{formatted}
+
+IMPORTANT RULES:
+- You are Mina. Reply with a little Mina flair.
+- Use ONLY the verified tool output above.
+- DO NOT invent files, commands, errors, paths, or test results.
+- If the tool failed, clearly say it failed and include the exact error details from the output.
+- Keep it concise and useful.
+
+REQUIRED OUTPUT FORMAT:
+1) One short Mina-style sentence.
+2) Then this exact marker line: VERIFIED OUTPUT:
+3) Then include the verified tool output verbatim in a fenced block:
+```text
+{formatted}
+```
+4) Do not add any other technical claims.
+""",
+        })
+
+        try:
+            reply = self.model.chat(convo)
+            text = self._clean_response_text(self._extract_text(reply))
+            while True:
+                lines = text.splitlines()
+                if not lines:
+                    break
+                first = lines[0].strip().lower()
+                if re.match(r'^\d+\)\s+', first):
+                    text = "\n".join(lines[1:]).strip()
+                    continue
+                break
+            if text.strip() and formatted.strip() and formatted.strip() in text:
+                return text.strip()
+        except Exception:
+            traceback.print_exc()
+
+        return self._with_mina_flair(formatted, tool_name)
+
     def _normalize_memory_reply_perspective(self, user_query: str, text: str) -> str:
         out = (text or "").strip()
         if not out:
@@ -2530,7 +2595,13 @@ class MK1Core:
             "github_repo",
             "ps_run",
         ):
-            content = self._with_mina_flair(formatted, tool_name)
+            content = self._render_tool_response_as_mina(
+                messages=messages,
+                user_input=user_input,
+                tool_name=tool_name,
+                formatted=formatted,
+                tool_ok=bool(result.get("ok", True)),
+            )
             return {
                 "choices": [
                     {

@@ -35,6 +35,95 @@ class LMStudioClient:
             "local-model",
         )
 
+        self._vision_support_cache_value: Optional[bool] = None
+        self._vision_support_cache_until: float = 0.0
+        self._vision_support_cache_ttl: float = float(os.getenv("MK1_VISION_CHECK_TTL", "30"))
+
+    def _supports_vision_by_name(self) -> bool:
+        model_name = str(self.default_model or "").lower()
+        vision_hints = [
+            "vision",
+            "-vl",
+            "vl-",
+            "llava",
+            "qwen2-vl",
+            "qwen2.5-vl",
+            "qwen-vl",
+            "minicpm-v",
+            "internvl",
+            "phi-3-vision",
+            "moondream",
+        ]
+        return any(h in model_name for h in vision_hints)
+
+    def _probe_vision_support(self) -> bool:
+        tiny_png_data_url = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7fNwAAAABJRU5ErkJggg=="
+        )
+
+        payload: Dict[str, Any] = {
+            "model": self.default_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image in one short phrase."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": tiny_png_data_url},
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "stream": False,
+        }
+
+        try:
+            resp = requests.post(
+                self.chat_url,
+                json=payload,
+                timeout=20,
+            )
+
+            if resp.status_code < 400:
+                return True
+
+            body = ""
+            try:
+                body = (resp.text or "").lower()
+            except Exception:
+                body = ""
+
+            known_non_vision_markers = [
+                "failed to load image or audio file",
+                "image input is not supported",
+                "does not support image",
+                "invalid image",
+                "unsupported content type",
+            ]
+            if any(m in body for m in known_non_vision_markers):
+                return False
+
+            return False
+        except Exception:
+            return self._supports_vision_by_name()
+
+    def supports_vision(self, force_refresh: bool = False) -> bool:
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._vision_support_cache_value is not None
+            and now < self._vision_support_cache_until
+        ):
+            return bool(self._vision_support_cache_value)
+
+        value = bool(self._probe_vision_support())
+        self._vision_support_cache_value = value
+        self._vision_support_cache_until = now + max(1.0, self._vision_support_cache_ttl)
+        return value
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -295,6 +384,88 @@ class MK1Core:
                     semantic_top_k=int(self.auto_promote_semantic_top_k),
                 )
 
+            fact = self._extract_personal_fact(user_input)
+            if fact:
+                self._store_user_fact_if_new(fact)
+
+        except Exception:
+            traceback.print_exc()
+
+    def _extract_personal_fact(self, text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+
+        low = raw.lower()
+        if "?" in raw:
+            return ""
+        if any(x in low for x in [" remember ", "store", "save this", "write this down"]):
+            return ""
+
+        # Core pattern: "my <attribute> is <value>"
+        m = re.search(r"\bmy\s+([a-z][a-z0-9_\- ]{1,40})\s+is\s+(.+)$", raw, re.IGNORECASE)
+        if not m:
+            return ""
+
+        attr = re.sub(r"\s+", " ", m.group(1).strip())
+        value = m.group(2).strip()
+        value = re.sub(
+            r"[,;:\-]?\s*(?:save|store|remember|keep)(?:\s+(?:this|that))?(?:\s+please)?[.!?]*$",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip()
+        value = value.strip(" .")
+
+        if not attr or not value:
+            return ""
+
+        fact = f"my {attr} is {value}"
+        return fact
+
+    def _store_user_fact_if_new(self, fact: str) -> None:
+        f = (fact or "").strip()
+        if not f:
+            return
+
+        try:
+            name_match = re.match(r"^my\s+name\s+is\s+(.+)$", f, re.IGNORECASE)
+            if name_match and hasattr(self.memory, "recent_memories") and hasattr(self.memory, "delete_memory_ids"):
+                target_name = name_match.group(1).strip().lower()
+                existing = self.memory.recent_memories(
+                    top_k=500,
+                    include_kinds=["fact"],
+                    include_tags=["user_memory", "profile_auto"],
+                )
+                delete_ids = []
+                for item in existing or []:
+                    text = (item.get("text") or "").strip()
+                    if not text:
+                        continue
+                    m = re.match(r"^my\s+name\s+is\s+(.+)$", text, re.IGNORECASE)
+                    if not m:
+                        continue
+                    current_name = m.group(1).strip().lower()
+                    if current_name and current_name != target_name:
+                        delete_ids.append(int(item.get("id") or 0))
+
+                if delete_ids:
+                    self.memory.delete_memory_ids(delete_ids)
+
+            exists = None
+            if hasattr(self.memory, "find_memory_id_by_text"):
+                exists = self.memory.find_memory_id_by_text(
+                    f,
+                    include_kinds=["fact", "preference", "procedure"],
+                    include_tags=["user_memory"],
+                )
+
+            if exists is None:
+                self.memory.add_memory(
+                    f,
+                    kind="fact",
+                    tags=["user_memory", "profile_auto"],
+                )
         except Exception:
             traceback.print_exc()
 
@@ -2323,6 +2494,7 @@ class MK1Core:
     def process(
         self,
         user_input: str,
+        image_attachment: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
         try:
@@ -2384,10 +2556,48 @@ class MK1Core:
             # NORMAL MODEL FLOW
             # =================================================
 
-            messages.append({
-                "role": "user",
-                "content": user_input,
-            })
+            image_meta: Optional[Dict[str, Any]] = None
+            if isinstance(image_attachment, dict):
+                image_meta = {
+                    "name": str(image_attachment.get("name") or "image"),
+                    "type": str(image_attachment.get("type") or "image/*"),
+                    "size": int(image_attachment.get("size") or 0),
+                    "data_url": str(image_attachment.get("data_url") or ""),
+                }
+
+            image_forwarded = False
+            if image_meta and image_meta.get("data_url"):
+                if self.model.supports_vision():
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": user_input,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_meta["data_url"],
+                                },
+                            },
+                        ],
+                    })
+                    image_forwarded = True
+                else:
+                    img_hint = (
+                        f"[Image staged: {image_meta['name']} "
+                        f"({image_meta['type']}, {max(1, image_meta['size'] // 1024)} KB)]"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": f"{user_input}\n\n{img_hint}",
+                    })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": user_input,
+                })
 
             reply = self.model.chat(
                 messages=messages,
@@ -2403,9 +2613,21 @@ class MK1Core:
                 assistant_text=final_text,
             )
 
-            return {
-                "reply": final_text
+            response: Dict[str, Any] = {
+                "reply": final_text,
             }
+
+            if image_meta is not None:
+                response["image"] = {
+                    "received": True,
+                    "name": image_meta.get("name"),
+                    "type": image_meta.get("type"),
+                    "size": image_meta.get("size"),
+                    "vision_model": self.model.supports_vision(),
+                    "forwarded_to_model": image_forwarded,
+                }
+
+            return response
 
 
         except Exception as e:

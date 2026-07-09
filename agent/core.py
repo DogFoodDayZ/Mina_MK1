@@ -1206,6 +1206,14 @@ class MK1Core:
                 "error": "not_a_git_repository",
             }
 
+        presync = self._git_safe_presync()
+        if not presync.get("ok"):
+            return {
+                "ok": False,
+                "result": None,
+                "error": f"presync_failed: {presync.get('error')}",
+            }
+
         add = self._run_git(["add", "-A"], timeout_sec=30)
         if not add.get("ok"):
             return {"ok": False, "result": None, "error": add.get("stderr") or "git_add_failed"}
@@ -1218,6 +1226,7 @@ class MK1Core:
                 "result": {
                     "snapshot_created": False,
                     "message": "no_changes_to_commit",
+                    "presync": presync.get("result", {}),
                     "files_changed": [],
                 },
                 "error": None,
@@ -1248,6 +1257,7 @@ class MK1Core:
             "result": {
                 "snapshot_created": True,
                 "message": msg,
+                "presync": presync.get("result", {}),
                 "commit": head.get("stdout", ""),
                 "files_changed": changed_files,
             },
@@ -1271,10 +1281,57 @@ class MK1Core:
             "error": None,
         }
 
+    def _git_safe_presync(self) -> Dict[str, Any]:
+        state = self._git_is_repo()
+        if not state.get("ok"):
+            return {"ok": False, "result": None, "error": "not_a_git_repository"}
+
+        upstream = self._run_git(
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            timeout_sec=10,
+        )
+
+        if not upstream.get("ok"):
+            return {
+                "ok": True,
+                "result": {
+                    "presync": "skipped",
+                    "reason": "no_upstream_tracking_branch",
+                    "output": "",
+                },
+                "error": None,
+            }
+
+        pulled = self._run_git(["pull", "--ff-only"], timeout_sec=120)
+        if not pulled.get("ok"):
+            return {
+                "ok": False,
+                "result": None,
+                "error": pulled.get("stderr") or "git_presync_pull_failed",
+            }
+
+        return {
+            "ok": True,
+            "result": {
+                "presync": "ok",
+                "reason": "upstream_synced",
+                "output": pulled.get("stdout", "") or pulled.get("stderr", ""),
+            },
+            "error": None,
+        }
+
     def _git_push(self) -> Dict[str, Any]:
         state = self._git_is_repo()
         if not state.get("ok"):
             return {"ok": False, "result": None, "error": "not_a_git_repository"}
+
+        presync = self._git_safe_presync()
+        if not presync.get("ok"):
+            return {
+                "ok": False,
+                "result": None,
+                "error": f"presync_failed: {presync.get('error')}",
+            }
 
         pushed = self._run_git(["push"], timeout_sec=120)
         if not pushed.get("ok"):
@@ -1283,6 +1340,7 @@ class MK1Core:
         return {
             "ok": True,
             "result": {
+                "presync": presync.get("result", {}),
                 "output": pushed.get("stdout", "") or pushed.get("stderr", ""),
             },
             "error": None,
@@ -1822,11 +1880,22 @@ class MK1Core:
                 return f"Git snapshot failed: {result.get('error')}"
             payload = result.get("result", {})
             if not payload.get("snapshot_created"):
-                return "No changes to commit. Working tree is clean."
+                lines = ["No changes to commit. Working tree is clean."]
+                presync = payload.get("presync", {}) if isinstance(payload.get("presync", {}), dict) else {}
+                if presync.get("presync") == "ok":
+                    lines.append("Pre-sync: fast-forward pull succeeded.")
+                elif presync.get("presync") == "skipped":
+                    lines.append(f"Pre-sync: skipped ({presync.get('reason')}).")
+                return "\n".join(lines)
             lines = [
                 f"Snapshot created: {payload.get('commit')}",
                 f"Message: {payload.get('message')}",
             ]
+            presync = payload.get("presync", {}) if isinstance(payload.get("presync", {}), dict) else {}
+            if presync.get("presync") == "ok":
+                lines.append("Pre-sync: fast-forward pull succeeded.")
+            elif presync.get("presync") == "skipped":
+                lines.append(f"Pre-sync: skipped ({presync.get('reason')}).")
             changed = payload.get("files_changed", [])
             if changed:
                 lines.append("Files:")
@@ -1843,7 +1912,14 @@ class MK1Core:
             if not result.get("ok"):
                 return f"Git push failed: {result.get('error')}"
             payload = result.get("result", {})
-            return payload.get("output") or "Git push completed."
+            lines = []
+            presync = payload.get("presync", {}) if isinstance(payload.get("presync", {}), dict) else {}
+            if presync.get("presync") == "ok":
+                lines.append("Pre-sync: fast-forward pull succeeded.")
+            elif presync.get("presync") == "skipped":
+                lines.append(f"Pre-sync: skipped ({presync.get('reason')}).")
+            lines.append(payload.get("output") or "Git push completed.")
+            return "\n".join(lines)
 
         if tool_name == "__project_tracker_status__":
             if not result.get("ok"):

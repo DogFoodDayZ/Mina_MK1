@@ -327,6 +327,25 @@ class MK1Core:
         out = re.sub(r"\n{3,}", "\n\n", out)
         return out
 
+    def _with_mina_flair(self, text: str, tool_name: str = "") -> str:
+        out = (text or "").strip()
+        if not out:
+            return out
+
+        # Keep raw file content exact.
+        if tool_name in {"file_read"}:
+            return out
+
+        low = out.lower()
+        if any(x in low for x in ["gremlin", "chaos", "*twinkle", "*cackles"]):
+            return out
+
+        flair = "Gremlin check complete."
+        if out[-1] not in ".!?":
+            out += "."
+
+        return f"{out}\n\n{flair}"
+
     def _normalize_memory_reply_perspective(self, user_query: str, text: str) -> str:
         out = (text or "").strip()
         if not out:
@@ -2511,11 +2530,12 @@ class MK1Core:
             "github_repo",
             "ps_run",
         ):
+            content = self._with_mina_flair(formatted, tool_name)
             return {
                 "choices": [
                     {
                         "message": {
-                            "content": formatted,
+                            "content": content,
                         }
                     }
                 ]

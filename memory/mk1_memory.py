@@ -4,6 +4,7 @@ import time
 import json
 import shutil
 import hashlib
+import re
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -584,6 +585,125 @@ class MK1Memory:
         except Exception as e:
             self._set_error(f"trim_by_size_error: {e}")
             return 0
+
+    def memory_hygiene(self, dry_run: bool = False, max_delete: int = 500) -> Dict[str, Any]:
+        """
+        Conservative memory cleanup pass:
+        - keeps user-authored long-term facts/preferences/procedures
+        - removes noisy interaction artifacts
+        - deduplicates repeated interaction lines (keeps latest 2 copies)
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT id, text, kind, tags, timestamp FROM memories ORDER BY timestamp DESC")
+            rows = cur.fetchall()
+
+            if not rows:
+                conn.close()
+                return {
+                    "ok": True,
+                    "dry_run": dry_run,
+                    "total_rows": 0,
+                    "delete_count": 0,
+                    "delete_ids": [],
+                    "samples": [],
+                }
+
+            def _norm_text(s: str) -> str:
+                return " ".join((s or "").strip().lower().split())
+
+            def _is_noise_interaction(text: str, kind: str, tags: List[str]) -> bool:
+                t = (text or "").strip()
+                low = t.lower()
+                tag_set = {x.lower() for x in tags}
+
+                if kind != "interaction":
+                    return False
+
+                # Keep explicit user-memory and durable fact/procedure lines.
+                if "user_memory" in tag_set:
+                    return False
+
+                if not t:
+                    return True
+
+                noise_patterns = [
+                    r"^mina-style output\s*:",
+                    r"^mina-sign-off\s*:",
+                    r"^verified output\s*:",
+                    r"^```text$",
+                    r"^```$",
+                    r"^gremlin memory ping:\s*i do not have that in memory yet\.?$",
+                    r"^gremlin memory check, incoming\.?",
+                ]
+
+                return any(re.search(p, low) is not None for p in noise_patterns)
+
+            delete_ids: List[int] = []
+            samples: List[str] = []
+            seen_interaction: Dict[str, int] = {}
+
+            for row in rows:
+                mem_id = int(row[0])
+                text = row[1] or ""
+                kind = row[2] or ""
+                tags = json.loads(row[3]) if row[3] else []
+
+                if _is_noise_interaction(text, kind, tags):
+                    delete_ids.append(mem_id)
+                    if len(samples) < 12:
+                        samples.append(text[:180])
+                    continue
+
+                # Deduplicate interaction spam: keep latest 2 copies.
+                if kind == "interaction":
+                    key = _norm_text(text)
+                    if key:
+                        count = seen_interaction.get(key, 0)
+                        if count >= 2:
+                            delete_ids.append(mem_id)
+                            if len(samples) < 12:
+                                samples.append(text[:180])
+                            continue
+                        seen_interaction[key] = count + 1
+
+                if len(delete_ids) >= max(1, int(max_delete)):
+                    break
+
+            delete_ids = delete_ids[:max(1, int(max_delete))]
+
+            if not dry_run and delete_ids:
+                # Best-effort backup before destructive maintenance.
+                self.backup(reason="memory_hygiene", force=False)
+
+                placeholders = ",".join(["?"] * len(delete_ids))
+                cur.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", tuple(delete_ids))
+                conn.commit()
+                self.small_index, self.base_index = self._rebuild_indexes()
+
+            conn.close()
+
+            return {
+                "ok": True,
+                "dry_run": dry_run,
+                "total_rows": len(rows),
+                "delete_count": len(delete_ids),
+                "delete_ids": delete_ids,
+                "samples": samples,
+            }
+
+        except Exception as e:
+            self._set_error(f"memory_hygiene_error: {e}")
+            return {
+                "ok": False,
+                "dry_run": dry_run,
+                "total_rows": 0,
+                "delete_count": 0,
+                "delete_ids": [],
+                "samples": [],
+                "error": str(e),
+            }
 
     # ================= MAINTENANCE CYCLE =================
 

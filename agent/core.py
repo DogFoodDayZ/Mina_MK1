@@ -1841,6 +1841,21 @@ class MK1Core:
         except Exception as e:
             return {"ok": False, "result": None, "error": str(e)}
 
+    def _memory_tidy(self, dry_run: bool = False) -> Dict[str, Any]:
+        try:
+            if hasattr(self.memory, "memory_hygiene"):
+                out = self.memory.memory_hygiene(dry_run=dry_run, max_delete=500)
+                if isinstance(out, dict):
+                    ok = bool(out.get("ok", False))
+                    return {
+                        "ok": ok,
+                        "result": out if ok else None,
+                        "error": None if ok else str(out.get("error") or "memory_hygiene_failed"),
+                    }
+            return {"ok": False, "result": None, "error": "memory_hygiene_not_supported"}
+        except Exception as e:
+            return {"ok": False, "result": None, "error": str(e)}
+
     def _startup_status(self) -> Dict[str, Any]:
         try:
             self.startup_context = self._build_startup_context()
@@ -2765,6 +2780,22 @@ class MK1Core:
 
             return "\n".join(lines)
 
+        if tool_name == "__memory_tidy__":
+            if not result.get("ok"):
+                return f"Memory tidy failed: {result.get('error')}"
+
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            lines = [
+                f"Mode: {'DRY RUN' if payload.get('dry_run') else 'APPLY'}",
+                f"Total memory rows scanned: {payload.get('total_rows')}",
+                f"Rows flagged for cleanup: {payload.get('delete_count')}",
+            ]
+            samples = payload.get("samples", []) if isinstance(payload.get("samples", []), list) else []
+            if samples:
+                lines.append("Sample cleaned items:")
+                lines.extend([f"- {s}" for s in samples[:10]])
+            return "\n".join(lines)
+
         if tool_name == "__project_bootstrap__":
             if not result.get("ok"):
                 return f"Project bootstrap failed: {result.get('error')}"
@@ -3003,6 +3034,10 @@ class MK1Core:
             )
         elif tool_name == "__memory_status__":
             result = self._memory_status()
+        elif tool_name == "__memory_tidy__":
+            result = self._memory_tidy(
+                dry_run=bool(tool_args.get("dry_run", False)),
+            )
         elif tool_name == "__project_bootstrap__":
             result = self._bootstrap_project(
                 project_name=str(tool_args.get("project", "") or ""),
@@ -3050,6 +3085,7 @@ class MK1Core:
             "__project_tracker_update__",
             "__project_bootstrap__",
             "__memory_status__",
+            "__memory_tidy__",
             "__scaffold__",
             "memory_write",
             "dir_list",
@@ -3415,6 +3451,19 @@ IMPORTANT RULES:
             "check memory",
         ]):
             return "__memory_status__", {}
+
+        if any(x in t for x in [
+            "tidy memory",
+            "clean memory",
+            "cleanup memory",
+            "prune memory",
+            "memory cleanup",
+            "memory tidy",
+            "manage memory",
+            "clear memory trash",
+        ]):
+            dry_run = any(x in t for x in ["preview", "dry run", "dry-run", "show only", "what would"])
+            return "__memory_tidy__", {"dry_run": dry_run}
 
         create_project_match = re.search(
             r'\bcreate\s+project\s+["\']?([^"\']+?)["\']?(?:\s|$)',

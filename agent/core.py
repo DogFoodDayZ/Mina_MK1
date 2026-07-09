@@ -2800,7 +2800,7 @@ IMPORTANT RULES:
         scaffold_intent = (
             re.search(r'\b(create|make|build|scaffold|setup)\b', t) is not None
             and (
-                re.search(r'\b(folder|directory|dir)\b', t) is not None
+                re.search(r'\b(folder|folders|directory|directories|dir)\b', t) is not None
                 and (
                     re.search(r'\b(file|files|script|scripts|module|modules)\b', t) is not None
                     or " with " in t
@@ -2808,6 +2808,16 @@ IMPORTANT RULES:
                 )
             )
         )
+
+        if not scaffold_intent:
+            scaffold_intent = (
+                "project scaffold" in t
+                or (
+                    "create project" in t
+                    and re.search(r'\b(src|tests?)\b', t) is not None
+                    and re.search(r'\b(file|files|directory|directories|folder|folders)\b', t) is not None
+                )
+            )
 
         if scaffold_intent:
             return "__scaffold__", {"request": raw_text}
@@ -3056,6 +3066,18 @@ IMPORTANT RULES:
             path = extract_file_write_path(raw_text)
             if not path:
                 return None, {}
+
+            # Guardrail: if target looks like a directory path in a scaffold-style request,
+            # route to scaffold logic instead of creating an extensionless file.
+            if (
+                not re.search(r'\.[A-Za-z0-9]{1,8}$', path)
+                and (
+                    "project scaffold" in t
+                    or re.search(r'\b(make|create)\b.*\b(project|structure)\b', t) is not None
+                    or re.search(r'\b(src|tests?)\b', t) is not None
+                )
+            ):
+                return "__scaffold__", {"request": raw_text}
 
             content = extract_file_write_content(raw_text, t)
 

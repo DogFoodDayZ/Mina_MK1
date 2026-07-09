@@ -6,6 +6,7 @@ import json
 import traceback
 import re
 import subprocess
+import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -265,6 +266,7 @@ class MK1Core:
         self._ensure_workspace_structure()
         self.startup_context = self._build_startup_context()
         self._seed_startup_memory_facts()
+        self.last_active_project_path: Optional[str] = None
 
     def _store_turn_memory(
         self,
@@ -458,6 +460,202 @@ class MK1Core:
         if not os.path.isabs(p):
             p = os.path.join(self.workspace_root, p)
         return os.path.abspath(p)
+
+    def _extract_path_from_text(self, text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+
+        quoted = re.findall(r'["\']([^"\']+)["\']', raw)
+        for q in quoted:
+            if re.search(r'^[A-Za-z]:\\', q) or re.search(r'^[.]{1,2}[\\/]', q):
+                return self._normalize_path(q)
+
+        m = re.search(r'([A-Za-z]:\\[^\n\r]+)', raw)
+        if m:
+            candidate = m.group(1).strip().rstrip('.,;:')
+            return self._normalize_path(candidate)
+
+        return ""
+
+    def _remember_active_project_path(self, path: str) -> None:
+        p = self._normalize_path(path)
+        if not p:
+            return
+        try:
+            if os.path.isfile(p):
+                p = os.path.dirname(p)
+            if os.path.isdir(p):
+                self.last_active_project_path = p
+        except Exception:
+            traceback.print_exc()
+
+    def _run_project_tests(self, request: str) -> Dict[str, Any]:
+        req = (request or "").strip()
+        target = self._extract_path_from_text(req)
+
+        low = req.lower()
+        if not target and any(x in low for x in ["this project", "current project", "that project"]):
+            target = self.last_active_project_path or ""
+
+        if not target:
+            target = self._infer_project_path_from_recent_memory()
+
+        if not target:
+            maybe_last = self.startup_context.get("last_worked_project") if isinstance(self.startup_context, dict) else None
+            if isinstance(maybe_last, dict):
+                target = str(maybe_last.get("path") or "").strip()
+
+        target = self._normalize_path(target) if target else ""
+        if not target:
+            return {"ok": False, "result": None, "error": "no_project_path_detected"}
+
+        if os.path.isfile(target):
+            target = os.path.dirname(target)
+
+        if not os.path.isdir(target):
+            return {"ok": False, "result": None, "error": f"project_path_not_found: {target}"}
+
+        self._remember_active_project_path(target)
+
+        py_exec = sys.executable if (sys.executable and os.path.isfile(sys.executable)) else "python"
+        cmd = [py_exec, "-m", "pytest", "-q"]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=target,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+
+            changed_files: List[str] = []
+            retried = False
+
+            if proc.returncode != 0 and "fix" in low:
+                changed_files = self._attempt_basic_test_autofix(target, stdout, stderr)
+                if changed_files:
+                    retried = True
+                    proc = subprocess.run(
+                        cmd,
+                        cwd=target,
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                    )
+                    stdout = (proc.stdout or "").strip()
+                    stderr = (proc.stderr or "").strip()
+
+            return {
+                "ok": proc.returncode == 0,
+                "result": {
+                    "project_path": target,
+                    "command": " ".join(cmd),
+                    "exit_code": proc.returncode,
+                    "retried_after_fix": retried,
+                    "changed_files": changed_files,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                },
+                "error": None if proc.returncode == 0 else (stderr or "pytest_failed"),
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "result": {
+                    "project_path": target,
+                    "command": " ".join(cmd),
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "",
+                },
+                "error": "pytest_timeout",
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "result": None,
+                "error": f"pytest_exception: {str(e)}",
+            }
+
+    def _attempt_basic_test_autofix(self, project_path: str, stdout: str, stderr: str) -> List[str]:
+        changed: List[str] = []
+        combined = f"{stdout}\n{stderr}".lower()
+
+        try:
+            # Common scaffold mismatch: test imports main() but generated file only prints at import time.
+            if "cannot import name 'main' from 'src.main'" in combined:
+                main_py = os.path.join(project_path, "src", "main.py")
+                if os.path.isfile(main_py):
+                    with open(main_py, "r", encoding="utf-8") as f:
+                        src = f.read()
+
+                    if re.search(r"^\s*def\s+main\s*\(", src, flags=re.MULTILINE) is None:
+                        msg = "'todo cli ready'"
+                        m = re.search(r"print\((.+?)\)", src)
+                        if m:
+                            msg = m.group(1).strip()
+
+                        fixed = (
+                            "def main() -> int:\n"
+                            f"    print({msg})\n"
+                            "    return 0\n\n\n"
+                            "if __name__ == '__main__':\n"
+                            "    raise SystemExit(main())\n"
+                        )
+
+                        with open(main_py, "w", encoding="utf-8") as f:
+                            f.write(fixed)
+
+                        changed.append(main_py)
+        except Exception:
+            traceback.print_exc()
+
+        return changed
+
+    def _infer_project_path_from_recent_memory(self) -> str:
+        candidates: List[str] = []
+
+        try:
+            recent = self.memory.recent_memories(top_k=120)
+        except Exception:
+            recent = []
+
+        for item in recent or []:
+            txt = str(item.get("text") or "")
+            if not txt:
+                continue
+
+            for m in re.finditer(r'([A-Za-z]:\\[^\s\"\']+)', txt):
+                p = m.group(1).strip().rstrip('.,;:')
+                p = self._normalize_path(p)
+                if os.path.isfile(p):
+                    p = os.path.dirname(p)
+                if not os.path.isdir(p):
+                    continue
+
+                has_tests = os.path.isdir(os.path.join(p, "tests"))
+                has_src = os.path.isdir(os.path.join(p, "src"))
+                if has_tests or has_src:
+                    candidates.append(p)
+
+        if not candidates:
+            return ""
+
+        # Prefer latest mention; dedupe while preserving order.
+        seen = set()
+        ordered = []
+        for p in reversed(candidates):
+            if p in seen:
+                continue
+            seen.add(p)
+            ordered.append(p)
+
+        return ordered[0] if ordered else ""
 
     def _ensure_workspace_structure(self) -> None:
         try:
@@ -1530,6 +1728,15 @@ class MK1Core:
                     errors.append(f"file_write {path}: {r.get('error')}")
 
         ok = len(errors) == 0 and (len(dir_created) > 0 or len(file_written) > 0 or len(file_skipped) > 0)
+
+        path_hints = [p for p in dir_created if p] + [os.path.dirname(p) for p in file_written if p]
+        if path_hints:
+            try:
+                root_hint = os.path.commonpath(path_hints)
+            except Exception:
+                root_hint = path_hints[0]
+            self._remember_active_project_path(root_hint)
+
         return {
             "ok": ok,
             "result": {
@@ -1921,6 +2128,31 @@ class MK1Core:
             lines.append(payload.get("output") or "Git push completed.")
             return "\n".join(lines)
 
+        if tool_name == "__project_test_run__":
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            lines = [
+                f"Project: {payload.get('project_path')}",
+                f"Command: {payload.get('command')}",
+                f"Exit code: {payload.get('exit_code')}",
+            ]
+            if payload.get("retried_after_fix"):
+                lines.append("Auto-fix retry: attempted")
+            changed = payload.get("changed_files", [])
+            if changed:
+                lines.append("Changed files:")
+                lines.extend([f"- {p}" for p in changed])
+
+            if not result.get("ok") and result.get("error"):
+                lines.append(f"Result: failed ({result.get('error')})")
+
+            stdout = (payload.get("stdout") or "").strip()
+            stderr = (payload.get("stderr") or "").strip()
+            if stdout:
+                lines.extend(["STDOUT:", stdout])
+            if stderr:
+                lines.extend(["STDERR:", stderr])
+            return "\n".join(lines)
+
         if tool_name == "__project_tracker_status__":
             if not result.get("ok"):
                 return f"Project tracker status failed: {result.get('error')}"
@@ -2205,6 +2437,10 @@ class MK1Core:
             result = self._git_pull()
         elif tool_name == "__git_push__":
             result = self._git_push()
+        elif tool_name == "__project_test_run__":
+            result = self._run_project_tests(
+                request=str(tool_args.get("request", user_input) or user_input),
+            )
         elif tool_name == "__project_tracker_status__":
             result = self._project_tracker_status()
         elif tool_name == "__project_tracker_update__":
@@ -2257,6 +2493,7 @@ class MK1Core:
             "__git_snapshot__",
             "__git_pull__",
             "__git_push__",
+            "__project_test_run__",
             "__project_tracker_status__",
             "__project_tracker_update__",
             "__project_bootstrap__",
@@ -2562,6 +2799,12 @@ IMPORTANT RULES:
             "push to github",
         ]):
             return "__git_push__", {}
+
+        if (
+            re.search(r'\b(run|execute|start)\b.*\b(test|tests|pytest)\b', t) is not None
+            or re.search(r'\b(run|execute)\s+pytest\b', t) is not None
+        ):
+            return "__project_test_run__", {"request": raw_text}
 
         if any(x in t for x in [
             "save snapshot",

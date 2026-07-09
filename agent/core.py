@@ -539,6 +539,9 @@ class MK1Core:
         ]):
             return ""
 
+        if re.match(r"^(mark|set|update|create|delete|remove|run|execute|list|show)\b", low_all):
+            return ""
+
         # Keep the first declarative sentence only.
         for sent in re.split(r"(?<=[.!?])\s+", txt):
             s = sent.strip()
@@ -792,6 +795,14 @@ class MK1Core:
                 )
                 if not birth_fact:
                     birth_fact = self._lookup_slot_fact("birthdate", user_query)
+                if not birth_fact and slots.get("age"):
+                    try:
+                        tool_out = self.tools.run("memory_read", {"query": "what is my birthdate", "top_k": 1})
+                        if isinstance(tool_out, dict) and tool_out.get("ok"):
+                            first = (tool_out.get("results", []) or [{}])[0]
+                            birth_fact = self._sanitize_memory_fact_line(str(first.get("text") or ""))
+                    except Exception:
+                        traceback.print_exc()
                 if birth_fact and slots.get("birthdate"):
                     selected.append(birth_fact)
                 if not birth_fact and slots.get("birthdate"):

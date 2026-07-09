@@ -138,6 +138,15 @@ def tool_entry(args):
             )):
                 continue
 
+            if t_norm.startswith((
+                "mark ", "set ", "update ", "create ", "delete ", "remove ",
+                "run ", "execute ", "list ", "show ",
+            )):
+                continue
+
+            if "project tracker" in t_norm or "tracker_demo" in t_norm:
+                continue
+
             out.append(item)
 
         return out

@@ -65,6 +65,46 @@ def tool_entry(args):
                 out.append(s)
         return out[:4]
 
+    def is_broad_self_recall(query_text: str) -> bool:
+        q = (query_text or "").strip().lower()
+        if not q:
+            return False
+
+        broad_patterns = [
+            r"\bwhat do you remember\b",
+            r"\bdo you remember anything\b",
+            r"\bwhat do you know about me\b",
+            r"\bwhat do you remember about me\b",
+            r"\bremember anything\b",
+            r"\banything about me\b",
+        ]
+
+        return any(re.search(p, q) is not None for p in broad_patterns)
+
+    def is_user_profile_candidate(item) -> bool:
+        text = (item.get("text") or "").strip()
+        tags = item.get("tags") or []
+        if not text:
+            return False
+
+        low = text.lower()
+        if low.startswith("mina "):
+            return False
+
+        if low.startswith("path_alias::") or low.startswith("path_alias_deleted::"):
+            return False
+
+        if low.startswith("file \"") and " as \"" in low:
+            return False
+
+        tag_set = {str(t).strip().lower() for t in tags if str(t).strip()}
+        if "system_seed" in tag_set or "startup_fact" in tag_set:
+            return False
+        if "path_alias" in tag_set or "path_alias_deleted" in tag_set:
+            return False
+
+        return True
+
     def recall_once(mem, query_text: str, top_k: int):
         # Prefer explicit user-authored facts first.
         results = mem.search(
@@ -159,6 +199,41 @@ def tool_entry(args):
 
     try:
         mem = MK1Memory()
+
+        if is_broad_self_recall(query):
+            merged = []
+
+            explicit = mem.recent_memories(
+                top_k=max(top_k * 30, 200),
+                include_kinds=["fact", "preference", "procedure"],
+                include_tags=["user_memory"],
+            )
+            merged.extend([x for x in post_filter_results(query, explicit) if is_user_profile_candidate(x)])
+
+            if not merged:
+                long_term = mem.recent_memories(
+                    top_k=max(top_k * 30, 200),
+                    include_kinds=["fact", "preference", "procedure"],
+                )
+                merged.extend([x for x in post_filter_results(query, long_term) if is_user_profile_candidate(x)])
+
+            # Dedupe while preserving order.
+            results = []
+            seen = set()
+            for item in merged:
+                txt = " ".join(str(item.get("text") or "").strip().lower().split())
+                if not txt or txt in seen:
+                    continue
+                seen.add(txt)
+                results.append(item)
+                if len(results) >= max(top_k, 5):
+                    break
+
+            return {
+                "ok": True,
+                "results": results,
+            }
+
         parts = split_query_parts(query)
         merged = []
 

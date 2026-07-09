@@ -459,6 +459,20 @@ class MK1Core:
             "age": bool(re.search(r"\bhow old\b|\bage\b", q)),
         }
 
+    def _is_broad_memory_recall_query(self, user_query: str) -> bool:
+        q = (user_query or "").strip().lower()
+        if not q:
+            return False
+        patterns = [
+            r"\bwhat do you remember\b",
+            r"\bdo you remember anything\b",
+            r"\bwhat do you know about me\b",
+            r"\bwhat do you remember about me\b",
+            r"\bremember anything\b",
+            r"\banything about me\b",
+        ]
+        return any(re.search(p, q) is not None for p in patterns)
+
     def _pick_fact_for_keywords(self, facts: List[str], keywords: List[str], used: set) -> str:
         for idx, fact in enumerate(facts):
             if idx in used:
@@ -907,6 +921,20 @@ class MK1Core:
                 elif not birth_fact:
                     lines.append("Age: I need your birthdate in memory to compute this.")
 
+            return "\n".join(lines)
+
+        if self._is_broad_memory_recall_query(user_query):
+            picks = clean_facts[:5]
+            if not picks:
+                return "Gremlin memory ping: I do not have that in memory yet."
+
+            lines = ["Gremlin memory check, incoming. Here's what I remember:"]
+            for p in picks:
+                s = self._normalize_memory_reply_perspective(user_query, p)
+                s = re.sub(r"[.!?]+$", "", s).strip()
+                if not s:
+                    continue
+                lines.append(f"- {s}.")
             return "\n".join(lines)
 
         if fact_clause and missing_clause:

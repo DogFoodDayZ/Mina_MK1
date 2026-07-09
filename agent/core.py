@@ -538,6 +538,16 @@ REQUIRED OUTPUT FORMAT:
         if not txt:
             return ""
 
+        # Drop conversational echoes/questions that can leak from interaction memory.
+        low_all = txt.lower()
+        if any(x in low_all for x in [
+            "what color are my eyes",
+            "what is my eye color",
+            "what is my birthdate",
+            "how old am i",
+        ]):
+            return ""
+
         # Keep the first declarative sentence only.
         for sent in re.split(r"(?<=[.!?])\s+", txt):
             s = sent.strip()
@@ -555,6 +565,59 @@ REQUIRED OUTPUT FORMAT:
             return s
 
         return ""
+
+    def _add_months(self, dt: datetime, months: int) -> datetime:
+        year = dt.year + (dt.month - 1 + months) // 12
+        month = (dt.month - 1 + months) % 12 + 1
+        # Clamp day to end-of-month.
+        day = dt.day
+        for d in [31, 30, 29, 28]:
+            try:
+                return dt.replace(year=year, month=month, day=min(day, d))
+            except Exception:
+                continue
+        return dt.replace(year=year, month=month, day=1)
+
+    def _compute_age_details(self, birth_dt: datetime) -> Dict[str, Any]:
+        now = datetime.now()
+        b = birth_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        if b > now:
+            return {
+                "ok": False,
+                "now_text": now.strftime("%Y-%m-%d %H:%M"),
+                "error": "future_birthdate",
+            }
+
+        # Calendar breakdown: years, months, days.
+        years = now.year - b.year - ((now.month, now.day) < (b.month, b.day))
+        anchor_year = b.replace(year=b.year + years)
+        months = (now.year - anchor_year.year) * 12 + (now.month - anchor_year.month)
+        if now.day < anchor_year.day:
+            months -= 1
+        if months < 0:
+            months = 0
+
+        anchor_month = self._add_months(anchor_year, months)
+        days = (now.date() - anchor_month.date()).days
+        if days < 0:
+            days = 0
+
+        total_days = (now - b).days
+        total_minutes = int((now - b).total_seconds() // 60)
+
+        return {
+            "ok": True,
+            "now_text": now.strftime("%Y-%m-%d %H:%M"),
+            "years": years,
+            "months": months,
+            "days": days,
+            "total_days": total_days,
+            "total_minutes": total_minutes,
+        }
+
+    def _format_birthdate_pretty(self, birth_dt: datetime) -> str:
+        month_name = birth_dt.strftime("%B")
+        return f"{month_name} {birth_dt.day}, {birth_dt.year}"
 
     def _select_memory_facts_for_parts(self, parts: List[str], facts: List[str]) -> Tuple[List[str], List[str]]:
         if not parts:
@@ -655,17 +718,34 @@ REQUIRED OUTPUT FORMAT:
                 if birth_fact:
                     bdt = self._parse_birthdate_from_text(birth_fact)
                     if bdt:
-                        age_sentence = self._compute_age_sentence(bdt)
+                        age_details = self._compute_age_details(bdt)
+                        if age_details.get("ok"):
+                            months_val = int(age_details.get("months") or 0)
+                            month_unit = "month" if months_val == 1 else "months"
+                            days_val = int(age_details.get("days") or 0)
+                            day_unit = "day" if days_val == 1 else "days"
+                            age_sentence = (
+                                f"Age: {age_details.get('years')} years, {months_val} {month_unit}, and {days_val} {day_unit} "
+                                f"(about {age_details.get('total_days'):,} days / {age_details.get('total_minutes'):,} minutes)."
+                            )
+                            current_dt_line = f"Current datetime: {age_details.get('now_text')}."
+                        else:
+                            current_dt_line = f"Current datetime: {age_details.get('now_text')}."
+                            age_sentence = "Age: I cannot compute from a future birthdate."
                     else:
                         missing.append("enough birthdate detail to compute age")
                 else:
                     missing.append("birthdate to compute age")
+                    current_dt_line = f"Current datetime: {datetime.now().strftime('%Y-%m-%d %H:%M')}."
+            else:
+                current_dt_line = ""
         else:
             parts = self._extract_memory_request_parts(user_query)
             selected, missing = self._select_memory_facts_for_parts(parts, clean_facts)
             if not selected:
                 selected = [clean_facts[0]]
             age_sentence = ""
+            current_dt_line = ""
 
         selected_for_sentence = [re.sub(r"[.!?]+$", "", s).strip() for s in selected[:2] if s.strip()]
         fact_clause = " and ".join(selected_for_sentence[:2]).strip()
@@ -685,7 +765,41 @@ REQUIRED OUTPUT FORMAT:
 
         missing_clause_no_dot = missing_clause.rstrip(".") if missing_clause else ""
 
-        if fact_clause and missing_clause and age_sentence:
+        # Multipart response style for slot-based memory questions.
+        if any(slots.values()):
+            lines: List[str] = [
+                "Gremlin memory check, incoming. *gears whir softly*",
+            ]
+
+            if eye_fact:
+                eye_line = self._normalize_memory_reply_perspective(user_query, eye_fact)
+                eye_line = re.sub(r"[.!?]+$", "", eye_line).strip()
+                lines.append(f"Eye color: {eye_line}.")
+            elif slots.get("eye_color"):
+                lines.append("Eye color: I do not have that in memory yet.")
+
+            if birth_fact:
+                bdt = self._parse_birthdate_from_text(birth_fact)
+                if bdt:
+                    lines.append(f"Birthdate: {self._format_birthdate_pretty(bdt)}.")
+                else:
+                    birth_line = self._normalize_memory_reply_perspective(user_query, birth_fact)
+                    birth_line = re.sub(r"[.!?]+$", "", birth_line).strip()
+                    lines.append(f"Birthdate: {birth_line}.")
+            elif slots.get("birthdate"):
+                lines.append("Birthdate: I do not have that in memory yet.")
+
+            if slots.get("age"):
+                if current_dt_line:
+                    lines.append(current_dt_line)
+                if age_sentence:
+                    lines.append(age_sentence)
+                elif not birth_fact:
+                    lines.append("Age: I need your birthdate in memory to compute this.")
+
+            return "\n".join(lines)
+
+        if fact_clause and missing_clause:
             first_sentence = f"Gremlin memory ping: {fact_clause}; {missing_clause_no_dot}."
         elif fact_clause:
             first_sentence = f"Gremlin memory ping: {fact_clause}."
@@ -694,16 +808,10 @@ REQUIRED OUTPUT FORMAT:
         else:
             first_sentence = "Gremlin memory ping: I do not have that in memory yet."
 
-        second_chunks: List[str] = []
-        if age_sentence:
-            second_chunks.append(age_sentence)
-        elif missing_clause and fact_clause:
-            second_chunks.append(missing_clause)
-
-        second_sentence = " ".join(second_chunks).strip()
+        second_sentence = age_sentence if age_sentence else ""
         merged = " ".join([x for x in [first_sentence, second_sentence] if x]).strip()
         merged = self._normalize_memory_reply_perspective(user_query, merged)
-        return self._cap_sentences(merged, max_sentences=2)
+        return merged
 
     def _generate_file_content_from_intent(
         self,

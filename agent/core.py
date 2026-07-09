@@ -508,11 +508,14 @@ REQUIRED OUTPUT FORMAT:
         now = datetime.now()
         b = birth_dt.replace(hour=0, minute=0, second=0, microsecond=0)
         if b > now:
-            return "I cannot compute age from a future birthdate."
+            return "Current datetime is " + now.strftime("%Y-%m-%d %H:%M") + "; I cannot compute age from a future birthdate."
 
-        years = now.year - b.year - ((now.month, now.day, now.hour, now.minute) < (b.month, b.day, 0, 0))
+        years = now.year - b.year - ((now.month, now.day) < (b.month, b.day))
+        days = (now - b).days
         minutes = int((now - b).total_seconds() // 60)
-        return f"As of now, you are {years} years old, about {minutes:,} minutes old."
+
+        now_text = now.strftime("%Y-%m-%d %H:%M")
+        return f"Current datetime is {now_text}; you are {years} years old, {days:,} days old, and about {minutes:,} minutes old."
 
     def _sanitize_memory_fact_line(self, line: str) -> str:
         txt = (line or "").strip().lstrip("- ").strip()
@@ -665,26 +668,37 @@ REQUIRED OUTPUT FORMAT:
             age_sentence = ""
 
         selected_for_sentence = [re.sub(r"[.!?]+$", "", s).strip() for s in selected[:2] if s.strip()]
-        if len(selected_for_sentence) >= 2:
-            first_sentence = "Gremlin memory ping: " + " and ".join(selected_for_sentence[:2]).strip() + "."
-        elif selected_for_sentence:
-            first_sentence = "Gremlin memory ping: " + selected_for_sentence[0] + "."
+        fact_clause = " and ".join(selected_for_sentence[:2]).strip()
+
+        uniq_missing = []
+        seen_missing = set()
+        for m in missing:
+            k = m.strip().lower()
+            if not k or k in seen_missing:
+                continue
+            seen_missing.add(k)
+            uniq_missing.append(m)
+
+        missing_clause = ""
+        if uniq_missing:
+            missing_clause = "I do not have your " + ", ".join(uniq_missing) + " in memory yet."
+
+        missing_clause_no_dot = missing_clause.rstrip(".") if missing_clause else ""
+
+        if fact_clause and missing_clause and age_sentence:
+            first_sentence = f"Gremlin memory ping: {fact_clause}; {missing_clause_no_dot}."
+        elif fact_clause:
+            first_sentence = f"Gremlin memory ping: {fact_clause}."
+        elif missing_clause:
+            first_sentence = f"Gremlin memory ping: {missing_clause}"
         else:
             first_sentence = "Gremlin memory ping: I do not have that in memory yet."
 
         second_chunks: List[str] = []
         if age_sentence:
             second_chunks.append(age_sentence)
-        if missing:
-            uniq_missing = []
-            seen_missing = set()
-            for m in missing:
-                k = m.strip().lower()
-                if not k or k in seen_missing:
-                    continue
-                seen_missing.add(k)
-                uniq_missing.append(m)
-            second_chunks.append("I do not have your " + ", ".join(uniq_missing) + " in memory yet.")
+        elif missing_clause and fact_clause:
+            second_chunks.append(missing_clause)
 
         second_sentence = " ".join(second_chunks).strip()
         merged = " ".join([x for x in [first_sentence, second_sentence] if x]).strip()
@@ -2962,6 +2976,12 @@ IMPORTANT RULES:
                 return "memory_read"
 
             if "memory" in t and t.startswith("find"):
+                return "memory_read"
+
+            if re.search(r"\b(how old am i|what color are my eyes?|my birthdate|my birthday|date of birth)\b", t):
+                return "memory_read"
+
+            if ("how old" in t and " i " in f" {t} ") or ("eye color" in t and "my" in t):
                 return "memory_read"
 
             # MEMORY WRITE (commands)

@@ -325,6 +325,12 @@ class MK1Core:
                 ln = re.sub(r"^\s*mina-style sentence[^:]*:\s*", "", ln, flags=re.IGNORECASE)
                 if not ln.strip():
                     continue
+            if re.match(r"^\s*mina-style output", low):
+                ln = re.sub(r"^\s*mina-style output[^:]*:\s*", "", ln, flags=re.IGNORECASE)
+                if not ln.strip():
+                    continue
+            if re.match(r"^\s*mina-sign-off", low):
+                continue
             kept.append(ln)
 
         out = "\n".join(kept).strip()
@@ -358,6 +364,9 @@ class MK1Core:
         formatted: str,
         tool_ok: bool,
     ) -> str:
+        if tool_name == "file_read":
+            return formatted
+
         convo = list(messages)
         convo.append({
             "role": "user",
@@ -366,34 +375,11 @@ class MK1Core:
 
         status = "success" if tool_ok else "failure"
         convo.append({
-            "role": "assistant",
-            "content": f"""A tool was executed.
-
-Tool Name:
-{tool_name}
-
-Tool Status:
-{status}
-
-Verified Tool Output:
-{formatted}
-
-IMPORTANT RULES:
-- You are Mina. Reply with a little Mina flair.
-- Use ONLY the verified tool output above.
-- DO NOT invent files, commands, errors, paths, or test results.
-- If the tool failed, clearly say it failed and include the exact error details from the output.
-- Keep it concise and useful.
-
-REQUIRED OUTPUT FORMAT:
-1) One short Mina-style sentence.
-2) Then this exact marker line: VERIFIED OUTPUT:
-3) Then include the verified tool output verbatim in a fenced block:
-```text
-{formatted}
-```
-4) Do not add any other technical claims.
-""",
+            "role": "system",
+            "content": (
+                "Write exactly one short Mina-style line with no quotes, no labels, no markdown, and no emojis. "
+                "Do not include technical details; those are handled separately."
+            ),
         })
 
         try:
@@ -408,8 +394,13 @@ REQUIRED OUTPUT FORMAT:
                     text = "\n".join(lines[1:]).strip()
                     continue
                 break
-            if text.strip() and formatted.strip() and formatted.strip() in text:
-                return text.strip()
+            flair = text.strip()
+            if not flair:
+                flair = "Gremlin check complete."
+            if flair[-1] not in ".!?":
+                flair += "."
+
+            return f"{flair}\n\nVERIFIED OUTPUT:\n```text\n{formatted}\n```"
         except Exception:
             traceback.print_exc()
 
@@ -619,6 +610,111 @@ REQUIRED OUTPUT FORMAT:
         month_name = birth_dt.strftime("%B")
         return f"{month_name} {birth_dt.day}, {birth_dt.year}"
 
+    def _lookup_slot_fact(self, slot: str, user_query: str) -> str:
+        slot_queries = {
+            "eye_color": ["eye color", "eyes", "eye"],
+            "birthdate": ["birthdate", "birthday", "date of birth", "dob"],
+        }
+        probes = slot_queries.get(slot, [])
+        if not probes:
+            return ""
+
+        candidates: List[str] = []
+
+        for q in probes:
+            try:
+                for item in self.memory.search(
+                    q,
+                    top_k=8,
+                    include_kinds=["fact", "preference", "procedure"],
+                    include_tags=["user_memory"],
+                ):
+                    s = self._sanitize_memory_fact_line(str(item.get("text") or ""))
+                    if s:
+                        candidates.append(s)
+            except Exception:
+                traceback.print_exc()
+
+        if not candidates:
+            for q in probes:
+                try:
+                    for item in self.memory.search(
+                        q,
+                        top_k=8,
+                        include_kinds=["fact", "preference", "procedure"],
+                    ):
+                        s = self._sanitize_memory_fact_line(str(item.get("text") or ""))
+                        if s:
+                            candidates.append(s)
+                except Exception:
+                    traceback.print_exc()
+
+        # Lexical fallback over recent explicit facts.
+        if not candidates:
+            try:
+                recents = self.memory.recent_memories(
+                    top_k=800,
+                    include_kinds=["fact", "preference", "procedure"],
+                    include_tags=["user_memory"],
+                )
+            except Exception:
+                recents = []
+
+            for item in recents or []:
+                raw = str(item.get("text") or "")
+                s = self._sanitize_memory_fact_line(raw)
+                if s:
+                    candidates.append(s)
+
+        if not candidates:
+            try:
+                recents_any = self.memory.recent_memories(
+                    top_k=800,
+                    include_kinds=["fact", "preference", "procedure"],
+                )
+            except Exception:
+                recents_any = []
+
+            for item in recents_any or []:
+                raw = str(item.get("text") or "")
+                s = self._sanitize_memory_fact_line(raw)
+                if s:
+                    candidates.append(s)
+
+        # Final fallback: reuse memory_read tool query behavior.
+        if not candidates:
+            tool_queries = {
+                "eye_color": "what is my eye color",
+                "birthdate": "what is my birthdate",
+            }
+            tq = tool_queries.get(slot)
+            if tq:
+                try:
+                    tool_out = self.tools.run("memory_read", {"query": tq, "top_k": 3})
+                    if isinstance(tool_out, dict) and tool_out.get("ok"):
+                        for item in tool_out.get("results", []) or []:
+                            raw = str(item.get("text") or "")
+                            s = self._sanitize_memory_fact_line(raw)
+                            if s:
+                                candidates.append(s)
+                except Exception:
+                    traceback.print_exc()
+
+        seen = set()
+        for c in candidates:
+            n = " ".join(c.lower().split())
+            if n in seen:
+                continue
+            seen.add(n)
+
+            low = c.lower()
+            if slot == "eye_color" and any(x in low for x in ["eye", "eyes", "color"]):
+                return c
+            if slot == "birthdate" and any(x in low for x in ["birth", "birthday", "dob", "date of birth"]):
+                return c
+
+        return ""
+
     def _select_memory_facts_for_parts(self, parts: List[str], facts: List[str]) -> Tuple[List[str], List[str]]:
         if not parts:
             picked = [facts[0]] if facts else []
@@ -679,9 +775,6 @@ REQUIRED OUTPUT FORMAT:
             seen.add(norm)
             clean_facts.append(s)
 
-        if not clean_facts:
-            return "Gremlin memory ping: I do not have that in memory yet."
-
         slots = self._extract_memory_slots(user_query)
         used = set()
         selected: List[str] = []
@@ -697,6 +790,8 @@ REQUIRED OUTPUT FORMAT:
                     ["birthdate", "birthday", "date of birth", "dob"],
                     used,
                 )
+                if not birth_fact:
+                    birth_fact = self._lookup_slot_fact("birthdate", user_query)
                 if birth_fact and slots.get("birthdate"):
                     selected.append(birth_fact)
                 if not birth_fact and slots.get("birthdate"):
@@ -708,6 +803,8 @@ REQUIRED OUTPUT FORMAT:
                     ["eye color", "eyes", "eye"],
                     used,
                 )
+                if not eye_fact:
+                    eye_fact = self._lookup_slot_fact("eye_color", user_query)
                 if eye_fact:
                     selected.append(eye_fact)
                 else:
@@ -740,6 +837,8 @@ REQUIRED OUTPUT FORMAT:
             else:
                 current_dt_line = ""
         else:
+            if not clean_facts:
+                return "Gremlin memory ping: I do not have that in memory yet."
             parts = self._extract_memory_request_parts(user_query)
             selected, missing = self._select_memory_facts_for_parts(parts, clean_facts)
             if not selected:
@@ -3367,8 +3466,12 @@ IMPORTANT RULES:
         intent = detect_memory_intent(t)
 
         if intent == "memory_read":
+            q_read = raw_text
+            t_read = t
+            if re.search(r"\bhow old\b|\bage\b", t_read) and not re.search(r"\b(birthdate|birthday|date of birth|dob)\b", t_read):
+                q_read = raw_text + " birthdate"
             return "memory_read", {
-                "query": raw_text,
+                "query": q_read,
                 "top_k": 3,
             }
 

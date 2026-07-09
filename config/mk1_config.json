@@ -1,0 +1,39 @@
+{
+  "model": {
+    "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
+    "load_endpoint": "http://127.0.0.1:1234/api/v1/models/load",
+    "default_model": "qwen2.5-7b-instruct"
+  },
+  "embedding": {
+    "small": "http://127.0.0.1:8084/embed_small",
+    "base": "http://127.0.0.1:8084/embed_base"
+  },
+  "memory": {
+    "db_path": "memory/memory.db",
+    "faiss_small": "memory/faiss_small.index",
+    "faiss_base": "memory/faiss_base.index",
+    "backup_dir": "memory/backups",
+    "auto_backup_every_writes": 100,
+    "auto_backup_every_seconds": 3600,
+    "backup_min_interval_seconds": 300,
+    "backup_keep_hourly_hours": 48,
+    "backup_keep_daily_days": 30,
+    "backup_keep_weekly_weeks": 26,
+    "backup_max_total": 120
+  },
+  "tools": {
+    "directory": "E:\\mina_mk1\\tools"
+  },
+  "workspace": {
+    "root": "E:\\workspace",
+    "default_dirs": [
+      "projects",
+      "scratch",
+      "templates",
+      "archive"
+    ]
+  },
+  "personality": {
+    "path": "config/personality.txt"
+  }
+}

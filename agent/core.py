@@ -1,0 +1,3318 @@
+# core.py
+
+import os
+import time
+import json
+import traceback
+import re
+import subprocess
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+from config.config_loader import load_config
+from tools.tool_loader import ToolLoader
+from memory.mk1_memory import MK1Memory
+
+
+# ============================================================
+# LM STUDIO CLIENT
+# ============================================================
+
+class LMStudioClient:
+
+    def __init__(self, model_cfg: Dict[str, Any]):
+
+        self.chat_url = model_cfg.get(
+            "endpoint",
+            "http://127.0.0.1:1234/v1/chat",
+        )
+
+        self.default_model = model_cfg.get(
+            "default_model",
+            "local-model",
+        )
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.7,
+    ) -> Dict[str, Any]:
+
+        payload: Dict[str, Any] = {
+            "model": self.default_model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": False,
+        }
+
+        print("\n========================================")
+        print("MK1 → LM STUDIO REQUEST")
+        print("========================================")
+        print("URL:")
+        print(self.chat_url)
+
+        try:
+
+            resp = requests.post(
+                self.chat_url,
+                json=payload,
+                timeout=120,
+            )
+
+            print("\n========================================")
+            print("LM STUDIO STATUS")
+            print("========================================")
+            print(resp.status_code)
+
+            resp.raise_for_status()
+
+            data = resp.json()
+
+            # Strip reasoning traces
+            try:
+                choices = data.get("choices", [])
+                if choices:
+                    msg = choices[0].get("message", {})
+                    if "reasoning_content" in msg:
+                        del msg["reasoning_content"]
+            except Exception:
+                pass
+
+            return data
+
+        except Exception as e:
+
+            print("\n========================================")
+            print("LM STUDIO ERROR")
+            print("========================================")
+
+            traceback.print_exc()
+
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": f"(LM Studio error: {str(e)})"
+                        }
+                    }
+                ]
+            }
+
+
+# ============================================================
+# MK1 CORE
+# ============================================================
+
+class MK1Core:
+
+    def __init__(self):
+
+        self.config = load_config()
+
+        self.personality = (
+            self.config.personality
+            if hasattr(self.config, "personality")
+            else ""
+        )
+
+        self.memory = MK1Memory(
+            db_path=self.config.get(
+                "memory",
+                "db_path",
+                "memory/memory.db",
+            ),
+
+            faiss_small_path=self.config.get(
+                "memory",
+                "faiss_small",
+                "",
+            ),
+
+            faiss_base_path=self.config.get(
+                "memory",
+                "faiss_base",
+                "",
+            ),
+
+            embed_small_url=self.config.get(
+                "embedding",
+                "small",
+                "",
+            ),
+
+            embed_base_url=self.config.get(
+                "embedding",
+                "base",
+                "",
+            ),
+
+            auto_backup_every_writes=self.config.get(
+                "memory",
+                "auto_backup_every_writes",
+                100,
+            ),
+
+            auto_backup_every_seconds=self.config.get(
+                "memory",
+                "auto_backup_every_seconds",
+                3600,
+            ),
+
+            backup_min_interval_seconds=self.config.get(
+                "memory",
+                "backup_min_interval_seconds",
+                300,
+            ),
+
+            backup_keep_hourly_hours=self.config.get(
+                "memory",
+                "backup_keep_hourly_hours",
+                48,
+            ),
+
+            backup_keep_daily_days=self.config.get(
+                "memory",
+                "backup_keep_daily_days",
+                30,
+            ),
+
+            backup_keep_weekly_weeks=self.config.get(
+                "memory",
+                "backup_keep_weekly_weeks",
+                26,
+            ),
+
+            backup_max_total=self.config.get(
+                "memory",
+                "backup_max_total",
+                120,
+            ),
+        )
+
+        tools_dir = self.config.get(
+            "tools",
+            "directory",
+            "tools",
+        )
+
+        self.tools = ToolLoader(tools_dir)
+
+        self.model = LMStudioClient({
+            "endpoint": self.config.get(
+                "model",
+                "endpoint",
+                "http://127.0.0.1:1234/v1/chat/",
+            ),
+
+            "default_model": self.config.get(
+                "model",
+                "default_model",
+                "local-model",
+            ),
+        })
+
+        self.system_prompt = (
+            self.personality.strip()
+            if self.personality
+            else ""
+        )
+
+        self.auto_promote_min_hits = self.config.get(
+            "memory",
+            "auto_promote_min_hits",
+            2,
+        )
+
+        self.auto_promote_recent_window = self.config.get(
+            "memory",
+            "auto_promote_recent_window",
+            40,
+        )
+
+        self.auto_promote_semantic_top_k = self.config.get(
+            "memory",
+            "auto_promote_semantic_top_k",
+            8,
+        )
+
+        workspace_root_cfg = self.config.get(
+            "workspace",
+            "root",
+            r"E:\workspace",
+        )
+        self.workspace_root = os.path.abspath(
+            os.path.expanduser(
+                os.path.expandvars(
+                    str(workspace_root_cfg or r"E:\workspace")
+                )
+            )
+        )
+
+        workspace_dirs_cfg = self.config.get(
+            "workspace",
+            "default_dirs",
+            ["projects", "scratch", "templates", "archive"],
+        )
+        if isinstance(workspace_dirs_cfg, list):
+            self.workspace_default_dirs = [
+                str(d).strip() for d in workspace_dirs_cfg if str(d).strip()
+            ]
+        else:
+            self.workspace_default_dirs = ["projects", "scratch", "templates", "archive"]
+
+        self._ensure_workspace_structure()
+        self.startup_context = self._build_startup_context()
+        self._seed_startup_memory_facts()
+
+    def _store_turn_memory(
+        self,
+        user_input: str,
+        assistant_text: str,
+    ) -> None:
+        try:
+            self.memory.add_memory(
+                user_input,
+                kind="interaction",
+                tags=["short_term", "user_turn"],
+            )
+
+            self.memory.add_memory(
+                assistant_text,
+                kind="interaction",
+                tags=["short_term", "assistant_turn"],
+            )
+
+            # Promote repeated short-term interaction fragments into long-term facts.
+            if hasattr(self.memory, "auto_promote_short_term"):
+                self.memory.auto_promote_short_term(
+                    seed_text=user_input,
+                    min_hits=int(self.auto_promote_min_hits),
+                    recent_window=int(self.auto_promote_recent_window),
+                    semantic_top_k=int(self.auto_promote_semantic_top_k),
+                )
+
+        except Exception:
+            traceback.print_exc()
+
+    def _strip_code_fences(self, text: str) -> str:
+        if not text:
+            return ""
+
+        raw = text.strip()
+        m = re.search(r'^```(?:[A-Za-z0-9_+-]+)?\n([\s\S]*?)\n```$', raw)
+        if m:
+            return m.group(1).strip("\n")
+        return raw
+
+    def _clean_response_text(self, text: str) -> str:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+
+        lines = cleaned.splitlines()
+        kept: List[str] = []
+        for ln in lines:
+            low = ln.strip().lower()
+            if low.startswith("- do not ") or low.startswith("do not "):
+                continue
+            if low in {"---", "important rules:"}:
+                continue
+            kept.append(ln)
+
+        out = "\n".join(kept).strip()
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        return out
+
+    def _normalize_memory_reply_perspective(self, user_query: str, text: str) -> str:
+        out = (text or "").strip()
+        if not out:
+            return ""
+
+        q = (user_query or "").lower()
+        if " my " in f" {q} " or q.startswith("my "):
+            out = re.sub(r"^\s*my\b", "your", out, flags=re.IGNORECASE)
+
+        return out
+
+    def _cap_sentences(self, text: str, max_sentences: int = 2) -> str:
+        value = (text or "").strip()
+        if not value or max_sentences < 1:
+            return value
+
+        parts = re.split(r"(?<=[.!?])\s+", value)
+        if len(parts) <= max_sentences:
+            return value
+
+        return " ".join(parts[:max_sentences]).strip()
+
+    def _build_memory_read_reply(
+        self,
+        messages: List[Dict[str, str]],
+        user_query: str,
+        formatted: str,
+    ) -> str:
+        fact_lines = [
+            ln.strip().lstrip("- ").strip()
+            for ln in (formatted or "").splitlines()
+            if ln.strip()
+        ]
+
+        if not fact_lines:
+            return "I do not have that in memory yet."
+
+        primary_fact = self._normalize_memory_reply_perspective(user_query, fact_lines[0])
+        primary_fact = self._clean_response_text(primary_fact)
+        if primary_fact and primary_fact[-1] not in ".!?":
+            primary_fact += "."
+
+        memory_messages = list(messages)
+        memory_messages.append({
+            "role": "user",
+            "content": user_query,
+        })
+        memory_messages.append({
+            "role": "system",
+            "content": (
+                "You are Mina. Reply in a warm, natural Mina tone in at most two short sentences.\n"
+                "You must include this exact verified fact sentence once and exactly as written:\n"
+                f"{primary_fact}\n"
+                "Do not change the fact wording, names, numbers, or attributes.\n"
+                "You may add brief personality words before or after it.\n"
+                "No markdown, no bullets, no extra facts, no questions."
+            ),
+        })
+
+        try:
+            reply = self.model.chat(memory_messages)
+            styled = self._clean_response_text(self._extract_text(reply))
+            styled = self._normalize_memory_reply_perspective(user_query, styled)
+            styled = self._cap_sentences(styled, max_sentences=2)
+
+            if primary_fact and primary_fact.lower() in styled.lower():
+                return styled
+        except Exception:
+            traceback.print_exc()
+
+        return primary_fact or "I do not have that in memory yet."
+
+    def _generate_file_content_from_intent(
+        self,
+        user_input: str,
+        target_path: str,
+    ) -> str:
+        """
+        Generate file content from a natural-language request when no explicit
+        content block is provided by the user.
+        """
+        try:
+            ext = os.path.splitext(target_path or "")[1].lower()
+            lang_hint = {
+                ".py": "Python",
+                ".ps1": "PowerShell",
+                ".json": "JSON",
+                ".md": "Markdown",
+                ".txt": "plain text",
+                ".js": "JavaScript",
+                ".ts": "TypeScript",
+                ".html": "HTML",
+                ".css": "CSS",
+                ".yml": "YAML",
+                ".yaml": "YAML",
+            }.get(ext, "text")
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You generate file contents for local coding tasks. "
+                        "Return ONLY the file content with no markdown fences, "
+                        "no explanations, and no surrounding prose."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"User request: {user_input}\n"
+                        f"Target path: {target_path}\n"
+                        f"Expected language/type: {lang_hint}\n"
+                        "Generate the full file content now."
+                    ),
+                },
+            ]
+
+            reply = self.model.chat(messages=messages, temperature=0.2)
+            text = self._extract_text(reply)
+            return self._strip_code_fences(text)
+
+        except Exception:
+            traceback.print_exc()
+            return ""
+
+    def _normalize_path(self, path: str) -> str:
+        p = (path or "").strip().strip('"\'')
+        if not p:
+            return ""
+        p = os.path.expanduser(os.path.expandvars(p))
+        if not os.path.isabs(p):
+            p = os.path.join(self.workspace_root, p)
+        return os.path.abspath(p)
+
+    def _ensure_workspace_structure(self) -> None:
+        try:
+            os.makedirs(self.workspace_root, exist_ok=True)
+            for d in self.workspace_default_dirs:
+                os.makedirs(os.path.join(self.workspace_root, d), exist_ok=True)
+        except Exception:
+            traceback.print_exc()
+
+    def _projects_root(self) -> str:
+        return os.path.join(self.workspace_root, "projects")
+
+    def _project_tracker_path(self) -> str:
+        return os.path.join(self._projects_root(), ".mina_project_tracker.json")
+
+    def _load_project_tracker(self) -> Dict[str, Any]:
+        path = self._project_tracker_path()
+        if not os.path.isfile(path):
+            return {
+                "updated_at": None,
+                "projects": {},
+            }
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {"updated_at": None, "projects": {}}
+            projects = data.get("projects", {})
+            if not isinstance(projects, dict):
+                projects = {}
+            return {
+                "updated_at": data.get("updated_at"),
+                "projects": projects,
+            }
+        except Exception:
+            traceback.print_exc()
+            return {
+                "updated_at": None,
+                "projects": {},
+            }
+
+    def _save_project_tracker(self, tracker: Dict[str, Any]) -> None:
+        path = self._project_tracker_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(tracker, f, indent=2, ensure_ascii=True)
+
+    def _sync_project_tracker(self, scanned_projects: List[Dict[str, Any]]) -> Dict[str, Any]:
+        tracker = self._load_project_tracker()
+        existing = tracker.get("projects", {}) if isinstance(tracker.get("projects", {}), dict) else {}
+        now_iso = datetime.now().isoformat(timespec="seconds")
+
+        merged: Dict[str, Any] = {}
+
+        for p in scanned_projects:
+            name = str(p.get("name") or "").strip()
+            if not name:
+                continue
+
+            prev = existing.get(name, {}) if isinstance(existing.get(name, {}), dict) else {}
+
+            status = str(prev.get("status") or "").strip().lower()
+            if status not in {"todo", "in_progress", "blocked", "complete", "archived"}:
+                status = "complete" if p.get("status") == "complete" else "in_progress"
+
+            next_steps = prev.get("next_steps", [])
+            if isinstance(next_steps, str):
+                next_steps = [next_steps] if next_steps.strip() else []
+            if not isinstance(next_steps, list):
+                next_steps = []
+            next_steps = [str(x).strip() for x in next_steps if str(x).strip()]
+
+            last_touched = p.get("last_modified_iso") or prev.get("last_touched")
+
+            merged[name] = {
+                "name": name,
+                "path": p.get("path"),
+                "status": status,
+                "next_steps": next_steps,
+                "last_touched": last_touched,
+                "last_scanned_at": now_iso,
+                "code_files": int(p.get("code_files") or 0),
+                "has_readme": bool(p.get("has_readme")),
+            }
+
+        for name, prev in existing.items():
+            if name in merged:
+                continue
+            if not isinstance(prev, dict):
+                continue
+
+            prev_status = str(prev.get("status") or "archived").strip().lower()
+            if prev_status in {"todo", "in_progress", "blocked"}:
+                prev_status = "archived"
+
+            merged[name] = {
+                "name": name,
+                "path": prev.get("path"),
+                "status": prev_status,
+                "next_steps": prev.get("next_steps") if isinstance(prev.get("next_steps"), list) else [],
+                "last_touched": prev.get("last_touched"),
+                "last_scanned_at": now_iso,
+                "code_files": int(prev.get("code_files") or 0),
+                "has_readme": bool(prev.get("has_readme")),
+                "missing": True,
+            }
+
+        tracker = {
+            "updated_at": now_iso,
+            "projects": merged,
+        }
+        self._save_project_tracker(tracker)
+        return tracker
+
+    def _projects_to_complete(self, tracker: Dict[str, Any]) -> List[Dict[str, Any]]:
+        projects = tracker.get("projects", {}) if isinstance(tracker.get("projects", {}), dict) else {}
+        todo_status = {"todo", "in_progress", "blocked"}
+        out: List[Dict[str, Any]] = []
+        for name, item in projects.items():
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            if status in todo_status:
+                out.append(item)
+
+        out.sort(key=lambda x: str(x.get("last_touched") or ""), reverse=True)
+        return out
+
+    def _update_project_tracker(
+        self,
+        project_name: str,
+        status: Optional[str] = None,
+        next_step: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        name = (project_name or "").strip()
+        if not name:
+            return {"ok": False, "result": None, "error": "no_project_name_provided"}
+
+        tracker = self._load_project_tracker()
+        projects = tracker.get("projects", {}) if isinstance(tracker.get("projects", {}), dict) else {}
+
+        target_key = None
+        low_name = name.lower()
+        for key in projects.keys():
+            if key.lower() == low_name:
+                target_key = key
+                break
+        if target_key is None:
+            for key in projects.keys():
+                if low_name in key.lower():
+                    target_key = key
+                    break
+
+        if target_key is None:
+            return {"ok": False, "result": None, "error": "project_not_found_in_tracker"}
+
+        entry = projects.get(target_key, {}) if isinstance(projects.get(target_key, {}), dict) else {}
+
+        if status:
+            status_norm = status.strip().lower().replace(" ", "_")
+            if status_norm in {"todo", "in_progress", "blocked", "complete", "archived"}:
+                entry["status"] = status_norm
+
+        if next_step:
+            steps = entry.get("next_steps", [])
+            if not isinstance(steps, list):
+                steps = []
+            step_clean = next_step.strip()
+            if step_clean and step_clean not in steps:
+                steps.append(step_clean)
+            entry["next_steps"] = steps
+
+        entry["last_scanned_at"] = datetime.now().isoformat(timespec="seconds")
+        projects[target_key] = entry
+        tracker["projects"] = projects
+        tracker["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_project_tracker(tracker)
+
+        return {
+            "ok": True,
+            "result": {
+                "project": target_key,
+                "status": entry.get("status"),
+                "next_steps": entry.get("next_steps", []),
+            },
+            "error": None,
+        }
+
+    def _extract_project_files_from_request(self, user_input: str) -> List[str]:
+        text = (user_input or "").strip()
+        out: List[str] = []
+
+        files_clause = re.search(r'\bwith\s+files?\s+(.+?)(?:\bnext\s+steps?\b|\bstatus\b|$)', text, re.IGNORECASE)
+        if not files_clause:
+            return out
+
+        raw = files_clause.group(1)
+        for m in re.finditer(r'([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]{1,8})', raw):
+            fname = m.group(1).strip().strip('"\'')
+            if fname and fname not in out:
+                out.append(fname)
+
+        return out
+
+    def _bootstrap_project(
+        self,
+        project_name: str,
+        user_input: str,
+        status: Optional[str] = None,
+        next_steps: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        name = (project_name or "").strip().strip('"\'')
+        if not name:
+            return {"ok": False, "result": None, "error": "no_project_name_provided"}
+
+        safe_name = re.sub(r'\s+', '_', name)
+        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', safe_name)
+        if not safe_name:
+            return {"ok": False, "result": None, "error": "invalid_project_name"}
+
+        project_path = self._normalize_path(os.path.join("projects", safe_name))
+        created_files: List[str] = []
+
+        dir_result = self.tools.run("dir_create", {"path": project_path})
+        if not dir_result.get("ok"):
+            return {
+                "ok": False,
+                "result": None,
+                "error": f"project_dir_create_failed: {dir_result.get('error')}",
+            }
+
+        requested_files = self._extract_project_files_from_request(user_input)
+        if not requested_files:
+            requested_files = ["README.md"]
+
+        for rel_file in requested_files:
+            rel_file_norm = rel_file.replace("/", os.sep).replace("\\", os.sep).strip(os.sep)
+            if not rel_file_norm:
+                continue
+
+            abs_file = os.path.join(project_path, rel_file_norm)
+            parent = os.path.dirname(abs_file)
+            if parent:
+                self.tools.run("dir_create", {"path": parent})
+
+            content = self._generate_file_content_from_intent(
+                user_input=f"Project bootstrap for {safe_name}. {user_input}",
+                target_path=abs_file,
+            )
+            if not content.strip() and rel_file_norm.lower().startswith("readme"):
+                content = f"# {safe_name}\n\nBootstrapped by Mina.\n"
+
+            if not content.strip():
+                continue
+
+            write_result = self.tools.run(
+                "file_write",
+                {
+                    "path": abs_file,
+                    "content": content,
+                    "overwrite": False,
+                },
+            )
+            if write_result.get("ok"):
+                wpath = write_result.get("result", {}).get("path")
+                if wpath:
+                    created_files.append(str(wpath))
+
+        self.startup_context = self._build_startup_context()
+
+        effective_status = (status or "in_progress").strip().lower().replace(" ", "_")
+        if effective_status not in {"todo", "in_progress", "blocked", "complete", "archived"}:
+            effective_status = "in_progress"
+
+        update_result = self._update_project_tracker(
+            project_name=safe_name,
+            status=effective_status,
+            next_step=None,
+        )
+        if not update_result.get("ok"):
+            return update_result
+
+        for step in (next_steps or []):
+            step_clean = str(step).strip()
+            if not step_clean:
+                continue
+            self._update_project_tracker(
+                project_name=safe_name,
+                status=None,
+                next_step=step_clean,
+            )
+
+        tracker = self._load_project_tracker()
+        projects = tracker.get("projects", {}) if isinstance(tracker.get("projects", {}), dict) else {}
+        entry = projects.get(safe_name, {}) if isinstance(projects.get(safe_name, {}), dict) else {}
+
+        return {
+            "ok": True,
+            "result": {
+                "project": safe_name,
+                "path": project_path,
+                "files_created": created_files,
+                "status": entry.get("status", effective_status),
+                "next_steps": entry.get("next_steps", []),
+            },
+            "error": None,
+        }
+
+    def _scan_projects(self, limit: int = 50) -> List[Dict[str, Any]]:
+        projects_root = self._projects_root()
+        out: List[Dict[str, Any]] = []
+
+        if not os.path.isdir(projects_root):
+            return out
+
+        code_exts = {".py", ".ps1", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".cs"}
+
+        try:
+            names = [
+                n for n in os.listdir(projects_root)
+                if os.path.isdir(os.path.join(projects_root, n))
+            ]
+        except Exception:
+            traceback.print_exc()
+            return out
+
+        for name in names:
+            proj_path = os.path.join(projects_root, name)
+            latest_mtime = 0.0
+            has_readme = False
+            code_file_count = 0
+
+            try:
+                for root, _, files in os.walk(proj_path):
+                    for fname in files:
+                        fpath = os.path.join(root, fname)
+                        try:
+                            mtime = os.path.getmtime(fpath)
+                            if mtime > latest_mtime:
+                                latest_mtime = mtime
+                        except Exception:
+                            pass
+
+                        low = fname.lower()
+                        if low.startswith("readme"):
+                            has_readme = True
+
+                        ext = os.path.splitext(fname)[1].lower()
+                        if ext in code_exts:
+                            code_file_count += 1
+            except Exception:
+                traceback.print_exc()
+
+            status = "complete" if has_readme and code_file_count > 0 else "incomplete"
+            out.append({
+                "name": name,
+                "path": proj_path,
+                "last_modified": latest_mtime,
+                "last_modified_iso": datetime.fromtimestamp(latest_mtime).isoformat(timespec="seconds") if latest_mtime else None,
+                "has_readme": has_readme,
+                "code_files": code_file_count,
+                "status": status,
+            })
+
+        out.sort(key=lambda x: float(x.get("last_modified") or 0.0), reverse=True)
+        return out[:max(1, int(limit))]
+
+    def _build_startup_context(self) -> Dict[str, Any]:
+        now = datetime.now().isoformat(timespec="seconds")
+        projects = self._scan_projects(limit=100)
+        tracker = self._sync_project_tracker(projects)
+        last_project = projects[0] if projects else None
+        incomplete = self._projects_to_complete(tracker)
+
+        return {
+            "startup_time": now,
+            "workspace_root": self.workspace_root,
+            "projects_root": self._projects_root(),
+            "project_tracker_path": self._project_tracker_path(),
+            "project_count": len(projects),
+            "last_worked_project": last_project,
+            "incomplete_projects": incomplete,
+        }
+
+    def _seed_startup_memory_facts(self) -> None:
+        """
+        Seed durable environment facts once at startup.
+        This avoids repeating the same context every turn while still making
+        these facts retrievable via memory tools and normal recall flows.
+        """
+        try:
+            facts = [
+                f"Mina workspace root is {self.workspace_root}",
+                f"Mina projects root is {self._projects_root()}",
+                f"Mina memory database path is {getattr(self.memory, 'db_path', '')}",
+                f"Mina FAISS small index path is {getattr(self.memory, 'faiss_small_path', '')}",
+                f"Mina FAISS base index path is {getattr(self.memory, 'faiss_base_path', '')}",
+                f"Mina memory backup directory is {getattr(self.memory, 'backup_dir', '')}",
+            ]
+
+            for fact in facts:
+                fact_clean = (fact or "").strip()
+                if not fact_clean:
+                    continue
+
+                exists = False
+                if hasattr(self.memory, "find_memory_id_by_text"):
+                    exists = self.memory.find_memory_id_by_text(
+                        fact_clean,
+                        include_kinds=["fact", "procedure"],
+                        include_tags=["system_seed"],
+                    ) is not None
+
+                if not exists:
+                    self.memory.add_memory(
+                        fact_clean,
+                        kind="procedure",
+                        tags=["user_memory", "system_seed", "startup_fact"],
+                    )
+        except Exception:
+            traceback.print_exc()
+
+    def _path_alias_record(self, alias: str, path: str) -> str:
+        return f"path_alias::{alias.strip().lower()}::{path}"
+
+    def _path_alias_deleted_record(self, alias: str) -> str:
+        return f"path_alias_deleted::{alias.strip().lower()}"
+
+    def _parse_path_alias_record(self, text: str) -> Tuple[str, str]:
+        m = re.match(r'^path_alias::([^:]+)::(.+)$', (text or "").strip(), re.IGNORECASE)
+        if not m:
+            return "", ""
+        return m.group(1).strip().lower(), m.group(2).strip()
+
+    def _parse_path_alias_deleted_record(self, text: str) -> str:
+        m = re.match(r'^path_alias_deleted::(.+)$', (text or "").strip(), re.IGNORECASE)
+        if not m:
+            return ""
+        return m.group(1).strip().lower()
+
+    def _get_path_alias_map(self) -> Dict[str, str]:
+        alias_map: Dict[str, str] = {}
+        deleted_aliases = set()
+
+        try:
+            recent = self.memory.recent_memories(
+                top_k=1000,
+                include_kinds=["procedure", "fact"],
+                include_tags=["user_memory"],
+            )
+
+            for item in recent or []:
+                text = (item.get("text") or "").strip()
+                if not text:
+                    continue
+
+                deleted_alias = self._parse_path_alias_deleted_record(text)
+                if deleted_alias:
+                    if deleted_alias not in alias_map:
+                        deleted_aliases.add(deleted_alias)
+                    continue
+
+                alias, path = self._parse_path_alias_record(text)
+                if not alias or not path:
+                    continue
+
+                if alias in deleted_aliases:
+                    continue
+
+                if alias not in alias_map:
+                    alias_map[alias] = path
+        except Exception:
+            traceback.print_exc()
+
+        return alias_map
+
+    def _store_path_alias(self, alias: str, path: str) -> Dict[str, Any]:
+        alias_clean = (alias or "").strip().lower()
+        path_clean = self._normalize_path(path)
+
+        if not alias_clean:
+            return {"ok": False, "result": None, "error": "no_alias_provided"}
+        if not path_clean:
+            return {"ok": False, "result": None, "error": "no_path_provided"}
+
+        text = self._path_alias_record(alias_clean, path_clean)
+        try:
+            dedupe_id = None
+            if hasattr(self.memory, "find_memory_id_by_text"):
+                dedupe_id = self.memory.find_memory_id_by_text(
+                    text,
+                    include_kinds=["procedure"],
+                    include_tags=["path_alias"],
+                )
+
+            if dedupe_id is None:
+                self.memory.add_memory(
+                    text,
+                    kind="procedure",
+                    tags=["user_memory", "path_alias"],
+                )
+
+            return {
+                "ok": True,
+                "result": {
+                    "alias": alias_clean,
+                    "path": path_clean,
+                    "stored": True,
+                },
+                "error": None,
+            }
+        except Exception as e:
+            return {"ok": False, "result": None, "error": str(e)}
+
+    def _forget_path_alias(self, alias: str) -> Dict[str, Any]:
+        alias_clean = (alias or "").strip().lower()
+        if not alias_clean:
+            return {"ok": False, "result": None, "error": "no_alias_provided"}
+
+        alias_map = self._get_path_alias_map()
+        if alias_clean not in alias_map:
+            return {
+                "ok": False,
+                "result": None,
+                "error": "alias_not_found",
+            }
+
+        try:
+            self.memory.add_memory(
+                self._path_alias_deleted_record(alias_clean),
+                kind="procedure",
+                tags=["user_memory", "path_alias_deleted"],
+            )
+            return {
+                "ok": True,
+                "result": {
+                    "alias": alias_clean,
+                    "forgotten": True,
+                },
+                "error": None,
+            }
+        except Exception as e:
+            return {"ok": False, "result": None, "error": str(e)}
+
+    def _list_path_aliases(self) -> Dict[str, Any]:
+        alias_map = self._get_path_alias_map()
+        entries = [
+            {"alias": alias, "path": path}
+            for alias, path in sorted(alias_map.items(), key=lambda x: x[0])
+        ]
+        return {
+            "ok": True,
+            "result": {
+                "aliases": entries,
+                "count": len(entries),
+            },
+            "error": None,
+        }
+
+    def _workspace_info(self) -> Dict[str, Any]:
+        try:
+            self.startup_context = self._build_startup_context()
+            root_exists = os.path.isdir(self.workspace_root)
+            default_dirs = [
+                os.path.join(self.workspace_root, d)
+                for d in self.workspace_default_dirs
+            ]
+            existing_dirs = [d for d in default_dirs if os.path.isdir(d)]
+
+            last_project = self.startup_context.get("last_worked_project")
+            incomplete = self.startup_context.get("incomplete_projects", [])
+
+            return {
+                "ok": True,
+                "result": {
+                    "current_datetime": datetime.now().isoformat(timespec="seconds"),
+                    "startup_time": self.startup_context.get("startup_time"),
+                    "workspace_root": self.workspace_root,
+                    "projects_root": self._projects_root(),
+                    "project_tracker_path": self._project_tracker_path(),
+                    "root_exists": root_exists,
+                    "default_dirs": default_dirs,
+                    "existing_default_dirs": existing_dirs,
+                    "project_count": self.startup_context.get("project_count", 0),
+                    "last_worked_project": last_project,
+                    "incomplete_projects": incomplete,
+                },
+                "error": None,
+            }
+        except Exception as e:
+            return {"ok": False, "result": None, "error": str(e)}
+
+    def _project_tracker_status(self) -> Dict[str, Any]:
+        try:
+            self.startup_context = self._build_startup_context()
+            tracker = self._load_project_tracker()
+            projects = tracker.get("projects", {}) if isinstance(tracker.get("projects", {}), dict) else {}
+            incomplete = self._projects_to_complete(tracker)
+            return {
+                "ok": True,
+                "result": {
+                    "tracker_path": self._project_tracker_path(),
+                    "updated_at": tracker.get("updated_at"),
+                    "project_count": len(projects),
+                    "incomplete_projects": incomplete,
+                },
+                "error": None,
+            }
+        except Exception as e:
+            return {"ok": False, "result": None, "error": str(e)}
+
+    def _memory_status(self) -> Dict[str, Any]:
+        try:
+            mem_status = self.memory.get_status() if hasattr(self.memory, "get_status") else {}
+            integrity = self.memory.verify_integrity() if hasattr(self.memory, "verify_integrity") else {}
+
+            return {
+                "ok": True,
+                "result": {
+                    "workspace_root": self.workspace_root,
+                    "memory_db_path": getattr(self.memory, "db_path", None),
+                    "faiss_small_path": getattr(self.memory, "faiss_small_path", None),
+                    "faiss_base_path": getattr(self.memory, "faiss_base_path", None),
+                    "backup_dir": getattr(self.memory, "backup_dir", None),
+                    "status": mem_status,
+                    "integrity": integrity,
+                },
+                "error": None,
+            }
+        except Exception as e:
+            return {"ok": False, "result": None, "error": str(e)}
+
+    def _startup_status(self) -> Dict[str, Any]:
+        try:
+            self.startup_context = self._build_startup_context()
+            return {
+                "ok": True,
+                "result": {
+                    "current_datetime": datetime.now().isoformat(timespec="seconds"),
+                    "startup_time": self.startup_context.get("startup_time"),
+                    "workspace_root": self.workspace_root,
+                    "last_worked_project": self.startup_context.get("last_worked_project"),
+                    "incomplete_projects": self.startup_context.get("incomplete_projects", []),
+                },
+                "error": None,
+            }
+        except Exception as e:
+            return {"ok": False, "result": None, "error": str(e)}
+
+    def _run_git(self, args: List[str], timeout_sec: int = 60) -> Dict[str, Any]:
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=os.getcwd(),
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+            return {
+                "ok": proc.returncode == 0,
+                "code": proc.returncode,
+                "stdout": (proc.stdout or "").strip(),
+                "stderr": (proc.stderr or "").strip(),
+            }
+        except FileNotFoundError:
+            return {
+                "ok": False,
+                "code": 127,
+                "stdout": "",
+                "stderr": "git_not_found",
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "code": 1,
+                "stdout": "",
+                "stderr": str(e),
+            }
+
+    def _git_is_repo(self) -> Dict[str, Any]:
+        probe = self._run_git(["rev-parse", "--is-inside-work-tree"], timeout_sec=10)
+        inside = probe.get("ok") and probe.get("stdout", "").strip().lower() == "true"
+        return {
+            "ok": bool(inside),
+            "probe": probe,
+        }
+
+    def _git_init(self) -> Dict[str, Any]:
+        existing = self._git_is_repo()
+        if existing.get("ok"):
+            root = self._run_git(["rev-parse", "--show-toplevel"], timeout_sec=10)
+            return {
+                "ok": True,
+                "result": {
+                    "already_initialized": True,
+                    "repo_root": root.get("stdout", "") or os.getcwd(),
+                },
+                "error": None,
+            }
+
+        init = self._run_git(["init"], timeout_sec=20)
+        if not init.get("ok"):
+            return {"ok": False, "result": None, "error": init.get("stderr") or "git_init_failed"}
+
+        root = self._run_git(["rev-parse", "--show-toplevel"], timeout_sec=10)
+        return {
+            "ok": True,
+            "result": {
+                "already_initialized": False,
+                "repo_root": root.get("stdout", "") or os.getcwd(),
+                "git_output": init.get("stdout", "") or init.get("stderr", ""),
+            },
+            "error": None,
+        }
+
+    def _git_status(self) -> Dict[str, Any]:
+        state = self._git_is_repo()
+        if not state.get("ok"):
+            return {
+                "ok": False,
+                "result": None,
+                "error": "not_a_git_repository",
+            }
+
+        branch = self._run_git(["branch", "--show-current"], timeout_sec=10)
+        status = self._run_git(["status", "--short", "--branch"], timeout_sec=15)
+        remotes = self._run_git(["remote", "-v"], timeout_sec=10)
+
+        return {
+            "ok": status.get("ok", False),
+            "result": {
+                "branch": branch.get("stdout", ""),
+                "status": status.get("stdout", ""),
+                "remotes": remotes.get("stdout", ""),
+            },
+            "error": None if status.get("ok") else (status.get("stderr") or "git_status_failed"),
+        }
+
+    def _git_snapshot(self, message: str) -> Dict[str, Any]:
+        state = self._git_is_repo()
+        if not state.get("ok"):
+            return {
+                "ok": False,
+                "result": None,
+                "error": "not_a_git_repository",
+            }
+
+        add = self._run_git(["add", "-A"], timeout_sec=30)
+        if not add.get("ok"):
+            return {"ok": False, "result": None, "error": add.get("stderr") or "git_add_failed"}
+
+        staged = self._run_git(["diff", "--cached", "--name-only"], timeout_sec=15)
+        changed_files = [ln.strip() for ln in (staged.get("stdout", "") or "").splitlines() if ln.strip()]
+        if not changed_files:
+            return {
+                "ok": True,
+                "result": {
+                    "snapshot_created": False,
+                    "message": "no_changes_to_commit",
+                    "files_changed": [],
+                },
+                "error": None,
+            }
+
+        msg = (message or "").strip()
+        if not msg:
+            msg = f"mina snapshot {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+        commit = self._run_git(["commit", "-m", msg, "--no-gpg-sign"], timeout_sec=45)
+        if not commit.get("ok"):
+            err = commit.get("stderr", "")
+            if "Please tell me who you are" in err or "unable to auto-detect email address" in err:
+                return {
+                    "ok": False,
+                    "result": None,
+                    "error": (
+                        "git_identity_not_configured. Run: "
+                        "git config user.name \"Your Name\" ; "
+                        "git config user.email \"you@example.com\""
+                    ),
+                }
+            return {"ok": False, "result": None, "error": err or "git_commit_failed"}
+
+        head = self._run_git(["rev-parse", "--short", "HEAD"], timeout_sec=10)
+        return {
+            "ok": True,
+            "result": {
+                "snapshot_created": True,
+                "message": msg,
+                "commit": head.get("stdout", ""),
+                "files_changed": changed_files,
+            },
+            "error": None,
+        }
+
+    def _git_pull(self) -> Dict[str, Any]:
+        state = self._git_is_repo()
+        if not state.get("ok"):
+            return {"ok": False, "result": None, "error": "not_a_git_repository"}
+
+        pulled = self._run_git(["pull", "--ff-only"], timeout_sec=120)
+        if not pulled.get("ok"):
+            return {"ok": False, "result": None, "error": pulled.get("stderr") or "git_pull_failed"}
+
+        return {
+            "ok": True,
+            "result": {
+                "output": pulled.get("stdout", "") or pulled.get("stderr", ""),
+            },
+            "error": None,
+        }
+
+    def _git_push(self) -> Dict[str, Any]:
+        state = self._git_is_repo()
+        if not state.get("ok"):
+            return {"ok": False, "result": None, "error": "not_a_git_repository"}
+
+        pushed = self._run_git(["push"], timeout_sec=120)
+        if not pushed.get("ok"):
+            return {"ok": False, "result": None, "error": pushed.get("stderr") or "git_push_failed"}
+
+        return {
+            "ok": True,
+            "result": {
+                "output": pushed.get("stdout", "") or pushed.get("stderr", ""),
+            },
+            "error": None,
+        }
+
+    def _resolve_path_alias(self, query: str) -> Optional[str]:
+        q = (query or "").strip().lower()
+        if not q:
+            return None
+
+        alias_map = self._get_path_alias_map()
+        if not alias_map:
+            return None
+
+        candidates: List[Tuple[int, str]] = []
+
+        def score_item(alias: str, path: str) -> int:
+            score = 0
+            if alias and alias in q:
+                score += 100
+
+            alias_tokens = [t for t in re.findall(r"[a-z0-9]+", alias) if len(t) > 1]
+            for tok in alias_tokens:
+                if tok in q:
+                    score += 10
+
+            base = os.path.basename(path).lower()
+            if base and base in q:
+                score += 20
+
+            if any(k in q for k in ["run", "execute", "start", "open"]):
+                if base.endswith((".ps1", ".py", ".bat", ".cmd")):
+                    score += 5
+
+            return score
+
+        try:
+            for alias, path in alias_map.items():
+                s = score_item(alias, path)
+                if s > 0:
+                    candidates.append((s, path))
+
+            if not candidates:
+                return None
+
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return candidates[0][1]
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    def _extract_json_object(self, text: str) -> str:
+        if not text:
+            return ""
+
+        raw = self._strip_code_fences(text).strip()
+        if raw.startswith("{") and raw.endswith("}"):
+            return raw
+
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            return raw[start:end + 1]
+        return ""
+
+    def _build_scaffold_plan(self, user_input: str) -> Dict[str, Any]:
+        fallback_files: List[Dict[str, str]] = []
+        for m in re.finditer(r'([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,8})', user_input):
+            p = m.group(1).strip()
+            if p:
+                fallback_files.append({"path": p, "instructions": user_input})
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Convert the user request into a workspace scaffold JSON plan. "
+                    "Return ONLY JSON with keys: directories (string[]), files ({path,instructions}[]). "
+                    "Use relative paths unless absolute path is explicitly requested. "
+                    "Do not include markdown fences or commentary."
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_input,
+            },
+        ]
+
+        try:
+            reply = self.model.chat(messages=messages, temperature=0.1)
+            raw = self._extract_text(reply)
+            json_text = self._extract_json_object(raw)
+            if json_text:
+                plan = json.loads(json_text)
+                if isinstance(plan, dict):
+                    directories = plan.get("directories", [])
+                    files = plan.get("files", [])
+                    if not isinstance(directories, list):
+                        directories = []
+                    if not isinstance(files, list):
+                        files = []
+                    return {
+                        "directories": [str(d).strip() for d in directories if str(d).strip()],
+                        "files": [
+                            {
+                                "path": str(f.get("path", "")).strip(),
+                                "instructions": str(f.get("instructions", "")).strip() or user_input,
+                            }
+                            for f in files
+                            if isinstance(f, dict) and str(f.get("path", "")).strip()
+                        ],
+                    }
+        except Exception:
+            traceback.print_exc()
+
+        return {
+            "directories": [],
+            "files": fallback_files,
+        }
+
+    def _execute_scaffold_request(self, user_input: str) -> Dict[str, Any]:
+        plan = self._build_scaffold_plan(user_input)
+        directories = plan.get("directories", [])
+        files = plan.get("files", [])
+
+        overwrite_existing = bool(re.search(r"\b(overwrite|replace|force|clobber)\b", user_input.lower()))
+
+        if not directories and not files:
+            return {
+                "ok": False,
+                "result": None,
+                "error": "no_scaffold_targets_detected",
+            }
+
+        dir_created: List[str] = []
+        file_written: List[str] = []
+        file_skipped: List[str] = []
+        errors: List[str] = []
+
+        for d in directories:
+            target_dir = self._normalize_path(d)
+            r = self.tools.run("dir_create", {"path": target_dir})
+            if r.get("ok"):
+                p = r.get("result", {}).get("path")
+                if p:
+                    dir_created.append(p)
+            else:
+                errors.append(f"dir_create {target_dir}: {r.get('error')}")
+
+        for f in files:
+            path = str(f.get("path", "")).strip()
+            if not path:
+                continue
+
+            path = self._normalize_path(path)
+
+            instructions = str(f.get("instructions", "")).strip() or user_input
+            parent = os.path.dirname(path)
+            if parent:
+                self.tools.run("dir_create", {"path": parent})
+
+            content = self._generate_file_content_from_intent(
+                user_input=instructions,
+                target_path=path,
+            )
+            if not content.strip():
+                errors.append(f"file_write {path}: failed_to_generate_content")
+                continue
+
+            r = self.tools.run(
+                "file_write",
+                {
+                    "path": path,
+                    "content": content,
+                    "overwrite": overwrite_existing,
+                },
+            )
+            if r.get("ok"):
+                p = r.get("result", {}).get("path")
+                if p:
+                    file_written.append(p)
+            else:
+                if r.get("error") == "file_exists_no_overwrite":
+                    p = r.get("result", {}).get("path") or path
+                    file_skipped.append(str(p))
+                else:
+                    errors.append(f"file_write {path}: {r.get('error')}")
+
+        ok = len(errors) == 0 and (len(dir_created) > 0 or len(file_written) > 0 or len(file_skipped) > 0)
+        return {
+            "ok": ok,
+            "result": {
+                "overwrite_enabled": overwrite_existing,
+                "directories_created": dir_created,
+                "files_written": file_written,
+                "files_skipped_existing": file_skipped,
+                "errors": errors,
+            },
+            "error": None if ok else "scaffold_incomplete",
+        }
+
+# ========================================================
+# PROCESS
+# ========================================================
+
+    def process(
+        self,
+        user_input: str,
+    ) -> Dict[str, Any]:
+
+        try:
+
+            print("\n========================================")
+            print("MK1 PROCESS START")
+            print("========================================")
+            print("USER INPUT:")
+            print(user_input)
+
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # HYBRID MEMORY ENGINE MAINTENANCE TICK
+            # Runs scheduled backups, trimming, health checks.
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            self.memory.maintenance_tick()
+
+            context = self.build_context(user_input)
+
+            messages: List[Dict[str, str]] = []
+
+            if self.system_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": self.system_prompt,
+                })
+
+            if context:
+                messages.append({
+                    "role": "system",
+                    "content": f"Relevant memory context:\n{context}",
+                })
+
+            # =================================================
+            # TOOL REFLEX FIRST
+            # =================================================
+
+            reflex_reply = self._reflex_tools_and_memory(
+                messages=messages,
+                reply={},
+                user_input=user_input,
+            )
+
+            if reflex_reply is not None:
+
+                final_text = self._extract_text(
+                    reflex_reply
+                )
+
+                self._store_turn_memory(
+                    user_input=user_input,
+                    assistant_text=final_text,
+                )
+
+                return {
+                    "reply": final_text
+                }
+
+            # =================================================
+            # NORMAL MODEL FLOW
+            # =================================================
+
+            messages.append({
+                "role": "user",
+                "content": user_input,
+            })
+
+            reply = self.model.chat(
+                messages=messages,
+            )
+
+            final_text = self._handle_model_response(
+                messages,
+                reply,
+            )
+
+            self._store_turn_memory(
+                user_input=user_input,
+                assistant_text=final_text,
+            )
+
+            return {
+                "reply": final_text
+            }
+
+
+        except Exception as e:
+
+            traceback.print_exc()
+
+            return {
+                "reply": f"(core error: {str(e)})"
+            }
+    # ========================================================
+    # MEMORY CONTEXT
+    # ========================================================
+
+    def build_context(self, query: str) -> str:
+        try:
+            recent_turns = self.memory.recent_memories(
+                top_k=6,
+                include_kinds=["interaction"],
+                include_tags=["short_term"],
+            )
+
+            short_semantic = self.memory.search(
+                query,
+                top_k=4,
+                include_kinds=["interaction"],
+                include_tags=["short_term"],
+            )
+
+            long_semantic = self.memory.search(
+                query,
+                top_k=4,
+                include_kinds=["fact", "tool", "preference", "procedure"],
+            )
+
+            if not recent_turns and not short_semantic and not long_semantic:
+                return ""
+
+            lines: List[str] = []
+            seen = set()
+
+            short_items = recent_turns + short_semantic
+            if short_items:
+                lines.append("Short-term recall:")
+                for r in short_items:
+                    txt = r.get("text", "").strip()
+                    if not txt or txt in seen:
+                        continue
+                    seen.add(txt)
+                    lines.append(f"- {txt}")
+
+            if long_semantic:
+                if lines:
+                    lines.append("")
+                lines.append("Long-term recall:")
+                for r in long_semantic:
+                    txt = r.get("text", "").strip()
+                    if not txt or txt in seen:
+                        continue
+                    seen.add(txt)
+                    lines.append(f"- {txt}")
+
+            if not lines:
+                return ""
+
+            return "\n".join(lines[:18])
+
+        except Exception:
+            traceback.print_exc()
+            return ""
+
+    # ========================================================
+    # FORMAT TOOL RESULT
+    # ========================================================
+
+    def _format_tool_result(
+        self,
+        tool_name: str,
+        result: Dict[str, Any],
+    ) -> str:
+
+        if not isinstance(result, dict):
+            return str(result)
+
+        if tool_name == "__tool_list__":
+            tools = result.get("tools", [])
+            if not tools:
+                return "No tools available."
+            lines = ["Available tools:", ""]
+            for t in tools:
+                lines.append(f"- {t}")
+            return "\n".join(lines)
+
+        if tool_name == "file_read":
+            if not result.get("ok"):
+                return f"File read failed: {result.get('error')}"
+            content = result.get("result", {}).get("content", "")
+            return content or "(empty file)"
+
+        if tool_name == "dir_list":
+            if not result.get("ok"):
+                return f"Directory listing failed: {result.get('error')}"
+            files = result.get("result", {}).get("items", [])
+            if not files:
+                return "(directory empty)"
+            return "\n".join(files)
+
+        if tool_name == "dir_create":
+            if not result.get("ok"):
+                return f"Directory create failed: {result.get('error')}"
+            path = result.get("result", {}).get("path")
+            already_exists = result.get("result", {}).get("already_exists")
+            if already_exists:
+                return f"Directory already exists: {path}"
+            return f"Directory created: {path}"
+
+        if tool_name == "__scaffold__":
+            payload = result.get("result", {})
+            if not payload and not result.get("ok"):
+                return f"Scaffold failed: {result.get('error')}"
+
+            dirs = payload.get("directories_created", [])
+            files = payload.get("files_written", [])
+            skipped = payload.get("files_skipped_existing", [])
+            errors = payload.get("errors", [])
+            overwrite_enabled = payload.get("overwrite_enabled", False)
+
+            lines = [
+                "Scaffold completed." if result.get("ok") else "Scaffold finished with issues.",
+                f"Overwrite mode: {'ON' if overwrite_enabled else 'SAFE (skip existing files)'}",
+            ]
+            if dirs:
+                lines.append("Directories:")
+                lines.extend([f"- {d}" for d in dirs])
+            if files:
+                lines.append("Files:")
+                lines.extend([f"- {f}" for f in files])
+            if skipped:
+                lines.append("Skipped existing files:")
+                lines.extend([f"- {s}" for s in skipped])
+            if errors:
+                lines.append("Errors:")
+                lines.extend([f"- {e}" for e in errors])
+            return "\n".join(lines)
+
+        if tool_name == "__path_alias_set__":
+            if not result.get("ok"):
+                return f"Path alias save failed: {result.get('error')}"
+            alias = result.get("result", {}).get("alias")
+            path = result.get("result", {}).get("path")
+            return f"Path alias saved: '{alias}' -> {path}"
+
+        if tool_name == "__path_alias_list__":
+            if not result.get("ok"):
+                return f"Path alias list failed: {result.get('error')}"
+            aliases = result.get("result", {}).get("aliases", [])
+            if not aliases:
+                return "No saved path aliases."
+            lines = ["Saved path aliases:"]
+            for item in aliases:
+                lines.append(f"- {item.get('alias')}: {item.get('path')}")
+            return "\n".join(lines)
+
+        if tool_name == "__path_alias_forget__":
+            if not result.get("ok"):
+                return f"Path alias forget failed: {result.get('error')}"
+            alias = result.get("result", {}).get("alias")
+            return f"Path alias removed: '{alias}'"
+
+        if tool_name == "__workspace_info__":
+            if not result.get("ok"):
+                return f"Workspace info failed: {result.get('error')}"
+            payload = result.get("result", {})
+            lines = [
+                f"Workspace root: {payload.get('workspace_root')}",
+                f"Current datetime: {payload.get('current_datetime')}",
+                f"Root exists: {payload.get('root_exists')}",
+            ]
+            last_project = payload.get("last_worked_project")
+            if isinstance(last_project, dict):
+                lines.append(
+                    f"Last worked project: {last_project.get('name')} ({last_project.get('path')})"
+                )
+
+            incomplete = payload.get("incomplete_projects", [])
+            if incomplete:
+                lines.append("Incomplete projects:")
+                for p in incomplete[:10]:
+                    lines.append(f"- {p.get('name')}: {p.get('path')}")
+
+            dirs = payload.get("default_dirs", [])
+            if dirs:
+                lines.append("Default directories:")
+                lines.extend([f"- {d}" for d in dirs])
+            return "\n".join(lines)
+
+        if tool_name == "__startup_status__":
+            if not result.get("ok"):
+                return f"Startup status failed: {result.get('error')}"
+            payload = result.get("result", {})
+            lines = [
+                f"Current datetime: {payload.get('current_datetime')}",
+                f"Startup time: {payload.get('startup_time')}",
+                f"Workspace root: {payload.get('workspace_root')}",
+            ]
+
+            last_project = payload.get("last_worked_project")
+            if isinstance(last_project, dict):
+                lines.append(
+                    f"Last worked project: {last_project.get('name')} ({last_project.get('path')})"
+                )
+
+            incomplete = payload.get("incomplete_projects", [])
+            if incomplete:
+                lines.append("Projects to complete:")
+                for p in incomplete[:10]:
+                    lines.append(f"- {p.get('name')}: {p.get('path')}")
+            else:
+                lines.append("Projects to complete: none detected")
+
+            return "\n".join(lines)
+
+        if tool_name == "__git_init__":
+            if not result.get("ok"):
+                return f"Git init failed: {result.get('error')}"
+            payload = result.get("result", {})
+            if payload.get("already_initialized"):
+                return f"Git is already initialized at: {payload.get('repo_root')}"
+            return f"Git initialized at: {payload.get('repo_root')}"
+
+        if tool_name == "__git_status__":
+            if not result.get("ok"):
+                return f"Git status failed: {result.get('error')}"
+            payload = result.get("result", {})
+            lines = [
+                f"Branch: {payload.get('branch') or '(unknown)'}",
+                "Status:",
+                payload.get("status") or "(clean)",
+            ]
+            remotes = (payload.get("remotes") or "").strip()
+            if remotes:
+                lines.extend(["Remotes:", remotes])
+            return "\n".join(lines)
+
+        if tool_name == "__git_snapshot__":
+            if not result.get("ok"):
+                return f"Git snapshot failed: {result.get('error')}"
+            payload = result.get("result", {})
+            if not payload.get("snapshot_created"):
+                return "No changes to commit. Working tree is clean."
+            lines = [
+                f"Snapshot created: {payload.get('commit')}",
+                f"Message: {payload.get('message')}",
+            ]
+            changed = payload.get("files_changed", [])
+            if changed:
+                lines.append("Files:")
+                lines.extend([f"- {p}" for p in changed[:50]])
+            return "\n".join(lines)
+
+        if tool_name == "__git_pull__":
+            if not result.get("ok"):
+                return f"Git pull failed: {result.get('error')}"
+            payload = result.get("result", {})
+            return payload.get("output") or "Git pull completed."
+
+        if tool_name == "__git_push__":
+            if not result.get("ok"):
+                return f"Git push failed: {result.get('error')}"
+            payload = result.get("result", {})
+            return payload.get("output") or "Git push completed."
+
+        if tool_name == "__project_tracker_status__":
+            if not result.get("ok"):
+                return f"Project tracker status failed: {result.get('error')}"
+            payload = result.get("result", {})
+            lines = [
+                f"Tracker file: {payload.get('tracker_path')}",
+                f"Updated at: {payload.get('updated_at')}",
+                f"Tracked projects: {payload.get('project_count')}",
+            ]
+            incomplete = payload.get("incomplete_projects", [])
+            if incomplete:
+                lines.append("Projects to complete:")
+                for p in incomplete[:20]:
+                    steps = p.get("next_steps", []) if isinstance(p.get("next_steps", []), list) else []
+                    lines.append(f"- {p.get('name')} [{p.get('status')}]")
+                    if steps:
+                        lines.append(f"  next: {steps[0]}")
+            else:
+                lines.append("Projects to complete: none detected")
+            return "\n".join(lines)
+
+        if tool_name == "__project_tracker_update__":
+            if not result.get("ok"):
+                return f"Project tracker update failed: {result.get('error')}"
+            payload = result.get("result", {})
+            return (
+                f"Project updated: {payload.get('project')}\n"
+                f"Status: {payload.get('status')}\n"
+                f"Next steps: {payload.get('next_steps')}"
+            )
+
+        if tool_name == "__memory_status__":
+            if not result.get("ok"):
+                return f"Memory status failed: {result.get('error')}"
+
+            payload = result.get("result", {})
+            status = payload.get("status", {}) if isinstance(payload.get("status", {}), dict) else {}
+            integrity = payload.get("integrity", {}) if isinstance(payload.get("integrity", {}), dict) else {}
+
+            lines = [
+                f"Workspace root: {payload.get('workspace_root')}",
+                f"Memory DB: {payload.get('memory_db_path')}",
+                f"FAISS small: {payload.get('faiss_small_path')}",
+                f"FAISS base: {payload.get('faiss_base_path')}",
+                f"Backup dir: {payload.get('backup_dir')}",
+                f"Memory OK: {status.get('ok')}",
+                f"DB OK: {status.get('db_ok')}",
+                f"Embed small/base OK: {status.get('embed_small_ok')}/{status.get('embed_base_ok')}",
+            ]
+
+            if integrity:
+                lines.append(
+                    f"Indexes loaded (small/base): {integrity.get('small_index_loaded')}/{integrity.get('base_index_loaded')}"
+                )
+                lines.append(
+                    f"Index totals (small/base): {integrity.get('small_index_ntotal')}/{integrity.get('base_index_ntotal')}"
+                )
+
+            return "\n".join(lines)
+
+        if tool_name == "__project_bootstrap__":
+            if not result.get("ok"):
+                return f"Project bootstrap failed: {result.get('error')}"
+            payload = result.get("result", {})
+            lines = [
+                f"Project created: {payload.get('project')}",
+                f"Path: {payload.get('path')}",
+                f"Status: {payload.get('status')}",
+                f"Next steps: {payload.get('next_steps')}",
+            ]
+            files = payload.get("files_created", [])
+            if files:
+                lines.append("Files created:")
+                lines.extend([f"- {f}" for f in files])
+            return "\n".join(lines)
+
+        if tool_name == "github_repo":
+            if not result.get("ok"):
+                return f"GitHub request failed: {result.get('error')}"
+            payload = result.get("result")
+            if payload is None:
+                return "No GitHub data returned."
+            try:
+                return json.dumps(payload, indent=2, ensure_ascii=False)
+            except Exception:
+                return str(payload)
+
+        if tool_name == "memory_read":
+            if not result.get("ok"):
+                return f"Memory read failed: {result.get('error')}"
+            entries = result.get("results", [])
+            if not entries:
+                return "No matching memories found."
+            lines = []
+            seen = set()
+            for item in entries:
+                text = item.get("text", "").strip()
+                if not text:
+                    continue
+                norm = " ".join(text.lower().split())
+                if norm in seen:
+                    continue
+                seen.add(norm)
+                lines.append(text)
+            return "\n".join(lines) if lines else "No matching memories found."
+
+        if tool_name == "file_write":
+            if not result.get("ok"):
+                return f"File write failed: {result.get('error')}"
+            written = result.get("result", {}).get("written")
+            path = result.get("result", {}).get("path")
+            if written:
+                return f"File written to: {path}"
+            return "File write completed."
+
+        if tool_name == "file_append":
+            if not result.get("ok"):
+                return f"File append failed: {result.get('error')}"
+            appended = result.get("result", {}).get("appended")
+            path = result.get("result", {}).get("path")
+            if appended:
+                return f"Content appended to: {path}"
+            return "File append completed."
+
+        if tool_name == "file_move":
+            if not result.get("ok"):
+                return f"File move failed: {result.get('error')}"
+            moved = result.get("result", {}).get("moved")
+            src = result.get("result", {}).get("src")
+            dst = result.get("result", {}).get("dst")
+            if moved:
+                return f"File moved from {src} to {dst}"
+            return "File move completed."
+
+        if tool_name == "safe_copy":
+            if not result.get("ok"):
+                return f"Safe copy failed: {result.get('error')}"
+            payload = result.get("result", {})
+            progress = payload.get("progress", [])
+            if progress:
+                return "\n".join(progress)
+            copied = payload.get("copied")
+            dst = payload.get("dst")
+            if copied and dst:
+                return f"File copied to: {dst}"
+            return "File copy completed."
+
+        if tool_name == "file_delete":
+            if not result.get("ok"):
+                return f"File delete failed: {result.get('error')}"
+            deleted = result.get("result", {}).get("deleted")
+            path = result.get("result", {}).get("path")
+            if deleted:
+                return f"File deleted: {path}"
+            return "File delete completed."
+
+        if tool_name == "memory_write":
+            if not result.get("ok"):
+                return f"Memory write failed: {result.get('error')}"
+            stored = result.get("stored")
+            if stored:
+                return f"Stored memory: {stored}"
+            return "Memory stored successfully."
+
+        if tool_name == "ps_run":
+            if not result.get("ok"):
+                return f"PowerShell execution failed: {result.get('error')}"
+            payload = result.get("result", {})
+            stdout = payload.get("stdout", "")
+            stderr = payload.get("stderr", "")
+            exit_code = payload.get("exit_code")
+            if stdout:
+                if stderr:
+                    return f"{stdout}\n\nSTDERR:\n{stderr}"
+                return stdout
+            if stderr:
+                return stderr
+            return f"PowerShell exited with code {exit_code}."
+
+        return json.dumps(result, indent=2)
+
+    # ========================================================
+    # REFLEX LAYER
+    # ========================================================
+
+    def _reflex_tools_and_memory(
+        self,
+        messages: List[Dict[str, Any]],
+        reply: Dict[str, Any],
+        user_input: str,
+    ) -> Optional[Dict[str, Any]]:
+
+        tool_name, tool_args = self.detect_tool_intent(user_input)
+        if not tool_name:
+            return None
+
+        print("\n========================================")
+        print("TOOL DETECTED")
+        print("========================================")
+        print(tool_name)
+
+        print("\n========================================")
+        print("TOOL ARGS")
+        print("========================================")
+        print(tool_args)
+
+        if tool_name in ("file_write", "file_append"):
+            existing = str(tool_args.get("content", "") or "").strip()
+            target_path = str(tool_args.get("path", "") or "").strip()
+
+            if target_path and not existing:
+                generated = self._generate_file_content_from_intent(
+                    user_input=user_input,
+                    target_path=target_path,
+                )
+                if generated.strip():
+                    tool_args["content"] = generated
+
+        if tool_name in ("file_read", "file_write", "file_append", "file_delete", "dir_create", "dir_list"):
+            path_val = str(tool_args.get("path", "") or "").strip()
+            if path_val:
+                tool_args["path"] = self._normalize_path(path_val)
+            else:
+                resolved = self._resolve_path_alias(user_input)
+                if resolved:
+                    tool_args["path"] = resolved
+
+        if tool_name == "file_move":
+            src_val = str(tool_args.get("src", "") or "").strip()
+            dst_val = str(tool_args.get("dst", "") or "").strip()
+            if src_val:
+                tool_args["src"] = self._normalize_path(src_val)
+            else:
+                resolved_src = self._resolve_path_alias(user_input)
+                if resolved_src:
+                    tool_args["src"] = resolved_src
+            if dst_val:
+                tool_args["dst"] = self._normalize_path(dst_val)
+            else:
+                resolved_dst = self._resolve_path_alias(user_input + " destination")
+                if resolved_dst:
+                    tool_args["dst"] = resolved_dst
+
+        if tool_name == "ps_run":
+            script_val = str(tool_args.get("script", "") or tool_args.get("command", "") or "").strip()
+            has_explicit_path = re.search(r'([A-Za-z]:\\|[.]{1,2}[\\/]|\\[^\s]+\.(ps1|py|bat|cmd))', script_val, re.IGNORECASE) is not None
+            if not has_explicit_path:
+                resolved_script = self._resolve_path_alias(user_input)
+                if resolved_script:
+                    tool_args["script"] = f'& "{resolved_script}"'
+
+        if tool_name == "__tool_list__":
+            result = {
+                "ok": True,
+                "tools": list(self.tools.tools.keys()),
+                "status": self.tools.get_status(),
+            }
+        elif tool_name == "__path_alias_set__":
+            result = self._store_path_alias(
+                alias=str(tool_args.get("alias", "") or ""),
+                path=str(tool_args.get("path", "") or ""),
+            )
+        elif tool_name == "__path_alias_list__":
+            result = self._list_path_aliases()
+        elif tool_name == "__path_alias_forget__":
+            result = self._forget_path_alias(
+                alias=str(tool_args.get("alias", "") or ""),
+            )
+        elif tool_name == "__workspace_info__":
+            result = self._workspace_info()
+        elif tool_name == "__startup_status__":
+            result = self._startup_status()
+        elif tool_name == "__git_init__":
+            result = self._git_init()
+        elif tool_name == "__git_status__":
+            result = self._git_status()
+        elif tool_name == "__git_snapshot__":
+            result = self._git_snapshot(
+                message=str(tool_args.get("message", "") or ""),
+            )
+        elif tool_name == "__git_pull__":
+            result = self._git_pull()
+        elif tool_name == "__git_push__":
+            result = self._git_push()
+        elif tool_name == "__project_tracker_status__":
+            result = self._project_tracker_status()
+        elif tool_name == "__project_tracker_update__":
+            result = self._update_project_tracker(
+                project_name=str(tool_args.get("project", "") or ""),
+                status=(str(tool_args.get("status", "") or "").strip() or None),
+                next_step=(str(tool_args.get("next_step", "") or "").strip() or None),
+            )
+        elif tool_name == "__memory_status__":
+            result = self._memory_status()
+        elif tool_name == "__project_bootstrap__":
+            result = self._bootstrap_project(
+                project_name=str(tool_args.get("project", "") or ""),
+                user_input=str(tool_args.get("request", user_input) or user_input),
+                status=(str(tool_args.get("status", "") or "").strip() or None),
+                next_steps=tool_args.get("next_steps", []) if isinstance(tool_args.get("next_steps", []), list) else [],
+            )
+        elif tool_name == "__scaffold__":
+            result = self._execute_scaffold_request(user_input)
+        else:
+            result = self.tools.run(tool_name, tool_args)
+
+        try:
+            summary = (
+                f"Tool '{tool_name}' "
+                f"called with args={tool_args}, "
+                f"result_ok={result.get('ok', None)}"
+            )
+            self.memory.add_memory(
+                summary,
+                kind="tool",
+                tags=["tool_call", tool_name],
+            )
+        except Exception:
+            traceback.print_exc()
+
+        formatted = self._format_tool_result(tool_name, result)
+        if not formatted.strip():
+            formatted = "(tool returned no output)"
+
+        if tool_name in (
+            "__tool_list__",
+            "__path_alias_set__",
+            "__path_alias_list__",
+            "__path_alias_forget__",
+            "__workspace_info__",
+            "__startup_status__",
+            "__git_init__",
+            "__git_status__",
+            "__git_snapshot__",
+            "__git_pull__",
+            "__git_push__",
+            "__project_tracker_status__",
+            "__project_tracker_update__",
+            "__project_bootstrap__",
+            "__memory_status__",
+            "__scaffold__",
+            "memory_write",
+            "dir_list",
+            "dir_create",
+            "file_read",
+            "file_write",
+            "file_append",
+            "file_delete",
+            "file_move",
+            "safe_copy",
+            "github_repo",
+            "ps_run",
+        ):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": formatted,
+                        }
+                    }
+                ]
+            }
+
+        messages.append({
+            "role": "user",
+            "content": user_input,
+        })
+
+        if tool_name == "memory_read":
+            cleaned = self._build_memory_read_reply(
+                messages=messages,
+                user_query=user_input,
+                formatted=formatted,
+            )
+
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": cleaned or formatted,
+                        }
+                    }
+                ]
+            }
+
+        messages.append({
+            "role": "assistant",
+            "content": f"""A tool was executed.
+
+Tool Name:
+{tool_name}
+
+Verified Tool Output:
+{formatted}
+
+IMPORTANT RULES:
+- ONLY use the verified tool output above.
+- DO NOT invent files, folders, summaries, or examples.
+- DO NOT hallucinate directory contents.
+- If the tool output is empty, say so plainly.
+- Stay conversational as Mina.
+- Keep the response concise and accurate.
+""",
+        })
+
+        reply = self.model.chat(messages)
+        return reply
+
+    # ========================================================
+    # TOOL DETECTION
+    # ========================================================
+
+    def detect_tool_intent(
+        self,
+        text: str,
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+
+        if not text:
+            return None, {}
+
+        raw_text = text.strip()
+        t = raw_text.lower().strip()
+
+        if t.startswith("please "):
+            t = t[7:].strip()
+
+        # ====================================================
+        # COMBINED MEMORY REFLEX
+        # ====================================================
+
+        def extract_memory_write_text(raw_text: str) -> str:
+            cleaned = (raw_text or "").strip()
+            lowered = cleaned.lower()
+
+            leading_triggers = [
+                "remember that ",
+                "remember this ",
+                "remember ",
+                "store this ",
+                "save this ",
+                "keep this ",
+                "note that ",
+                "note ",
+                "add to memory ",
+                "save to memory ",
+                "write this down ",
+                "keep that ",
+            ]
+
+            for trigger in leading_triggers:
+                if lowered.startswith(trigger):
+                    cleaned = cleaned[len(trigger):].strip()
+                    lowered = cleaned.lower()
+                    break
+
+            cleaned = re.sub(
+                r"\b(?:please\s+)?(?:save|store|remember|keep)\s+(?:this|that)\b[.!?]*$",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            cleaned = re.sub(r"^[\s\-:]+|[\s\-:]+$", "", cleaned)
+
+            return cleaned or raw_text.strip()
+
+        def detect_memory_intent(t: str):
+            # MEMORY READ (questions)
+            read_triggers = [
+                "what do you know",
+                "what do you remember",
+                "search memory",
+                "memory search",
+                "do you remember",
+                "what is my",
+                "what was my",
+                "recall ",
+                "find memory",
+                "look up memory",
+                "search my memory",
+                "what memories",
+                "what did i tell you",
+                "what have i told you",
+            ]
+
+            if any(t.startswith(x) for x in read_triggers):
+                return "memory_read"
+
+            if re.match(r"^what\b.*\bmy\b", t):
+                return "memory_read"
+
+            if "do you remember" in t or "can you remember" in t:
+                return "memory_read"
+
+            if t.startswith("recall") and not t.startswith("recall this"):
+                return "memory_read"
+
+            if "memory" in t and t.startswith("find"):
+                return "memory_read"
+
+            # MEMORY WRITE (commands)
+            write_triggers = [
+                "remember ",
+                "remember that ",
+                "remember this ",
+                "remember my ",
+                "store this ",
+                "save this ",
+                "keep this ",
+                "note that ",
+                "note ",
+                "add to memory ",
+                "save to memory ",
+                "write this down ",
+                "keep that ",
+            ]
+
+            if any(t.startswith(x) for x in write_triggers):
+                return "memory_write"
+
+            # Allow more natural phrasing that includes memory commands later in the sentence
+            suffix_write_triggers = [
+                "please store that",
+                "please remember that",
+                "please save that",
+                "please keep that",
+                "store that",
+                "remember that",
+                "save that",
+                "keep that",
+                "please store this",
+                "please remember this",
+                "please save this",
+                "please keep this",
+                "store this",
+                "save this",
+                "keep this",
+            ]
+
+            if any(x in t for x in suffix_write_triggers):
+                return "memory_write"
+
+            if "favorite color" in t and any(x in t for x in ["remember", "store", "save", "keep", "note"]):
+                return "memory_write"
+
+            if t.startswith("remember") and not t.startswith("remember what"):
+                return "memory_write"
+
+            return None
+
+        # ====================================================
+        # PATH ALIAS MEMORY
+        # ====================================================
+
+        quoted = re.findall(r'["\']([^"\']+)["\']', raw_text)
+
+        alias_patterns = [
+            r'\bremember\s+file\s+(.+?)\s+as\s+(.+)$',
+            r'\bremember\s+path\s+(.+?)\s+as\s+(.+)$',
+            r'\bremember\s+that\s+(.+?)\s+is\s+(.+)$',
+        ]
+
+        for pat in alias_patterns:
+            m = re.search(pat, raw_text, re.IGNORECASE)
+            if not m:
+                continue
+
+            left = m.group(1).strip().strip('"\'')
+            right = m.group(2).strip().strip('"\'')
+
+            left_is_path = re.search(r'([A-Za-z]:\\|[.]{1,2}[\\/]|\.[A-Za-z0-9]{1,8}$)', left) is not None
+            right_is_path = re.search(r'([A-Za-z]:\\|[.]{1,2}[\\/]|\.[A-Za-z0-9]{1,8}$)', right) is not None
+
+            if left_is_path and not right_is_path:
+                return "__path_alias_set__", {"path": left, "alias": right}
+            if right_is_path and not left_is_path:
+                return "__path_alias_set__", {"path": right, "alias": left}
+
+        if len(quoted) >= 2:
+            q0 = quoted[0].strip()
+            q1 = quoted[1].strip()
+            q0_is_path = re.search(r'([A-Za-z]:\\|[.]{1,2}[\\/]|\.[A-Za-z0-9]{1,8}$)', q0) is not None
+            q1_is_path = re.search(r'([A-Za-z]:\\|[.]{1,2}[\\/]|\.[A-Za-z0-9]{1,8}$)', q1) is not None
+            if ("remember" in t or "save" in t or "store" in t) and ("alias" in t or "path" in t or "file" in t):
+                if q0_is_path and not q1_is_path:
+                    return "__path_alias_set__", {"path": q0, "alias": q1}
+                if q1_is_path and not q0_is_path:
+                    return "__path_alias_set__", {"path": q1, "alias": q0}
+
+        if any(x in t for x in [
+            "list aliases",
+            "show aliases",
+            "what aliases",
+            "show saved aliases",
+            "list path aliases",
+            "show path aliases",
+        ]):
+            return "__path_alias_list__", {}
+
+        if any(x in t for x in [
+            "workspace root",
+            "current workspace",
+            "show workspace",
+            "where is the workspace",
+        ]):
+            return "__workspace_info__", {}
+
+        if any(x in t for x in [
+            "git init",
+            "init git",
+            "initialize git",
+            "setup git",
+            "set up git",
+            "create git repo",
+        ]):
+            return "__git_init__", {}
+
+        if any(x in t for x in [
+            "git status",
+            "repo status",
+            "repository status",
+            "status of repo",
+        ]):
+            return "__git_status__", {}
+
+        if any(x in t for x in [
+            "git pull",
+            "pull latest",
+            "pull changes",
+            "update from git",
+            "update from github",
+        ]):
+            return "__git_pull__", {}
+
+        if any(x in t for x in [
+            "git push",
+            "push changes",
+            "publish changes",
+            "push to github",
+        ]):
+            return "__git_push__", {}
+
+        if any(x in t for x in [
+            "save snapshot",
+            "snapshot this",
+            "commit changes",
+            "save progress",
+            "git commit",
+            "commit this",
+        ]):
+            msg = ""
+            msg_match = re.search(r'\b(?:message|msg)\s*[:=]\s*(.+)$', raw_text, re.IGNORECASE)
+            if msg_match:
+                msg = msg_match.group(1).strip().strip('"\'')
+            else:
+                quoted_msg = re.findall(r'["\']([^"\']+)["\']', raw_text)
+                if quoted_msg:
+                    msg = quoted_msg[-1].strip()
+            return "__git_snapshot__", {"message": msg}
+
+        if any(x in t for x in [
+            "startup status",
+            "startup report",
+            "last worked project",
+            "projects to complete",
+            "list projects to complete",
+            "what was i working on",
+        ]):
+            return "__startup_status__", {}
+
+        if any(x in t for x in [
+            "memory status",
+            "memory health",
+            "how is your memory",
+            "how is your memory working",
+            "is your memory working",
+            "check memory",
+        ]):
+            return "__memory_status__", {}
+
+        create_project_match = re.search(
+            r'\bcreate\s+project\s+["\']?([^"\']+?)["\']?(?:\s|$)',
+            raw_text,
+            re.IGNORECASE,
+        )
+        if create_project_match:
+            project = create_project_match.group(1).strip()
+
+            status_match = re.search(
+                r'\b(?:status\s+|as\s+)(todo|in\s*progress|blocked|complete|archived)\b',
+                raw_text,
+                re.IGNORECASE,
+            )
+            status = status_match.group(1).strip().lower().replace(" ", "_") if status_match else "in_progress"
+
+            next_steps: List[str] = []
+            next_steps_match = re.search(r'\bnext\s+steps?\s*:\s*(.+)$', raw_text, re.IGNORECASE)
+            if next_steps_match:
+                raw_steps = next_steps_match.group(1)
+                for token in re.split(r';|\|', raw_steps):
+                    step = token.strip().strip('"\'')
+                    if step:
+                        next_steps.append(step)
+
+            return "__project_bootstrap__", {
+                "project": project,
+                "status": status,
+                "next_steps": next_steps,
+                "request": raw_text,
+            }
+
+        mark_project_match = re.search(
+            r'\bmark\s+project\s+["\']?([^"\']+?)["\']?\s+as\s+(todo|in\s*progress|blocked|complete|archived)\b',
+            raw_text,
+            re.IGNORECASE,
+        )
+        if mark_project_match:
+            project = mark_project_match.group(1).strip()
+            status = mark_project_match.group(2).strip().lower().replace(" ", "_")
+            return "__project_tracker_update__", {
+                "project": project,
+                "status": status,
+            }
+
+        next_step_match = re.search(
+            r'\bnext\s+step\s+for\s+["\']?([^"\']+?)["\']?\s*:\s*(.+)$',
+            raw_text,
+            re.IGNORECASE,
+        )
+        if next_step_match:
+            project = next_step_match.group(1).strip()
+            next_step = next_step_match.group(2).strip()
+            return "__project_tracker_update__", {
+                "project": project,
+                "next_step": next_step,
+            }
+
+        if (
+            re.search(r'\bproject\s+tracker\b', t) is not None
+            or "tracker status" in t
+            or "show project list" in t
+            or "show tracked projects" in t
+        ):
+            return "__project_tracker_status__", {}
+
+        forget_alias_match = re.search(
+            r'\b(?:forget|remove|delete|clear)\s+(?:alias\s+)?(?:named\s+|called\s+)?["\']?([^"\']+?)["\']?\s*$',
+            raw_text,
+            re.IGNORECASE,
+        )
+        if forget_alias_match and ("alias" in t or "remembered" in t):
+            alias = forget_alias_match.group(1).strip().lower()
+            if alias:
+                return "__path_alias_forget__", {"alias": alias}
+
+        update_alias_match = re.search(
+            r'\b(?:update|set|change)\s+alias\s+["\']?([^"\']+?)["\']?\s+to\s+["\']?([^"\']+)["\']?\s*$',
+            raw_text,
+            re.IGNORECASE,
+        )
+        if update_alias_match:
+            alias = update_alias_match.group(1).strip()
+            path = update_alias_match.group(2).strip()
+            if alias and path:
+                return "__path_alias_set__", {"alias": alias, "path": path}
+
+        intent = detect_memory_intent(t)
+
+        if intent == "memory_read":
+            return "memory_read", {
+                "query": raw_text,
+                "top_k": 3,
+            }
+
+        if intent == "memory_write":
+            return "memory_write", {
+                "text": extract_memory_write_text(raw_text),
+                "kind": "fact",
+                "tags": ["user_memory"],
+            }
+
+        # ====================================================
+        # POWERSHELL SCRIPT EXECUTION (ps_run)
+        # ====================================================
+
+        system_query_terms = [
+            "what system",
+            "what machine",
+            "what host",
+            "what computer",
+            "what os",
+            "what operating system",
+            "what platform",
+            "what hardware",
+            "system specs",
+            "system info",
+            "hardware info",
+            "list hardware",
+            "list the current hardware",
+            "gpu info",
+            "cpu info",
+            "memory info",
+            "specs",
+            "specification",
+            "show system",
+            "show specs",
+            "what time is it",
+            "current time",
+            "local time",
+            "time now",
+            "what date is it",
+            "current date",
+            "today's date",
+            "todays date",
+        ]
+
+        if any(x in t for x in [
+            "run ps",
+            "run powershell",
+            "execute ps",
+            "execute powershell",
+            "powershell:",
+            "ps:",
+            "run script",
+            "execute script",
+            "run this script",
+            "run this ps",
+            "run this powershell",
+        ]) or any(x in t for x in system_query_terms) or (
+            re.search(r"\bwhat\b.*\b(cpu|gpu|ram|memory|system|os|platform|specs?)\b", t) is not None
+        ) or (
+            re.search(r"\b(what|current|local)\b.*\b(time|date)\b", t) is not None
+        ) or (
+            (t.startswith("get ") or t.startswith("show ") or t.startswith("list "))
+            and any(x in t for x in ["cpu", "gpu", "memory", "ram", "hardware", "system", "spec", "os", "platform"])
+        ):
+            return "ps_run", {
+                "script": raw_text
+            }
+
+        if re.match(r'^(run|execute|start)\b', t):
+            path_like = re.search(r'([A-Za-z]:\\|[.]{1,2}[\\/]|\.(ps1|py|bat|cmd)\b)', raw_text, re.IGNORECASE) is not None
+            alias_hit = self._resolve_path_alias(raw_text) is not None
+            if path_like or alias_hit:
+                return "ps_run", {
+                    "script": raw_text
+                }
+
+        # ====================================================
+        # DIRECTORY CREATE
+        # ====================================================
+
+        def extract_directory_path(raw: str) -> str:
+            quoted = re.findall(r'["\']([^"\']+)["\']', raw)
+            for q in quoted:
+                candidate = q.strip()
+                if candidate and not re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
+                    return candidate
+
+            patterns = [
+                r'\b(?:in|at|to)\s+([A-Za-z]:\\[^\s,;]+)',
+                r'\b(?:in|at|to)\s+([.]{1,2}[\\/][^\s,;]+)',
+                r'\b(?:in|at|to)\s+([^\s,;]+[\\/][^\s,;]+)',
+                r'\b(?:named|called)\s+([^\s,;]+)',
+                r'\b(?:folder|directory|dir)\s+([^\s,;]+)',
+            ]
+
+            for pattern in patterns:
+                m = re.search(pattern, raw, re.IGNORECASE)
+                if m:
+                    candidate = m.group(1).strip().strip('"\'')
+                    if candidate and not re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
+                        return candidate
+
+            return ""
+
+        scaffold_intent = (
+            re.search(r'\b(create|make|build|scaffold|setup)\b', t) is not None
+            and (
+                re.search(r'\b(folder|directory|dir)\b', t) is not None
+                and (
+                    re.search(r'\b(file|files|script|scripts|module|modules)\b', t) is not None
+                    or " with " in t
+                    or " inside " in t
+                )
+            )
+        )
+
+        if scaffold_intent:
+            return "__scaffold__", {"request": raw_text}
+
+        directory_create_intent = (
+            re.search(r'\b(create|make|add|new)\b', t) is not None
+            and re.search(r'\b(folder|directory|dir)\b', t) is not None
+        ) or any(x in t for x in [
+            "mkdir ",
+            "make folder",
+            "create folder",
+            "create directory",
+            "new folder",
+            "new directory",
+        ])
+
+        if directory_create_intent:
+            path = extract_directory_path(raw_text)
+            if path:
+                return "dir_create", {"path": path}
+
+        
+        # ====================================================
+        # FILE READ
+        # ====================================================
+
+        if any(x in t for x in [
+            "read file",
+            "open file",
+            "show file",
+        ]):
+            m = re.search(r'["\']([^"\']+)["\']', text)
+            if not m:
+                m = re.search(r'[“‘]([^”’]+)[”’]', text)
+            if not m:
+                m = re.search(r'file\s+([^\s]+)', text, re.IGNORECASE)
+
+            path = m.group(1).strip() if m else ""
+            return "file_read", {"path": path}
+
+        # ====================================================
+        # FILE DELETE
+        # ====================================================
+
+        if any(x in t for x in [
+            "delete file",
+            "remove file",
+            "delete script",
+            "remove script",
+            "delete the file",
+            "remove the file",
+            "delete this file",
+            "remove this file",
+        ]):
+            path = ""
+            quoted = re.findall(r'["\']([^"\']+)["\']', text)
+            for q in quoted:
+                if re.match(r'^[A-Za-z]:\\', q):
+                    path = q.strip()
+                    break
+
+            if not path:
+                m = re.search(r'\bat\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\bfrom\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'([A-Za-z]:\\[^\s,]+\.(?:py|txt|md|json|csv))', text, re.IGNORECASE)
+                if m:
+                    path = m.group(1).strip()
+
+            return "file_delete", {"path": path}
+
+        # ====================================================
+        # FILE MOVE / RENAME
+        # ====================================================
+
+        if any(x in t for x in [
+            "move file",
+            "move script",
+            "move this file",
+            "move the file",
+            "rename file",
+            "rename script",
+            "rename this file",
+            "rename the file",
+            "rename to",
+            "move to",
+        ]) or (
+            ("move" in t or "rename" in t)
+            and re.search(r'[A-Za-z]:\\', text)
+            and " to " in t
+        ):
+            src = ""
+            dst = ""
+            quoted = re.findall(r'["\']([^"\']+)["\']', text)
+            quoted_paths = [q.strip() for q in quoted if re.match(r'^[A-Za-z]:\\', q)]
+            if len(quoted_paths) >= 2:
+                src, dst = quoted_paths[0], quoted_paths[1]
+            elif len(quoted_paths) == 1:
+                src = quoted_paths[0]
+
+            if not src:
+                m = re.search(r'\b(?:move|rename)\s+(?:the\s+)?file\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\bfrom\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if m:
+                    src = m.group(1).strip()
+
+            if not dst:
+                m = re.search(r'\bto\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\brename\s+[A-Za-z]:\\[^\s,]+\s+to\s+([^\s,]+)', text, re.IGNORECASE)
+                if m:
+                    dst = m.group(1).strip()
+
+            if src and dst and not os.path.isabs(dst):
+                dst = os.path.join(os.path.dirname(src), dst)
+
+            return "file_move", {"src": src, "dst": dst}
+
+        # ====================================================
+        # FILE APPEND
+        # ====================================================
+
+        if any(x in t for x in [
+            "append file",
+            "append to file",
+            "add to file",
+            "add content to file",
+            "append text to",
+            "append this",
+            "append the following",
+        ]) or (
+            "append" in t
+            and re.search(r'[A-Za-z]:\\', text)
+            and any(x in t for x in ["to", "with", "content", "text", "line"])
+        ):
+            path = ""
+            content = ""
+
+            quoted = re.findall(r'["\']([^"\']+)["\']', text)
+            for q in quoted:
+                if re.match(r'^[A-Za-z]:\\', q):
+                    path = q.strip()
+                elif not content:
+                    content = q.strip()
+
+            if not path:
+                m = re.search(r'\bat\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\bto\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'([A-Za-z]:\\[^\s,]+\.[A-Za-z0-9]+)', text, re.IGNORECASE)
+                if m:
+                    path = m.group(1).strip()
+
+            if not content:
+                if quoted:
+                    content = quoted[-1].strip()
+                else:
+                    m = re.search(r'(?:append|add).*?\bto\s+[^\s]+\s+(.+)', text, re.IGNORECASE)
+                    if m:
+                        content = m.group(1).strip()
+
+            return "file_append", {"path": path, "content": content}
+
+        # ====================================================
+        # FILE WRITE
+        # ====================================================
+
+        def extract_file_write_path(raw: str) -> str:
+            quoted = re.findall(r'["\']([^"\']+)["\']', raw)
+            for q in quoted:
+                candidate = q.strip()
+                if re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
+                    return candidate
+
+            patterns = [
+                r'\b(?:at|to|in)\s+([A-Za-z]:\\[^\s,;]+)',
+                r'\b(?:at|to|in)\s+([.]{1,2}[\\/][^\s,;]+)',
+                r'\b(?:at|to|in)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
+                r'\b(?:named|called)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
+            ]
+
+            for pattern in patterns:
+                m = re.search(pattern, raw, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip().strip('"\'')
+
+            return ""
+
+        def extract_file_write_content(raw: str, lowered: str) -> str:
+            fence = re.search(r'```(?:[A-Za-z0-9_+-]+)?\n([\s\S]*?)```', raw)
+            if fence:
+                return fence.group(1).strip("\n")
+
+            quoted = re.findall(r'["\']([^"\']+)["\']', raw)
+            if quoted:
+                for q in reversed(quoted):
+                    if not re.search(r'\.[A-Za-z0-9]{1,8}$', q.strip()):
+                        return q.strip()
+
+            content_patterns = [
+                r'\bwith\s+content\s*:\s*([\s\S]+)$',
+                r'\bwith\s+content\s+([\s\S]+)$',
+                r'\bthat\s+(?:says|prints|contains)\s+([\s\S]+)$',
+                r'\bprint(?:s)?\s+(["\'][^"\']+["\'])',
+            ]
+
+            for pattern in content_patterns:
+                m = re.search(pattern, raw, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip().strip('"\'')
+
+            if "hello world" in lowered:
+                return 'print("hello world")'
+
+            return ""
+
+        file_write_intent = any(x in t for x in [
+            "create file",
+            "write file",
+            "save file",
+            "make file",
+            "create a python script",
+            "create a script",
+            "write a python script",
+            "save a python script",
+            "make a python script",
+            "create script",
+            "make script",
+            "write script",
+            "save script",
+        ]) or (
+            ("at " in t or "to " in t)
+            and any(x in t for x in ["print", "prints", "code", "content", "with content"])
+        ) or (
+            re.search(r'\b(create|write|save|make|generate|build)\b', t) is not None
+            and (
+                re.search(r'\b(file|script|module)\b', t) is not None
+                or re.search(r'\.[A-Za-z0-9]{1,8}\b', raw_text) is not None
+            )
+        )
+
+        if file_write_intent:
+            path = extract_file_write_path(raw_text)
+            if not path:
+                return None, {}
+
+            content = extract_file_write_content(raw_text, t)
+
+            if path.lower().endswith('.py') and content:
+                if not content.strip().startswith('print') and ('print' in t or 'prints' in t or 'python script' in t):
+                    content = f'print({json.dumps(content)})'
+
+            return "file_write", {"path": path, "content": content}
+
+        # ====================================================
+        # GITHUB REPO TOOL
+        # ====================================================
+
+        github_related = (
+            "github" in t
+            or ("repo" in t and re.search(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", text))
+        )
+        if github_related:
+            action = "repo_info"
+            if "open issues" in t or "issues" in t:
+                action = "open_issues"
+            elif "release" in t:
+                action = "list_releases"
+            elif "branch" in t:
+                action = "list_branches"
+            elif "commit" in t or "latest commit" in t:
+                action = "latest_commit"
+            elif (
+                "list repos" in t
+                or "github repos" in t
+                or "repos for" in t
+                or "repos by" in t
+                or "repositories" in t
+            ):
+                action = "list_repos"
+
+            owner = ""
+            repo = ""
+            if action == "list_repos":
+                m = re.search(r'github\s+user\s+([A-Za-z0-9_.-]+)', t)
+                if m:
+                    owner = m.group(1)
+                else:
+                    m = re.search(r'repos\s+(?:for|by)\s+([A-Za-z0-9_.-]+)', t)
+                    if m:
+                        owner = m.group(1)
+            else:
+                m = re.search(r'([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)', text)
+                if m:
+                    owner = m.group(1)
+                    repo = m.group(2)
+
+            return "github_repo", {
+                "action": action,
+                "owner": owner,
+                "repo": repo,
+                "branch": "main",
+                "per_page": 20,
+            }
+
+        # ====================================================
+        # DIRECTORY LIST
+        # ====================================================
+
+        dir_list_triggers = [
+            "list directory",
+            "list files",
+            "show files",
+            "show directory",
+            "directory contents",
+            "folder contents",
+            "what files",
+            "what's in this folder",
+            "contents of",
+            "list the contents",
+            "list contents",
+            "show contents",
+            "what is in",
+            "toy box",
+            "toybox",
+        ]
+
+        if (
+            any(x in t for x in dir_list_triggers)
+            or re.search(r'\blist\b\s+[a-zA-Z]:\\', t)
+            or re.search(r'\bcontents\b.*[a-zA-Z]:\\', t)
+        ):
+            workspace_root = self.workspace_root
+            path = workspace_root
+            
+            # Try to extract path after "in " (e.g., "list files in c:\")
+            m = re.search(r'in\s+([a-zA-Z]:\\?[^\n\r]*)', text, re.IGNORECASE)
+            
+            # If not found, try "on " (e.g., "list files on c:\")
+            if not m:
+                m = re.search(r'on\s+([a-zA-Z]:\\?[^\n\r]*)', text, re.IGNORECASE)
+            
+            # If not found, try "of " (e.g., "list the contents of c:\")
+            if not m:
+                m = re.search(r'of\s+([a-zA-Z]:\\?[^\n\r]*)', text, re.IGNORECASE)
+            
+            # If still not found, try bare path pattern (e.g., "list c:\" or "list files c:\")
+            if not m:
+                m = re.search(r'(?:list\s+files\s+)?([a-zA-Z]:\\[^\n\r]*)', text, re.IGNORECASE)
+            
+            # If still not found, try just a drive letter (e.g., "list e:\" or "list files e:\")
+            if not m:
+                m = re.search(r'(?:list\s+)?([a-zA-Z]:\\?)(?:\s|$)', text, re.IGNORECASE)
+            
+            if m:
+                path = m.group(1).strip()
+            elif any(x in t for x in ["toy box", "toybox"]):
+                path = os.path.join(workspace_root, "toys")
+
+            return "dir_list", {"path": path}
+
+        # ====================================================
+        # TOOL LIST
+        # ====================================================
+
+        if any(x in t for x in [
+            "list tools",
+            "show tools",
+            "available tools",
+            "what tools",
+        ]):
+            return "__tool_list__", {}
+
+        return None, {}
+
+        
+    
+    # ========================================================
+    # HANDLE MODEL RESPONSE
+    # ========================================================
+
+    def _handle_model_response(
+        self,
+        messages: List[Dict[str, str]],
+        reply: Dict[str, Any],
+    ) -> str:
+
+        text = self._clean_response_text(self._extract_text(reply))
+
+        if (
+            "<remember>" in text
+            and "</remember>" in text
+        ):
+
+            mem = (
+                text
+                .split("<remember>", 1)[1]
+                .split("</remember>", 1)[0]
+                .strip()
+            )
+
+            if mem:
+
+                try:
+
+                    self.memory.add_memory(
+                        mem,
+                        kind="note",
+                        tags=["model"],
+                    )
+
+                except Exception:
+
+                    traceback.print_exc()
+
+            text = text.replace(
+                f"<remember>{mem}</remember>",
+                "",
+            ).strip()
+
+        return text or ""
+
+    # ========================================================
+    # EXTRACT TEXT
+    # ========================================================
+
+    def _extract_text(
+        self,
+        reply: Dict[str, Any],
+    ) -> str:
+
+        if (
+            "choices" in reply
+            and reply["choices"]
+        ):
+
+            msg = (
+                reply["choices"][0]
+                .get("message", {})
+            )
+
+            return msg.get("content", "") or ""
+
+        return ""
+
+# ========================================================
+# CORE STATUS
+# ========================================================
+
+    def get_core_status(self) -> Dict[str, Any]:
+
+        try:
+
+            return {
+                "core_temp": "STABLE",
+                "memory_bus": "ONLINE",
+                "neural_cache": "ACTIVE",
+                "io_channels": "CLEAR",
+                "core_online": True,
+                "model_loaded": True,
+                "tool_count": len(self.tools.tools),
+                "memory_enabled": self.memory is not None,
+                "personality_loaded": bool(self.system_prompt),
+                "memory_engine": self.memory.verify_integrity(),
+                "level": "NORMAL",
+            }
+
+        except Exception as e:
+
+            traceback.print_exc()
+
+            return {
+                "core_temp": "ERROR",
+                "memory_bus": "ERROR",
+                "neural_cache": "ERROR",
+                "io_channels": "ERROR",
+                "error": str(e),
+                "level": "CRITICAL",
+            }
+    # ========================================================
+    # DATABASE STATUS
+    # ========================================================
+
+    def get_db_status(self) -> Dict[str, Any]:
+
+        try:
+
+            return {
+                "db_link": "CONNECTED",
+                "db_sync": "IN_SYNC",
+                "db_latency": "LOW",
+                "active_connections": "1",
+                "read_ops": "OK",
+                "write_ops": "OK",
+                "cache_state": "WARM",
+                "last_commit": time.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "memory_db": getattr(
+                    self.memory,
+                    "db_path",
+                    "unknown"
+                ),
+                "level": "NORMAL",
+            }
+
+        except Exception as e:
+
+            traceback.print_exc()
+
+            return {
+                "db_link": "ERROR",
+                "db_sync": "ERROR",
+                "db_latency": "UNKNOWN",
+                "active_connections": "0",
+                "read_ops": "FAIL",
+                "write_ops": "FAIL",
+                "cache_state": "COLD",
+                "last_commit": "FAILED",
+                "error": str(e),
+                "level": "CRITICAL",
+            }
+
+    # ========================================================
+    # AUTO-PROMOTED MEMORY VIEW
+    # ========================================================
+
+    def get_auto_promoted_memories(
+        self,
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        try:
+            items = self.memory.get_auto_promoted_memories(limit=limit)
+            return {
+                "ok": True,
+                "count": len(items),
+                "items": items,
+            }
+
+        except Exception as e:
+            traceback.print_exc()
+            return {
+                "ok": False,
+                "count": 0,
+                "items": [],
+                "error": str(e),
+            }
+
+    # ========================================================
+    # DIRECT TOOL RUN
+    # ========================================================
+
+    def run_tool(
+        self,
+        name: str,
+        args: Dict[str, Any],
+    ) -> Dict[str, Any]:
+
+        return self.tools.run(
+            name,
+            args,
+        )
+
+
+# ============================================================
+# DIRECT TEST MODE
+# ============================================================
+
+if __name__ == "__main__":
+
+    core = MK1Core()
+
+    result = core.process(
+        "list tools"
+    )
+
+    print("\n========================================")
+    print("FINAL RESULT")
+    print("========================================")
+    print(result)
+

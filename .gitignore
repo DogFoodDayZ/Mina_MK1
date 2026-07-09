@@ -1,0 +1,27 @@
+# Python cache and virtual environment
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Runtime and logs
+logs/
+*.pid
+.mk1_api.pid
+
+# Large local model and index artifacts
+Models/
+Memory_server/*.npz
+Memory_server/*.json
+memory/*.index
+memory/backups/
+memory/memory.db*
+
+# Local scratch and archives
+cleanup_archive/
+sandbox/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/

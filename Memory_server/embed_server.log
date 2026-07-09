@@ -1,0 +1,128 @@
+2026-05-18 22:23:20,975 [INFO] --------------------------------------------------
+2026-05-18 22:23:20,975 [INFO] MK1 Brick-Wall Embed Server Starting
+2026-05-18 22:23:20,975 [INFO] Loading model: bge-small-en-v1.5
+2026-05-18 22:23:20,987 [INFO] No device provided, using cpu
+2026-05-18 22:23:21,521 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/bge-small-en-v1.5/resolve/main/modules.json "HTTP/1.1 401 Unauthorized"
+2026-05-18 22:23:21,521 [INFO] No modules.json found for sentence-transformers/bge-small-en-v1.5, initializing a new SentenceTransformer model.
+2026-05-18 22:23:21,633 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/bge-small-en-v1.5/resolve/main/adapter_config.json "HTTP/1.1 401 Unauthorized"
+2026-05-18 22:23:21,633 [ERROR] Model failed to load
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\utils\_http.py", line 761, in hf_raise_for_status
+    response.raise_for_status()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\httpx\_models.py", line 829, in raise_for_status
+    raise HTTPStatusError(message, request=request, response=self)
+httpx.HTTPStatusError: Client error '401 Unauthorized' for url 'https://huggingface.co/sentence-transformers/bge-small-en-v1.5/resolve/main/adapter_config.json'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/401
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\transformers\utils\hub.py", line 420, in cached_files
+    hf_hub_download(
+    ~~~~~~~~~~~~~~~^
+        path_or_repo_id,
+        ^^^^^^^^^^^^^^^^
+    ...<9 lines>...
+        local_files_only=local_files_only,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\utils\_validators.py", line 89, in _inner_fn
+    return fn(*args, **kwargs)
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\file_download.py", line 986, in hf_hub_download
+    return _hf_hub_download_to_cache_dir(
+        # Destination
+    ...<15 lines>...
+        dry_run=dry_run,
+    )
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\file_download.py", line 1137, in _hf_hub_download_to_cache_dir
+    _raise_on_head_call_error(head_call_error, force_download, local_files_only)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\file_download.py", line 1766, in _raise_on_head_call_error
+    raise head_call_error
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\file_download.py", line 1653, in _get_metadata_or_catch_error
+    metadata = get_hf_file_metadata(
+        url=url,
+    ...<4 lines>...
+        retry_on_errors=retry_on_errors,
+    )
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\utils\_validators.py", line 89, in _inner_fn
+    return fn(*args, **kwargs)
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\file_download.py", line 1576, in get_hf_file_metadata
+    response = _httpx_follow_relative_redirects_with_backoff(
+        method="HEAD", url=url, headers=hf_headers, timeout=timeout, retry_on_errors=retry_on_errors
+    )
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\utils\_http.py", line 692, in _httpx_follow_relative_redirects_with_backoff
+    hf_raise_for_status(response)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\huggingface_hub\utils\_http.py", line 847, in hf_raise_for_status
+    raise repo_err from e
+huggingface_hub.errors.RepositoryNotFoundError: 401 Client Error. (Request ID: Root=1-6a0bf3ca-39c26a6e696d5d9d5165712d;c40d30b3-fdb5-4b33-955e-d6f1ab1e2b41)
+
+Repository Not Found for url: https://huggingface.co/sentence-transformers/bge-small-en-v1.5/resolve/main/adapter_config.json.
+Please make sure you specified the correct `repo_id` and `repo_type`.
+If you are trying to access a private or gated repo, make sure you are authenticated. For more details, see https://huggingface.co/docs/huggingface_hub/authentication
+Invalid username or password.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "E:\Mina_MK1\Memory_server\embed_server.py", line 153, in main
+    model = SentenceTransformer(args.model)
+  File "C:\Python314\Lib\site-packages\sentence_transformers\util\decorators.py", line 41, in wrapper
+    return func(*args, **kwargs)
+  File "C:\Python314\Lib\site-packages\sentence_transformers\sentence_transformer\model.py", line 183, in __init__
+    super().__init__(
+    ~~~~~~~~~~~~~~~~^
+        model_name_or_path=model_name_or_path,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<13 lines>...
+        default_prompt_name=default_prompt_name,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Python314\Lib\site-packages\sentence_transformers\base\model.py", line 198, in __init__
+    modules, self.module_kwargs = self._load_modules(
+                                  ~~~~~~~~~~~~~~~~~~^
+        model_name_or_path,
+        ^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        config_kwargs=config_kwargs,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Python314\Lib\site-packages\sentence_transformers\base\model.py", line 963, in _load_modules
+    return self._load_default_modules(model_name_or_path, **load_kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\site-packages\sentence_transformers\sentence_transformer\model.py", line 1056, in _load_default_modules
+    transformer_model = Transformer(
+        model_name_or_path,
+    ...<4 lines>...
+        backend=self.backend,
+    )
+  File "C:\Python314\Lib\site-packages\sentence_transformers\util\decorators.py", line 87, in wrapper
+    return func(*args, **kwargs)
+  File "C:\Python314\Lib\site-packages\sentence_transformers\base\modules\transformer.py", line 628, in __init__
+    config, is_peft_model = self._load_config(model_name_or_path, backend, config_kwargs)
+                            ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\site-packages\sentence_transformers\base\modules\transformer.py", line 1354, in _load_config
+    adapter_config_file = find_adapter_config_file(
+        model_name_or_path,
+    ...<4 lines>...
+        local_files_only=config_kwargs.get("local_files_only", False),
+    )
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\transformers\utils\peft_utils.py", line 84, in find_adapter_config_file
+    adapter_cached_filename = cached_file(
+        model_id,
+    ...<11 lines>...
+        _raise_exceptions_for_connection_errors=False,
+    )
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\transformers\utils\hub.py", line 277, in cached_file
+    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\transformers\utils\hub.py", line 450, in cached_files
+    raise OSError(
+    ...<4 lines>...
+    ) from e
+OSError: sentence-transformers/bge-small-en-v1.5 is not a local folder and is not a valid model identifier listed on 'https://huggingface.co/models'
+If this is a private repository, make sure to pass a token having permission to this repo either by logging in with `hf auth login` or by passing `token=<your_token>`

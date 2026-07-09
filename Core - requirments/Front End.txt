@@ -1,0 +1,269 @@
+===========================
+ MK1 CORE → FRONTEND CONTRACT
+===========================
+
+1. /process  (POST)
+-------------------
+Input:
+{
+  "input": "string"
+}
+
+Accepted Response Formats:
+{
+  "output": { "reply": "string" }
+}
+
+{
+  "output": "string"
+}
+
+{
+  "reply": "string"
+}
+
+{
+  "choices": [
+    { "message": { "content": "string" } }
+  ]
+}
+
+Error Fallback:
+{
+  "output": { "reply": "(error contacting core)" }
+}
+
+
+2. /status  (GET)
+-----------------
+Response:
+{
+  "core_temp": "string",
+  "memory_bus": "string",
+  "neural_cache": "string",
+  "io_channels": "string",
+  "level": "NORMAL" | "WARN" | "ERROR" | "CRITICAL"
+}
+
+
+3. /db/status  (GET)
+--------------------
+Response:
+{
+  "db_link": "string",
+  "db_sync": "string",
+  "db_latency": "string",
+  "active_connections": "string",
+  "read_ops": "string",
+  "write_ops": "string",
+  "cache_state": "string",
+  "last_commit": "string",
+  "level": "NORMAL" | "WARN" | "ERROR" | "CRITICAL"
+}
+
+
+4. Severity Levels (Shared)
+---------------------------
+Allowed values:
+NORMAL
+WARN
+ERROR
+CRITICAL
+
+Anything else defaults to WARN.
+
+
+5. Stability Requirements
+-------------------------
+- Always return valid JSON.
+- Never return HTML or plaintext.
+- All fields must be strings.
+- Missing fields are allowed; UI will show "UNKNOWN".
+- Missing endpoint results in "WAITING FOR CORE…" or "WAITING FOR DB…".
+- Polling interval: 2000ms.
+- Field names must match exactly.
+
+
+6. Safe Extensions
+------------------
+- You may add extra fields to /status or /db/status.
+- UI ignores unknown fields safely.
+
+
+===========================
+ END OF CONTRACT BLOCK
+===========================
+"""
+MK1 CORE DEPENDENCY CONTRACT
+This file defines what each subsystem requires from CORE.
+It contains no executable logic. It is a specification.
+
+CORE MUST PROVIDE:
+- Stable interfaces
+- No sideways dependencies
+- No direct coupling between subsystems
+- Central orchestration
+"""
+
+CORE_DEPENDENCIES = {
+
+    # ============================================================
+    # MEMORY SUBSYSTEM REQUIREMENTS
+    # ============================================================
+    "memory": {
+        "requires_from_core": [
+            "embedding_client_small",      # core.embed_small(text)
+            "embedding_client_base",       # core.embed_base(text)
+            "index_manager",               # core.index.add/search/update
+            "backup_manager",              # core.backup(memory)
+            "error_reporting",             # core.report_error(source, msg)
+            "status_reporting",            # core.get_status()
+            "context_pipeline",            # core.build_context(query)
+        ],
+        "provides_to_core": [
+            "add_memory(text, kind, tags)",
+            "search(query, top_k)",
+            "get_context(query, top_k)",
+            "trim_by_age(seconds)",
+            "trim_by_size(max_rows)",
+            "backup()",
+            "get_status()",
+        ],
+        "core_must_guarantee": [
+            "Stable embedding endpoints",
+            "Stable index dimensions",
+            "No silent failures",
+            "Structured error objects",
+            "Structured status objects",
+        ],
+    },
+
+    # ============================================================
+    # TOOL SUBSYSTEM REQUIREMENTS
+    # ============================================================
+    "tools": {
+        "requires_from_core": [
+            "tool_loader.run(name, args)",
+            "tool_loader.get_status()",
+            "error_reporting",
+        ],
+        "provides_to_core": [
+            "ps_run",
+            "file_read",
+            "file_write",
+            "dir_list",
+            "safe_copy",
+            "web_fetch",
+            "gremlin_chaos",
+        ],
+        "core_must_guarantee": [
+            "Tools are hot-swappable",
+            "Tools do not require core changes",
+            "Tools run in isolation",
+            "Tools return structured results",
+            "Tools cannot crash CORE",
+        ],
+    },
+
+    # ============================================================
+    # MODEL SUBSYSTEM REQUIREMENTS
+    # ============================================================
+    "model": {
+        "requires_from_core": [
+            "context_injection",           # core.build_context()
+            "tool_invocation",             # core.run_tool()
+            "memory_retrieval",            # core.memory.get_context()
+            "error_reporting",
+        ],
+        "provides_to_core": [
+            "model_output",
+            "tool_requests",
+            "memory_write_requests",
+        ],
+        "core_must_guarantee": [
+            "Deterministic context assembly",
+            "Safe tool execution",
+            "No infinite loops",
+            "No unbounded memory writes",
+        ],
+    },
+
+    # ============================================================
+    # GUI SUBSYSTEM REQUIREMENTS
+    # ============================================================
+    "gui": {
+        "requires_from_core": [
+            "status_reporting",
+            "memory_status",
+            "tool_status",
+            "model_status",
+            "core_status",
+            "context_preview",
+        ],
+        "provides_to_core": [
+            "user_input",
+            "settings",
+            "runtime_controls",
+        ],
+        "core_must_guarantee": [
+            "Stable API",
+            "Predictable responses",
+            "No blocking operations",
+            "No direct file access",
+        ],
+    },
+
+    # ============================================================
+    # CORE RESPONSIBILITIES
+    # ============================================================
+    "core": {
+        "must_provide": [
+            "run_tool(name, args)",
+            "embed_small(text)",
+            "embed_base(text)",
+            "memory.add_memory()",
+            "memory.search()",
+            "memory.get_context()",
+            "tool_loader.run()",
+            "status.get_all()",
+            "error.report()",
+        ],
+        "must_never": [
+            "Call tools directly",
+            "Call memory internals directly",
+            "Call model internals directly",
+            "Allow sideways dependencies",
+            "Modify tools when tools change",
+            "Modify memory when memory changes",
+        ],
+    },
+}
+    # ============================================================
+    # MODEL SUBSYSTEM REQUIREMENTS (LM Studio + Qwen2.5-7B-Instruct)
+    # ============================================================
+    "model": {
+        "requires_from_core": [
+            "model_load",                 # core.model_load(name)
+            "model_chat",                 # core.model_chat(messages)
+            "context_injection",          # core.build_context()
+            "tool_invocation",            # core.run_tool()
+            "memory_retrieval",           # core.memory.get_context()
+            "memory_write_handler",       # core.memory.add_memory()
+            "error_reporting",            # core.model_error()
+            "status_reporting",           # core.get_model_status()
+        ],
+        "provides_to_core": [
+            "model_output",               # raw text or JSON
+            "tool_requests",              # {"tool": name, "args": {...}}
+            "memory_write_requests",      # {"remember": "..."}
+        ],
+        "core_must_guarantee": [
+            "Stable LM Studio API calls",
+            "Correct JSON parsing",
+            "Safe tool execution",
+            "No infinite tool loops",
+            "No unbounded memory writes",
+            "Deterministic context assembly",
+            "Graceful recovery from LM Studio errors",
+        ],
+    },

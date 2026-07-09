@@ -1,0 +1,30 @@
+2026-05-18 22:50:22,078 [INFO] --------------------------------------------------
+2026-05-18 22:50:22,078 [INFO] MK1 Pure-Python GGUF Embed Server Starting
+2026-05-18 22:50:22,078 [INFO] Loading GGUF model: E:\Mina_MK1\Models\nomic-embed-text-v1.5.Q3_K_M.gguf
+2026-05-18 22:50:22,079 [ERROR] Model failed to load
+Traceback (most recent call last):
+  File "E:\Mina_MK1\Memory_server\gguf_embed_server.py", line 159, in main
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+    ...<4 lines>...
+        }
+    )
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\ctransformers\hub.py", line 178, in from_pretrained
+    config=config.config,
+           ^^^^^^^^^^^^^
+AttributeError: 'dict' object has no attribute 'config'
+2026-05-18 22:52:07,939 [INFO] --------------------------------------------------
+2026-05-18 22:52:07,940 [INFO] MK1 Pure-Python GGUF Embed Server Starting
+2026-05-18 22:52:07,940 [INFO] Loading GGUF model: E:\Mina_MK1\Models\nomic-embed-text-v1.5.Q3_K_M.gguf
+2026-05-18 22:52:07,940 [ERROR] Model failed to load
+Traceback (most recent call last):
+  File "E:\Mina_MK1\Memory_server\gguf_embed_server.py", line 159, in main
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+    ...<4 lines>...
+        }
+    )
+  File "C:\Users\Admin\AppData\Roaming\Python\Python314\site-packages\ctransformers\hub.py", line 178, in from_pretrained
+    config=config.config,
+           ^^^^^^^^^^^^^
+AttributeError: 'dict' object has no attribute 'config'

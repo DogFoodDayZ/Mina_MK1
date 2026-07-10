@@ -1,0 +1,102 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&display=swap');
+
+:root {
+  color-scheme: dark;
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: transparent;
+  overflow: hidden;
+}
+
+#overlay-root {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+}
+
+#avatar {
+  position: relative;
+  width: min(260px, 60vw);
+  height: min(400px, 65vh);
+  animation: idle-bob 5s ease-in-out infinite;
+}
+
+.avatar-layer {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -56%);
+  width: 100%;
+  height: auto;
+  display: none;
+  image-rendering: auto;
+}
+
+.avatar-layer.visible {
+  display: block;
+}
+
+.glow {
+  position: absolute;
+  width: 320px;
+  height: 320px;
+  left: 50%;
+  top: 45%;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(45, 241, 255, 0.25), transparent 65%);
+  filter: blur(40px);
+  z-index: -1;
+  animation: pulse 8s ease-in-out infinite;
+}
+
+#status-bar {
+  min-width: clamp(220px, 50vw, 320px);
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(7, 10, 16, 0.75);
+  border: 1px solid rgba(45, 241, 255, 0.3);
+  color: #e5f7ff;
+  font-size: 0.85rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(6px);
+}
+
+#status-bar[data-mode="talk"] {
+  background: rgba(255, 64, 129, 0.8);
+  border-color: rgba(255, 187, 221, 0.8);
+  color: #fff;
+}
+
+#status-bar[data-mode="smirk"] {
+  background: rgba(255, 214, 102, 0.8);
+  border-color: rgba(255, 240, 180, 0.8);
+  color: #110a19;
+}
+
+#status-bar[data-mode="annoyed"] {
+  background: rgba(255, 86, 86, 0.85);
+  border-color: rgba(255, 150, 150, 0.9);
+}
+
+@keyframes idle-bob {
+  0% { transform: translateY(0px); }
+  50% { transform: translateY(-8px); }
+  100% { transform: translateY(0px); }
+}
+
+@keyframes pulse {
+  0% { opacity: 0.5; }
+  50% { opacity: 0.15; }
+  100% { opacity: 0.5; }
+}

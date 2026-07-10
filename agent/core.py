@@ -38,6 +38,18 @@ class LMStudioClient:
         self._vision_support_cache_value: Optional[bool] = None
         self._vision_support_cache_until: float = 0.0
         self._vision_support_cache_ttl: float = float(os.getenv("MK1_VISION_CHECK_TTL", "30"))
+        self.vision_max_tokens: int = int(
+            model_cfg.get(
+                "vision_max_tokens",
+                os.getenv("MK1_VISION_MAX_TOKENS", "512"),
+            )
+        )
+        self.vision_reasoning_effort: str = str(
+            model_cfg.get(
+                "vision_reasoning_effort",
+                os.getenv("MK1_VISION_REASONING_EFFORT", "none"),
+            )
+        ).strip()
 
     def _supports_vision_by_name(self) -> bool:
         model_name = str(self.default_model or "").lower()
@@ -46,6 +58,7 @@ class LMStudioClient:
             "-vl",
             "vl-",
             "llava",
+            "gemma-4",
             "qwen2-vl",
             "qwen2.5-vl",
             "qwen-vl",
@@ -57,10 +70,52 @@ class LMStudioClient:
         return any(h in model_name for h in vision_hints)
 
     def _probe_vision_support(self) -> bool:
-        tiny_png_data_url = (
-            "data:image/png;base64,"
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7fNwAAAABJRU5ErkJggg=="
-        )
+        # Build a valid 1x1 RGB PNG in-memory so the probe does not depend on
+        # external files or potentially invalid hardcoded image bytes.
+        try:
+            import base64
+            import binascii
+            import struct
+            import zlib
+
+            width = 1
+            height = 1
+            bit_depth = 8
+            color_type = 2  # Truecolor RGB
+
+            ihdr = struct.pack(
+                "!IIBBBBB",
+                width,
+                height,
+                bit_depth,
+                color_type,
+                0,
+                0,
+                0,
+            )
+
+            # One scanline: filter byte (0) + one red pixel (255, 0, 0)
+            raw_scanline = b"\x00\xff\x00\x00"
+            idat = zlib.compress(raw_scanline, level=9)
+
+            def _png_chunk(tag: bytes, data: bytes) -> bytes:
+                crc = binascii.crc32(tag + data) & 0xFFFFFFFF
+                return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", crc)
+
+            png_bytes = (
+                b"\x89PNG\r\n\x1a\n"
+                + _png_chunk(b"IHDR", ihdr)
+                + _png_chunk(b"IDAT", idat)
+                + _png_chunk(b"IEND", b"")
+            )
+
+            tiny_png_data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+        except Exception:
+            # Fallback if local generation fails for any reason.
+            tiny_png_data_url = (
+                "data:image/png;base64,"
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7fNwAAAABJRU5ErkJggg=="
+            )
 
         payload: Dict[str, Any] = {
             "model": self.default_model,
@@ -112,6 +167,13 @@ class LMStudioClient:
 
     def supports_vision(self, force_refresh: bool = False) -> bool:
         now = time.monotonic()
+
+        # Fast path: known vision model families should not need active probing.
+        if not force_refresh and self._supports_vision_by_name():
+            self._vision_support_cache_value = True
+            self._vision_support_cache_until = now + max(1.0, self._vision_support_cache_ttl)
+            return True
+
         if (
             not force_refresh
             and self._vision_support_cache_value is not None
@@ -130,12 +192,26 @@ class LMStudioClient:
         temperature: float = 0.7,
     ) -> Dict[str, Any]:
 
+        has_image = False
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                if any(isinstance(part, dict) and part.get("type") == "image_url" for part in content):
+                    has_image = True
+                    break
+
         payload: Dict[str, Any] = {
             "model": self.default_model,
             "messages": messages,
             "temperature": temperature,
             "stream": False,
         }
+
+        # Vision calls are slower; cap response length to keep UI snappy.
+        if has_image and self.vision_max_tokens > 0:
+            payload["max_tokens"] = self.vision_max_tokens
+        if has_image and self.vision_reasoning_effort:
+            payload["reasoning_effort"] = self.vision_reasoning_effort
 
         print("\n========================================")
         print("MK1 → LM STUDIO REQUEST")
@@ -151,6 +227,30 @@ class LMStudioClient:
                 timeout=120,
             )
 
+            # Some OpenAI-compatible backends may not accept reasoning_effort.
+            if resp.status_code >= 400 and "reasoning_effort" in payload:
+                lowered = ""
+                try:
+                    lowered = (resp.text or "").lower()
+                except Exception:
+                    lowered = ""
+
+                unsupported_markers = [
+                    "reasoning_effort",
+                    "unknown field",
+                    "unrecognized",
+                    "unexpected",
+                    "invalid request",
+                ]
+                if any(m in lowered for m in unsupported_markers):
+                    retry_payload = dict(payload)
+                    retry_payload.pop("reasoning_effort", None)
+                    resp = requests.post(
+                        self.chat_url,
+                        json=retry_payload,
+                        timeout=120,
+                    )
+
             print("\n========================================")
             print("LM STUDIO STATUS")
             print("========================================")
@@ -160,13 +260,20 @@ class LMStudioClient:
 
             data = resp.json()
 
-            # Strip reasoning traces
+            # Strip reasoning traces from all choices and nested payloads.
+            def _scrub_reasoning(obj: Any) -> Any:
+                if isinstance(obj, dict):
+                    obj = dict(obj)
+                    obj.pop("reasoning_content", None)
+                    for k, v in list(obj.items()):
+                        obj[k] = _scrub_reasoning(v)
+                    return obj
+                if isinstance(obj, list):
+                    return [_scrub_reasoning(x) for x in obj]
+                return obj
+
             try:
-                choices = data.get("choices", [])
-                if choices:
-                    msg = choices[0].get("message", {})
-                    if "reasoning_content" in msg:
-                        del msg["reasoning_content"]
+                data = _scrub_reasoning(data)
             except Exception:
                 pass
 
@@ -300,6 +407,20 @@ class MK1Core:
                 "model",
                 "default_model",
                 "local-model",
+            ),
+
+            # Pass through vision tuning from config so image replies are not
+            # silently capped by constructor defaults.
+            "vision_max_tokens": self.config.get(
+                "model",
+                "vision_max_tokens",
+                int(os.getenv("MK1_VISION_MAX_TOKENS", "512")),
+            ),
+
+            "vision_reasoning_effort": self.config.get(
+                "model",
+                "vision_reasoning_effort",
+                os.getenv("MK1_VISION_REASONING_EFFORT", "none"),
             ),
         })
 
@@ -599,6 +720,17 @@ class MK1Core:
 
         return " ".join(parts[:max_sentences]).strip()
 
+    def _cap_paragraphs(self, text: str, max_paragraphs: int = 2) -> str:
+        value = (text or "").strip()
+        if not value or max_paragraphs < 1:
+            return value
+
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", value) if p.strip()]
+        if len(paragraphs) <= max_paragraphs:
+            return value
+
+        return "\n\n".join(paragraphs[:max_paragraphs]).strip()
+
     def _extract_memory_request_parts(self, user_query: str) -> List[str]:
         q = (user_query or "").strip().lower()
         if not q:
@@ -627,6 +759,7 @@ class MK1Core:
         return {
             "birthdate": bool(re.search(r"\b(birthdate|birthday|date of birth|dob)\b", q)),
             "eye_color": bool(re.search(r"\b(eye color|eyes color|eye|eyes)\b", q)),
+            "favorite_color": bool(re.search(r"\b(favorite|favourite)\s+color\b", q)),
             "age": bool(re.search(r"\bhow old\b|\bage\b", q)),
         }
 
@@ -802,6 +935,8 @@ class MK1Core:
         slot_queries = {
             "eye_color": ["eye color", "eyes", "eye"],
             "birthdate": ["birthdate", "birthday", "date of birth", "dob"],
+            "favorite_color": ["favorite color", "favourite color", "color", "colour"],
+            "favorite_color": ["favorite color", "favourite color", "color", "colour"],
         }
         probes = slot_queries.get(slot, [])
         if not probes:
@@ -971,6 +1106,7 @@ class MK1Core:
         if any(slots.values()):
             birth_fact = ""
             eye_fact = ""
+            favorite_fact = ""
 
             if slots.get("birthdate") or slots.get("age"):
                 birth_fact = self._pick_fact_for_keywords(
@@ -1005,6 +1141,19 @@ class MK1Core:
                     selected.append(eye_fact)
                 else:
                     missing.append("eye color")
+
+            if slots.get("favorite_color"):
+                favorite_fact = self._pick_fact_for_keywords(
+                    clean_facts,
+                    ["favorite color", "favourite color", "color", "colour"],
+                    used,
+                )
+                if not favorite_fact:
+                    favorite_fact = self._lookup_slot_fact("favorite_color", user_query)
+                if favorite_fact:
+                    selected.append(favorite_fact)
+                else:
+                    missing.append("favorite color")
 
             age_sentence = ""
             if slots.get("age"):
@@ -1072,6 +1221,12 @@ class MK1Core:
                 lines.append(f"Eye color: {eye_line}.")
             elif slots.get("eye_color"):
                 lines.append("Eye color: I do not have that in memory yet.")
+            if favorite_fact:
+                fav_line = self._normalize_memory_reply_perspective(user_query, favorite_fact)
+                fav_line = re.sub(r"[.!?]+$", "", fav_line).strip()
+                lines.append(f"Favorite color: {fav_line}.")
+            elif slots.get("favorite_color"):
+                lines.append("Favorite color: I do not have that in memory yet.")
 
             if birth_fact:
                 bdt = self._parse_birthdate_from_text(birth_fact)
@@ -3488,6 +3643,9 @@ IMPORTANT RULES:
             if ("how old" in t and " i " in f" {t} ") or ("eye color" in t and "my" in t):
                 return "memory_read"
 
+            if re.search(r"\b(favorite|favourite)\s+color\b", t):
+                return "memory_read"
+
             # MEMORY WRITE (commands)
             write_triggers = [
                 "remember ",
@@ -4343,6 +4501,7 @@ IMPORTANT RULES:
                 "",
             ).strip()
 
+        text = self._cap_paragraphs(text, max_paragraphs=2)
         return text or ""
 
     # ========================================================
@@ -4364,7 +4523,50 @@ IMPORTANT RULES:
                 .get("message", {})
             )
 
-            return msg.get("content", "") or ""
+            # Never allow hidden reasoning fields to leak into user-visible text.
+            if isinstance(msg, dict):
+                msg.pop("reasoning_content", None)
+
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+
+            # Handle OpenAI-compatible multimodal/content-part formats.
+            if isinstance(content, list):
+                parts: List[str] = []
+                for part in content:
+                    if isinstance(part, dict):
+                        txt = part.get("text")
+                        if isinstance(txt, str) and txt.strip():
+                            parts.append(txt)
+                    elif isinstance(part, str) and part.strip():
+                        parts.append(part)
+                return "\n".join(parts).strip()
+
+            # Some backends may nest content as an object.
+            if isinstance(content, dict):
+                content.pop("reasoning_content", None)
+                if isinstance(content.get("content"), str):
+                    return content.get("content", "")
+                if isinstance(content.get("text"), str):
+                    return content.get("text", "")
+                return ""
+
+            text = str(content or "")
+
+            # If content is a serialized JSON object with content/reasoning_content,
+            # parse and keep only the user-visible content field.
+            stripped = text.strip()
+            if stripped.startswith("{") and stripped.endswith("}") and '"content"' in stripped:
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        parsed.pop("reasoning_content", None)
+                        inner = parsed.get("content")
+                        if isinstance(inner, str):
+                            return inner
+                except Exception:
+                    pass
+
+            return text
 
         return ""
 

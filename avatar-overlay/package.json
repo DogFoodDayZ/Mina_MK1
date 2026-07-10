@@ -1,0 +1,9 @@
+{
+  "name": "mina-avatar-overlay",
+  "version": "0.1.0",
+  "description": "Lightweight local web overlay for the Mina gremlin avatar",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

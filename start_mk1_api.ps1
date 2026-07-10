@@ -1,5 +1,6 @@
 param(
     [int]$Port = 8000,
+    [string]$ApiHost = '127.0.0.1',
     [int]$EmbedPort = 8084,
     [string]$EmbedHost = '127.0.0.1',
     [switch]$Foreground
@@ -25,7 +26,8 @@ function Test-EmbedHealth {
             return $true
         }
         return $false
-    } catch {
+    }
+    catch {
         return $false
     }
 }
@@ -83,7 +85,8 @@ if (Test-Path $pidFile) {
             Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
             Write-Host "Stopped PID from pidfile: $oldPid"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Could not process pidfile: $($_.Exception.Message)"
     }
     Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
@@ -97,7 +100,8 @@ if ($pids.Count -gt 0) {
         try {
             Stop-Process -Id $procId -Force -ErrorAction Stop
             Write-Host "Stopped process on port ${Port}: $procId"
-        } catch {
+        }
+        catch {
             Write-Warning "Could not stop process $procId on port ${Port}: $($_.Exception.Message)"
         }
     }
@@ -112,25 +116,25 @@ $embedPython = Resolve-PythonPath -PreferredPath $pythonExe
 Ensure-EmbedServer -HealthUrl $embedHealthUrl -ScriptPath $embedScript -PythonPath $embedPython
 
 $uvicornArgs = @(
-    "-m", "uvicorn", "mk1_api:app",
-    "--host", "127.0.0.1",
+    "-m", "uvicorn", "agent.server.mk1_api:app",
+    "--host", "$ApiHost",
     "--port", "$Port",
     "--no-access-log"
 )
 
 if ($Foreground) {
-    Write-Host "Starting MK1 API in foreground on http://127.0.0.1:$Port"
+    Write-Host "Starting MK1 API in foreground on http://${ApiHost}:$Port"
     & $pythonExe @uvicornArgs
     exit $LASTEXITCODE
 }
 
-Write-Host "Starting MK1 API detached on http://127.0.0.1:$Port"
+Write-Host "Starting MK1 API detached on http://${ApiHost}:$Port"
 $proc = Start-Process -FilePath $pythonExe -ArgumentList $uvicornArgs -WorkingDirectory $PSScriptRoot -PassThru
 
 $listenerPid = $null
 for ($i = 0; $i -lt 20; $i++) {
     $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
-        Select-Object -First 1 OwningProcess
+    Select-Object -First 1 OwningProcess
     if ($listener) {
         $listenerPid = [int]$listener.OwningProcess
         break
@@ -141,7 +145,8 @@ for ($i = 0; $i -lt 20; $i++) {
 if ($null -ne $listenerPid) {
     Set-Content -Path $pidFile -Value $listenerPid -NoNewline
     Write-Host "MK1 API PID: $listenerPid"
-} else {
+}
+else {
     Set-Content -Path $pidFile -Value $proc.Id -NoNewline
     Write-Warning "Could not resolve listener PID quickly; recorded parent PID $($proc.Id)"
 }

@@ -999,6 +999,77 @@ class MK1Memory:
 
         return None
 
+    def delete_memory_ids(self, memory_ids: List[int]) -> int:
+        ids = []
+        for mem_id in memory_ids or []:
+            try:
+                ids.append(int(mem_id))
+            except Exception:
+                continue
+
+        ids = [mem_id for mem_id in dict.fromkeys(ids) if mem_id > 0]
+        if not ids:
+            return 0
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            placeholders = ",".join(["?"] * len(ids))
+            cur.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", tuple(ids))
+            deleted = int(cur.rowcount or 0)
+            conn.commit()
+            conn.close()
+
+            if deleted > 0:
+                self.small_index, self.base_index = self._rebuild_indexes()
+            return deleted
+        except Exception as e:
+            self._set_error(f"delete_memory_ids_error: {e}")
+            return 0
+
+    def delete_memory_by_text(
+        self,
+        text: str,
+        include_kinds: Optional[List[str]] = None,
+        include_tags: Optional[List[str]] = None,
+    ) -> int:
+        target = self._normalize_text(text)
+        if not target:
+            return 0
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT id, text, kind, tags, timestamp FROM memories ORDER BY timestamp DESC")
+            rows = cur.fetchall()
+            conn.close()
+
+            delete_ids: List[int] = []
+            for row in rows:
+                row_id = int(row[0])
+                row_text = row[1] or ""
+                row_kind = row[2]
+                row_tags = json.loads(row[3]) if row[3] else []
+                row_ts = float(row[4])
+
+                if not self._matches_filters(
+                    kind=row_kind,
+                    tags=row_tags,
+                    timestamp=row_ts,
+                    include_kinds=include_kinds,
+                    include_tags=include_tags,
+                    since_ts=None,
+                ):
+                    continue
+
+                if self._normalize_text(row_text) == target:
+                    delete_ids.append(row_id)
+
+            return self.delete_memory_ids(delete_ids)
+        except Exception as e:
+            self._set_error(f"delete_memory_by_text_error: {e}")
+            return 0
+
     def auto_promote_short_term(
         self,
         seed_text: str,

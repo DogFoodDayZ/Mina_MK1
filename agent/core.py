@@ -2845,10 +2845,12 @@ class MK1Core:
                     matches = re.findall(tool_pattern, text_content)
                     
                     if matches:
-                        # Found custom format tools
+                        # Found custom format tools - remove tool calls from output
+                        cleaned_content = re.sub(tool_pattern, "", text_content).strip()
+                        
                         messages.append({
                             "role": "assistant",
-                            "content": text_content,
+                            "content": cleaned_content or "[thinking...]",
                         })
                         
                         for tool_name, args_str in matches:
@@ -2861,8 +2863,12 @@ class MK1Core:
                                     v = v.strip().strip('"\'')
                                     tool_args[k.strip()] = v
                             
+                            print(f"\n>>> CALLING TOOL: {tool_name} with args {tool_args}")
+                            
                             # Run the tool
                             tool_result = self.tools.run(tool_name, tool_args)
+                            
+                            print(f">>> TOOL RESULT: {tool_result}")
                             
                             # Add tool result to messages
                             messages.append({

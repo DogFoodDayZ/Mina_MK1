@@ -2688,6 +2688,21 @@ class MK1Core:
                     "content": f"Relevant memory context:\n{context}",
                 })
 
+            # Add tool availability hint if tools are available
+            tool_schemas = self.tools.get_tool_schemas()
+            if tool_schemas:
+                tool_names = [t["function"]["name"] for t in tool_schemas]
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"You have access to these tools: {', '.join(tool_names)}. "
+                        f"Use them proactively when the user asks for information you can fetch, files to read/write, "
+                        f"or tasks you can perform. For example, use 'web_fetch' to get content from URLs, "
+                        f"'file_read' for files, 'ps_run' for PowerShell commands, etc. "
+                        f"Call tools to help the user rather than just discussing what you would do."
+                    ),
+                })
+
             # =================================================
             # TOOL REFLEX FIRST
             # =================================================
@@ -2759,9 +2774,6 @@ class MK1Core:
                     "role": "user",
                     "content": user_input,
                 })
-
-            # Get tool schemas for function calling
-            tool_schemas = self.tools.get_tool_schemas()
 
             reply = self.model.chat(
                 messages=messages,

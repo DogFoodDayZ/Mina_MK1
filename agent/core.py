@@ -4704,7 +4704,7 @@ IMPORTANT RULES:
         ]
         return [name for name in preferred if name in self.tools.tools]
 
-    def _extract_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+    def _extract_json_dict(self, text: str) -> Optional[Dict[str, Any]]:
         raw = (text or "").strip()
         if not raw:
             return None
@@ -4786,7 +4786,7 @@ IMPORTANT RULES:
         try:
             plan_reply = self.model.chat(messages=messages, tools=None, temperature=0.0)
             plan_text = self._extract_text(plan_reply)
-            plan = self._extract_json_object(plan_text)
+            plan = self._extract_json_dict(plan_text)
             if not plan:
                 return None
 

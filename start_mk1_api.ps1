@@ -47,7 +47,7 @@ function Resolve-PythonPath {
     throw "No Python executable found for embed server startup."
 }
 
-function Ensure-EmbedServer {
+function Start-EmbedServerIfNeeded {
     param(
         [string]$HealthUrl,
         [string]$ScriptPath,
@@ -113,7 +113,7 @@ if (-not (Test-Path $pythonExe)) {
 }
 
 $embedPython = Resolve-PythonPath -PreferredPath $pythonExe
-Ensure-EmbedServer -HealthUrl $embedHealthUrl -ScriptPath $embedScript -PythonPath $embedPython
+Start-EmbedServerIfNeeded -HealthUrl $embedHealthUrl -ScriptPath $embedScript -PythonPath $embedPython
 
 $uvicornArgs = @(
     "-m", "uvicorn", "agent.server.mk1_api:app",

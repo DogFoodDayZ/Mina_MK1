@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 try:
@@ -1011,6 +1011,59 @@ def process(req: ProcessRequest):
     )
 
     return out
+
+
+@app.post("/process-stream")
+def process_stream(req: ProcessRequest):
+    """
+    Streaming processing endpoint (SSE).
+    Emits JSON lines in SSE data frames:
+      data: {"type":"chunk","content":"..."}
+      data: {"type":"done"}
+    """
+
+    def event_stream():
+        full_parts: list[str] = []
+        try:
+            for chunk in core.process_stream(
+                req.input,
+                image_attachment=req.image_attachment,
+            ):
+                part = str(chunk or "")
+                if not part:
+                    continue
+                full_parts.append(part)
+                payload = json.dumps(
+                    {"type": "chunk", "content": part},
+                    ensure_ascii=False,
+                )
+                yield f"data: {payload}\n\n"
+
+            full_reply = "".join(full_parts).strip()
+            _push_gui_event(
+                source="process_stream",
+                input_text=req.input,
+                reply_text=full_reply,
+                extra=None,
+            )
+            yield "data: {\"type\":\"done\"}\n\n"
+        except Exception as e:
+            err = json.dumps(
+                {"type": "error", "error": str(e)},
+                ensure_ascii=False,
+            )
+            yield f"data: {err}\n\n"
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers=headers,
+    )
 
 
 if MULTIPART_AVAILABLE:

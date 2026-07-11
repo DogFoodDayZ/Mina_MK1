@@ -304,6 +304,78 @@ class LMStudioClient:
                 ]
             }
 
+    def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.7,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ):
+
+        payload: Dict[str, Any] = {
+            "model": self.default_model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        with requests.post(
+            self.chat_url,
+            json=payload,
+            stream=True,
+            timeout=180,
+        ) as resp:
+            resp.raise_for_status()
+
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+
+                line = str(raw_line).strip()
+                if not line:
+                    continue
+
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+
+                if line == "[DONE]":
+                    break
+
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+
+                choices = item.get("choices") or []
+                if not choices:
+                    continue
+
+                choice0 = choices[0] if isinstance(choices[0], dict) else {}
+                delta = choice0.get("delta") if isinstance(choice0, dict) else {}
+
+                piece = ""
+                if isinstance(delta, dict):
+                    content = delta.get("content")
+                    if isinstance(content, str):
+                        piece = content
+                    elif isinstance(content, list):
+                        out_parts: List[str] = []
+                        for part in content:
+                            if isinstance(part, dict):
+                                txt = part.get("text")
+                                if isinstance(txt, str) and txt:
+                                    out_parts.append(txt)
+                        piece = "".join(out_parts)
+
+                if not piece and isinstance(choice0.get("text"), str):
+                    piece = str(choice0.get("text"))
+
+                if piece:
+                    yield piece
+
 
 # ============================================================
 # MK1 CORE
@@ -2697,6 +2769,16 @@ class MK1Core:
             "error": None if ok else "scaffold_incomplete",
         }
 
+    def _iter_text_chunks(self, text: str, chunk_size: int = 64):
+        value = str(text or "")
+        if not value:
+            return
+        size = max(1, int(chunk_size))
+        idx = 0
+        while idx < len(value):
+            yield value[idx:idx + size]
+            idx += size
+
 # ========================================================
 # PROCESS
 # ========================================================
@@ -2932,6 +3014,129 @@ class MK1Core:
             return {
                 "reply": f"(core error: {str(e)})"
             }
+
+    def process_stream(
+        self,
+        user_input: str,
+        image_attachment: Optional[Dict[str, Any]] = None,
+    ):
+
+        try:
+            self._maybe_run_maintenance_tick()
+
+            command_like = self.fast_command_mode and self._is_command_like_query(user_input)
+            if command_like and self.fast_command_skip_context:
+                context = ""
+            else:
+                context = self.build_context(user_input)
+
+            messages: List[Dict[str, Any]] = []
+
+            if self.system_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": self.system_prompt,
+                })
+
+            if context:
+                messages.append({
+                    "role": "system",
+                    "content": f"Relevant memory context:\n{context}",
+                })
+
+            tool_schemas = self.tools.get_tool_schemas()
+            if tool_schemas:
+                tool_names = [t["function"]["name"] for t in tool_schemas]
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"You have access to these tools: {', '.join(tool_names)}. "
+                        f"Use them proactively when the user asks for information you can fetch, files to read/write, "
+                        f"or tasks you can perform. For example, use 'web_fetch' to get content from URLs, "
+                        f"'file_read' for files, 'ps_run' for PowerShell commands, etc. "
+                        f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>"
+                    ),
+                })
+
+            reflex_reply = self._reflex_tools_and_memory(
+                messages=messages,
+                reply={},
+                user_input=user_input,
+            )
+            if reflex_reply is not None:
+                final_text = self._extract_text(reflex_reply)
+                self._store_turn_memory(
+                    user_input=user_input,
+                    assistant_text=final_text,
+                )
+                for chunk in self._iter_text_chunks(final_text):
+                    yield chunk
+                return
+
+            image_meta: Optional[Dict[str, Any]] = None
+            if isinstance(image_attachment, dict):
+                image_meta = {
+                    "name": str(image_attachment.get("name") or "image"),
+                    "type": str(image_attachment.get("type") or "image/*"),
+                    "size": int(image_attachment.get("size") or 0),
+                    "data_url": str(image_attachment.get("data_url") or ""),
+                }
+
+            if image_meta and image_meta.get("data_url") and self.model.supports_vision():
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": user_input,
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_meta["data_url"],
+                            },
+                        },
+                    ],
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": user_input,
+                })
+
+            parts: List[str] = []
+            for piece in self.model.chat_stream(
+                messages=messages,
+                tools=None,
+            ):
+                if not piece:
+                    continue
+                parts.append(piece)
+                yield piece
+
+            final_text = self._clean_response_text("".join(parts)).strip()
+            final_text = re.sub(
+                r'<\|tool_call\>call:[^\n]*?<tool_call\|>\.?',
+                '',
+                final_text,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            if not final_text:
+                # Fallback in case backend didn't emit stream chunks.
+                reply = self.model.chat(messages=messages, tools=None)
+                final_text = self._handle_model_response(messages, reply)
+                for chunk in self._iter_text_chunks(final_text):
+                    yield chunk
+
+            self._store_turn_memory(
+                user_input=user_input,
+                assistant_text=final_text,
+            )
+
+        except Exception as e:
+            traceback.print_exc()
+            yield f"(core error: {str(e)})"
     # ========================================================
     # MEMORY CONTEXT
     # ========================================================
@@ -2941,40 +3146,29 @@ class MK1Core:
         if not q:
             return False
 
-        starts = (
-            "run ",
-            "execute ",
-            "start ",
-            "stop ",
-            "restart ",
-            "git ",
-            "status",
-            "list ",
-            "show ",
-            "open ",
-            "read ",
-            "write ",
-            "delete ",
-            "create ",
-            "mkdir ",
-        )
-        if q.startswith(starts):
+        # Strong signals first: explicit CLI/tool invocations and git commands.
+        strong_patterns = [
+            r"^git\s+\w+",
+            r"^(?:run|execute)\s+(?:ps|powershell|script|pytest)\b",
+            r"^(?:mkdir|cd|ls|dir|pwd|cat|type)\b",
+            r"\b(?:file_read|file_write|file_append|file_delete|ps_run|web_fetch|web_search)\b",
+        ]
+        if any(re.search(p, q) for p in strong_patterns):
             return True
 
-        command_tokens = [
-            "git status",
-            "git pull",
-            "git push",
-            "run ps",
-            "run powershell",
-            "execute script",
-            "read file",
-            "open file",
-            "show file",
-            "list aliases",
-            "show aliases",
-        ]
-        return any(tok in q for tok in command_tokens)
+        # Natural-language command forms, but only when they clearly target tools/files.
+        if re.search(r"\b(read|open|show)\s+(?:the\s+)?(?:file|folder|directory|path|repo)\b", q):
+            return True
+        if re.search(r"\b(write|append|delete|remove|create)\s+(?:a\s+)?(?:file|folder|directory)\b", q):
+            return True
+        if re.search(r"\b(run|start|stop|restart)\s+(?:the\s+)?(?:server|api|script|service|test|tests)\b", q):
+            return True
+
+        # Path-looking strings are usually operational commands.
+        if re.search(r"([a-z]:\\|[.]{1,2}[\\/]|\\\w+\\|\.(ps1|py|bat|cmd)\b)", q, re.IGNORECASE):
+            return True
+
+        return False
 
     def _maybe_run_maintenance_tick(self) -> None:
         now = time.monotonic()
@@ -4546,25 +4740,30 @@ IMPORTANT RULES:
             for q in quoted:
                 if re.match(r'^[A-Za-z]:\\', q):
                     path = q.strip()
-                elif not content:
-                    content = q.strip()
 
             if not path:
-                m = re.search(r'\bat\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                m = re.search(r'\bfile\s+([^\s,;:]+\.[A-Za-z0-9]{1,8})', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\bat\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
                 if not m:
                     m = re.search(r'\bto\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
                 if not m:
                     m = re.search(r'([A-Za-z]:\\[^\s,]+\.[A-Za-z0-9]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\b(?:at|to)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'([^\s,;]+\.[A-Za-z0-9]{1,8})', text, re.IGNORECASE)
                 if m:
-                    path = m.group(1).strip()
+                    path = m.group(1).strip().rstrip('.,;:')
 
             if not content:
-                if quoted:
-                    content = quoted[-1].strip()
-                else:
+                m = re.search(r'\bwith\s+content\s*:\s*([\s\S]+)$', text, re.IGNORECASE)
+                if not m:
                     m = re.search(r'(?:append|add).*?\bto\s+[^\s]+\s+(.+)', text, re.IGNORECASE)
-                    if m:
-                        content = m.group(1).strip()
+                if m:
+                    content = m.group(1).strip()
+                elif quoted:
+                    content = quoted[-1].strip()
 
             return "file_append", {"path": path, "content": content}
 
@@ -4577,9 +4776,10 @@ IMPORTANT RULES:
             for q in quoted:
                 candidate = q.strip()
                 if re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
-                    return candidate
+                    return candidate.rstrip('.,;:')
 
             patterns = [
+                r'\bfile\s+([^\s,;:]+\.[A-Za-z0-9]{1,8})',
                 r'\b(?:at|to|in)\s+([A-Za-z]:\\[^\s,;]+)',
                 r'\b(?:at|to|in)\s+([.]{1,2}[\\/][^\s,;]+)',
                 r'\b(?:at|to|in)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
@@ -4589,7 +4789,7 @@ IMPORTANT RULES:
             for pattern in patterns:
                 m = re.search(pattern, raw, re.IGNORECASE)
                 if m:
-                    return m.group(1).strip().strip('"\'')
+                    return m.group(1).strip().strip('"\'').rstrip('.,;:')
 
             return ""
 
@@ -4624,6 +4824,8 @@ IMPORTANT RULES:
         file_write_intent = any(x in t for x in [
             "create file",
             "write file",
+            "write to file",
+            "write this to file",
             "save file",
             "make file",
             "create a python script",

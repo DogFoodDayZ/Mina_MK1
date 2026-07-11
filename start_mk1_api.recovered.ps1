@@ -1,6 +1,6 @@
 param(
     [int]$Port = 8000,
-    [string]$ApiHost = '0.0.0.0',
+    [string]$ApiHost = '127.0.0.1',
     [int]$EmbedPort = 8084,
     [string]$EmbedHost = '127.0.0.1',
     [switch]$Foreground

@@ -3,6 +3,7 @@
 import os
 import time
 import json
+import html
 import traceback
 import re
 import subprocess
@@ -692,6 +693,7 @@ class MK1Core:
                     text = "\n".join(lines[1:]).strip()
                     continue
                 break
+            text = re.sub(r'<\|tool_call\>call:[^\n]*?<tool_call\|>\.?', '', text, flags=re.IGNORECASE).strip()
             flair = text.strip()
             if not flair:
                 flair = "Gremlin check complete."
@@ -3364,6 +3366,58 @@ class MK1Core:
                 return f"Stored memory: {stored}"
             return "Memory stored successfully."
 
+        if tool_name == "web_fetch":
+            if not result.get("ok"):
+                return f"Web fetch failed: {result.get('error')}"
+
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            content = str(payload.get("content") or "").strip()
+            if not content:
+                return "Web fetch succeeded but returned empty content."
+
+            # Turn HTML-heavy pages into readable plain text so Mina can summarize naturally.
+            text = content
+            if "<" in text and ">" in text:
+                text = re.sub(r"<script[\\s\\S]*?</script>", " ", text, flags=re.IGNORECASE)
+                text = re.sub(r"<style[\\s\\S]*?</style>", " ", text, flags=re.IGNORECASE)
+                text = re.sub(r"<[^>]+>", " ", text)
+                text = html.unescape(text)
+                text = re.sub(r"\\s+", " ", text).strip()
+
+            if len(text) > 1800:
+                text = text[:1800].rstrip() + "..."
+
+            return text
+
+        if tool_name == "web_search":
+            if not result.get("ok"):
+                return f"Web search failed: {result.get('error')}"
+
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            items = payload.get("results", []) if isinstance(payload.get("results", []), list) else []
+            if not items:
+                q = payload.get("query") or "(no query)"
+                return f"No web results found for: {q}"
+
+            lines = []
+            q = payload.get("query")
+            if q:
+                lines.append(f"Web results for: {q}")
+                lines.append("")
+
+            for idx, item in enumerate(items[:8], start=1):
+                title = str(item.get("title") or "(untitled)").strip()
+                url = str(item.get("url") or "").strip()
+                snippet = str(item.get("snippet") or "").strip()
+
+                lines.append(f"{idx}. {title}")
+                if url:
+                    lines.append(f"   {url}")
+                if snippet:
+                    lines.append(f"   {snippet}")
+
+            return "\n".join(lines)
+
         if tool_name == "ps_run":
             if not result.get("ok"):
                 return f"PowerShell execution failed: {result.get('error')}"
@@ -3532,18 +3586,6 @@ class MK1Core:
         if not formatted.strip():
             formatted = "(tool returned no output)"
 
-        if tool_name == "web_fetch":
-            # Keep web fetch output deterministic and avoid accidental shell-like narrative.
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": formatted,
-                        }
-                    }
-                ]
-            }
-
         if tool_name in (
             "__tool_list__",
             "__path_alias_set__",
@@ -3564,6 +3606,8 @@ class MK1Core:
             "__memory_tidy__",
             "__scaffold__",
             "memory_write",
+            "web_search",
+            "web_fetch",
             "dir_list",
             "dir_create",
             "file_read",
@@ -4083,6 +4127,46 @@ IMPORTANT RULES:
                 }
 
         # ====================================================
+        # WEB SEARCH
+        # ====================================================
+
+        web_search_triggers = [
+            "search web",
+            "web search",
+            "search online",
+            "on the web",
+            "find online",
+            "look up",
+            "latest news",
+            "current news",
+            "weather in",
+            "weather for",
+            "what is the weather",
+        ]
+
+        if any(trigger in t for trigger in web_search_triggers):
+            query = raw_text
+
+            # Remove leading command words so query is cleaner for the search tool.
+            query = re.sub(
+                r'^(?:please\s+)?(?:search\s+(?:the\s+)?web\s+for|search\s+online\s+for|find\s+online|look\s+up|web\s+search)\s+',
+                "",
+                query,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            query = query.strip(" \t\n\r.?!")
+            if not query:
+                query = raw_text.strip()
+
+            return "web_search", {
+                "query": query,
+                "max_results": 5,
+                "timeout": 12,
+                "include_content": False,
+            }
+
+        # ====================================================
         # POWERSHELL SCRIPT EXECUTION (ps_run)
         # ====================================================
 
@@ -4586,7 +4670,161 @@ IMPORTANT RULES:
         ]):
             return "__tool_list__", {}
 
+        planner_triggers = [
+            "search",
+            "find",
+            "look up",
+            "latest",
+            "news",
+            "weather",
+            "web",
+            "website",
+            "release notes",
+            "docs",
+            "documentation",
+            "http://",
+            "https://",
+        ]
+
+        if any(token in t for token in planner_triggers):
+            planned = self._plan_tool_action(raw_text)
+            if planned is not None:
+                return planned
+
         return None, {}
+
+    def _planner_candidate_tools(self) -> List[str]:
+        preferred = [
+            "web_search",
+            "web_fetch",
+            "memory_read",
+            "file_read",
+            "dir_list",
+            "ps_run",
+        ]
+        return [name for name in preferred if name in self.tools.tools]
+
+    def _extract_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+
+        fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw, re.IGNORECASE)
+        if fenced:
+            raw = fenced.group(1).strip()
+
+        if not (raw.startswith("{") and raw.endswith("}")):
+            m = re.search(r"(\{[\s\S]*\})", raw)
+            if not m:
+                return None
+            raw = m.group(1).strip()
+
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
+    def _sanitize_planned_tool_args(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        clean = dict(args or {})
+
+        if tool_name == "web_search":
+            q = str(clean.get("query") or "").strip()
+            clean["query"] = q
+
+            try:
+                clean["max_results"] = int(clean.get("max_results", 5))
+            except Exception:
+                clean["max_results"] = 5
+            clean["max_results"] = max(1, min(10, clean["max_results"]))
+
+            try:
+                clean["timeout"] = int(clean.get("timeout", 12))
+            except Exception:
+                clean["timeout"] = 12
+            clean["timeout"] = max(1, min(30, clean["timeout"]))
+
+            clean["include_content"] = bool(clean.get("include_content", False))
+
+        elif tool_name == "web_fetch":
+            clean["url"] = str(clean.get("url") or "").strip()
+            try:
+                clean["timeout"] = int(clean.get("timeout", 10))
+            except Exception:
+                clean["timeout"] = 10
+            clean["timeout"] = max(1, min(30, clean["timeout"]))
+
+        elif tool_name == "memory_read":
+            clean["query"] = str(clean.get("query") or "").strip()
+            try:
+                clean["top_k"] = int(clean.get("top_k", 3))
+            except Exception:
+                clean["top_k"] = 3
+            clean["top_k"] = max(1, min(8, clean["top_k"]))
+
+        return clean
+
+    def _plan_tool_action(self, user_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        candidates = self._planner_candidate_tools()
+        if not candidates:
+            return None
+
+        system_prompt = (
+            "You are a tool planner for Mina. "
+            "Pick the best single tool and arguments for the user request. "
+            "Return ONLY strict JSON with keys: tool, args, confidence, reason. "
+            "tool must be one of: " + ", ".join(candidates) + ". "
+            "confidence is 0.0-1.0. "
+            "If no suitable tool exists, set tool to null and confidence to 0.0."
+        )
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ]
+
+        try:
+            plan_reply = self.model.chat(messages=messages, tools=None, temperature=0.0)
+            plan_text = self._extract_text(plan_reply)
+            plan = self._extract_json_object(plan_text)
+            if not plan:
+                return None
+
+            tool_name_raw = plan.get("tool")
+            if tool_name_raw is None:
+                return None
+
+            tool_name = str(tool_name_raw).strip()
+            if tool_name not in candidates:
+                return None
+
+            confidence = plan.get("confidence", 0.0)
+            try:
+                conf_val = float(confidence)
+            except Exception:
+                conf_val = 0.0
+
+            if conf_val < 0.55:
+                return None
+
+            args_raw = plan.get("args", {})
+            if not isinstance(args_raw, dict):
+                args_raw = {}
+
+            args = self._sanitize_planned_tool_args(tool_name, args_raw)
+
+            # Minimum required args for key tools.
+            if tool_name == "web_search" and not str(args.get("query") or "").strip():
+                return None
+            if tool_name == "web_fetch" and not str(args.get("url") or "").strip():
+                return None
+            if tool_name == "memory_read" and not str(args.get("query") or "").strip():
+                return None
+
+            return tool_name, args
+        except Exception:
+            traceback.print_exc()
+            return None
 
         
     
@@ -4634,6 +4872,7 @@ IMPORTANT RULES:
             ).strip()
 
         text = self._cap_paragraphs(text, max_paragraphs=2)
+        text = re.sub(r'<\|tool_call\>call:[^\n]*?<tool_call\|>\.?', '', text, flags=re.IGNORECASE).strip()
         return text or ""
 
     # ========================================================

@@ -110,3 +110,28 @@ class ToolLoader:
         }
         """
         return dict(self.status)
+
+    # ------------------------------------------------------------
+    # PUBLIC: GET TOOL SCHEMAS FOR MODEL
+    # ------------------------------------------------------------
+    def get_tool_schemas(self) -> list:
+        """
+        Returns OpenAI-compatible tool schemas for function calling.
+        Each tool with a .schema attribute is included.
+        """
+        schemas = []
+        for tool_name, tool_func in self.tools.items():
+            if hasattr(tool_func, "schema") and tool_func.schema:
+                schema = tool_func.schema
+                schemas.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": schema.get("description", ""),
+                        "parameters": schema.get("parameters", {
+                            "type": "object",
+                            "properties": {},
+                        }),
+                    }
+                })
+        return schemas

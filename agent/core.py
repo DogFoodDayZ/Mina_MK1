@@ -190,6 +190,7 @@ class LMStudioClient:
         self,
         messages: List[Dict[str, Any]],
         temperature: float = 0.7,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
 
         has_image = False
@@ -206,6 +207,11 @@ class LMStudioClient:
             "temperature": temperature,
             "stream": False,
         }
+
+        # Add tools if provided
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
         # Vision calls are slower; cap response length to keep UI snappy.
         if has_image and self.vision_max_tokens > 0:
@@ -2668,7 +2674,7 @@ class MK1Core:
 
             context = self.build_context(user_input)
 
-            messages: List[Dict[str, str]] = []
+            messages: List[Dict[str, Any]] = []
 
             if self.system_prompt:
                 messages.append({
@@ -2754,9 +2760,66 @@ class MK1Core:
                     "content": user_input,
                 })
 
+            # Get tool schemas for function calling
+            tool_schemas = self.tools.get_tool_schemas()
+
             reply = self.model.chat(
                 messages=messages,
+                tools=tool_schemas if tool_schemas else None,
             )
+
+            # Handle tool calls if present
+            max_tool_loops = 5
+            loop_count = 0
+            while reply and reply.get("choices") and loop_count < max_tool_loops:
+                loop_count += 1
+                choice = reply["choices"][0]
+                finish_reason = choice.get("finish_reason", "")
+                
+                # Check for tool calls
+                if finish_reason == "tool_calls" or "tool_calls" in str(choice):
+                    content = choice.get("message", {}).get("content")
+                    tool_calls = choice.get("message", {}).get("tool_calls", [])
+                    
+                    if not tool_calls:
+                        break
+                    
+                    # Add assistant's response with tool calls to messages
+                    messages.append({
+                        "role": "assistant",
+                        "content": content or "",
+                        "tool_calls": tool_calls,
+                    })
+                    
+                    # Execute each tool call
+                    for tool_call in tool_calls:
+                        tool_name = tool_call.get("function", {}).get("name", "")
+                        tool_args_str = tool_call.get("function", {}).get("arguments", "{}")
+                        tool_id = tool_call.get("id", "")
+                        
+                        try:
+                            import json
+                            tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
+                        except:
+                            tool_args = {}
+                        
+                        # Run the tool
+                        tool_result = self.tools.run(tool_name, tool_args)
+                        
+                        # Add tool result to messages
+                        messages.append({
+                            "role": "tool",
+                            "tool_use_id": tool_id,
+                            "content": str(tool_result),
+                        })
+                    
+                    # Call model again with tool results
+                    reply = self.model.chat(
+                        messages=messages,
+                        tools=tool_schemas if tool_schemas else None,
+                    )
+                else:
+                    break
 
             final_text = self._handle_model_response(
                 messages,

@@ -455,6 +455,29 @@ class MK1Core:
             8,
         )
 
+        self.fast_command_mode = bool(
+            self.config.get(
+                "performance",
+                "fast_command_mode",
+                True,
+            )
+        )
+        self.fast_command_skip_context = bool(
+            self.config.get(
+                "performance",
+                "fast_command_skip_context",
+                True,
+            )
+        )
+        self.maintenance_min_interval_seconds = int(
+            self.config.get(
+                "performance",
+                "maintenance_min_interval_seconds",
+                20,
+            )
+        )
+        self._last_maintenance_tick_ts: float = 0.0
+
         workspace_root_cfg = self.config.get(
             "workspace",
             "root",
@@ -939,78 +962,92 @@ class MK1Core:
         month_name = birth_dt.strftime("%B")
         return f"{month_name} {birth_dt.day}, {birth_dt.year}"
 
-    def _lookup_slot_fact(self, slot: str, user_query: str) -> str:
-        slot_queries = {
-            "eye_color": ["eye color", "eyes", "eye"],
-            "birthdate": ["birthdate", "birthday", "date of birth", "dob"],
-            "favorite_color": ["favorite color", "favourite color", "color", "colour"],
-            "favorite_color": ["favorite color", "favourite color", "color", "colour"],
-        }
-        probes = slot_queries.get(slot, [])
-        if not probes:
-            return ""
-
+    def _search_memory_candidates(
+        self,
+        probes: List[str],
+        user_only: bool,
+        top_k: int = 8,
+    ) -> List[str]:
         candidates: List[str] = []
+        include_tags = ["user_memory"] if user_only else None
 
         for q in probes:
             try:
-                for item in self.memory.search(
+                results = self.memory.search(
                     q,
-                    top_k=8,
+                    top_k=top_k,
                     include_kinds=["fact", "preference", "procedure"],
-                    include_tags=["user_memory"],
-                ):
+                    include_tags=include_tags,
+                )
+                for item in results:
                     s = self._sanitize_memory_fact_line(str(item.get("text") or ""))
                     if s:
                         candidates.append(s)
             except Exception:
                 traceback.print_exc()
 
+        return candidates
+
+    def _recent_memory_candidates(
+        self,
+        user_only: bool,
+        top_k: int = 800,
+    ) -> List[str]:
+        candidates: List[str] = []
+        include_tags = ["user_memory"] if user_only else None
+
+        try:
+            recents = self.memory.recent_memories(
+                top_k=top_k,
+                include_kinds=["fact", "preference", "procedure"],
+                include_tags=include_tags,
+            )
+        except Exception:
+            recents = []
+
+        for item in recents or []:
+            raw = str(item.get("text") or "")
+            s = self._sanitize_memory_fact_line(raw)
+            if s:
+                candidates.append(s)
+
+        return candidates
+
+    def _lookup_slot_fact(self, slot: str, user_query: str) -> str:
+        slot_queries = {
+            "eye_color": ["eye color", "eyes", "eye"],
+            "birthdate": ["birthdate", "birthday", "date of birth", "dob"],
+            "favorite_color": ["favorite color", "favourite color", "color", "colour"],
+        }
+        probes = slot_queries.get(slot, [])
+        if not probes:
+            return ""
+
+        candidates = self._search_memory_candidates(
+            probes=probes,
+            user_only=True,
+            top_k=8,
+        )
+
         if not candidates:
-            for q in probes:
-                try:
-                    for item in self.memory.search(
-                        q,
-                        top_k=8,
-                        include_kinds=["fact", "preference", "procedure"],
-                    ):
-                        s = self._sanitize_memory_fact_line(str(item.get("text") or ""))
-                        if s:
-                            candidates.append(s)
-                except Exception:
-                    traceback.print_exc()
+            candidates = self._search_memory_candidates(
+                probes=probes,
+                user_only=False,
+                top_k=8,
+            )
 
         # Lexical fallback over recent explicit facts.
         if not candidates:
-            try:
-                recents = self.memory.recent_memories(
-                    top_k=800,
-                    include_kinds=["fact", "preference", "procedure"],
-                    include_tags=["user_memory"],
-                )
-            except Exception:
-                recents = []
-
-            for item in recents or []:
-                raw = str(item.get("text") or "")
-                s = self._sanitize_memory_fact_line(raw)
-                if s:
-                    candidates.append(s)
+            candidates = self._recent_memory_candidates(
+                user_only=True,
+                top_k=800,
+            )
 
         if not candidates:
-            try:
-                recents_any = self.memory.recent_memories(
-                    top_k=800,
-                    include_kinds=["fact", "preference", "procedure"],
-                )
-            except Exception:
-                recents_any = []
-
-            for item in recents_any or []:
-                raw = str(item.get("text") or "")
-                s = self._sanitize_memory_fact_line(raw)
-                if s:
-                    candidates.append(s)
+            candidates = self._recent_memory_candidates(
+                user_only=False,
+                top_k=800,
+            )
 
         # Final fallback: reuse memory_read tool query behavior.
         if not candidates:
@@ -1082,6 +1119,30 @@ class MK1Core:
 
         return selected, missing
 
+    def _sanitize_unique_facts(self, lines: List[str]) -> List[str]:
+        clean_facts: List[str] = []
+        seen = set()
+        for ln in lines:
+            s = self._sanitize_memory_fact_line(str(ln or ""))
+            if not s:
+                continue
+            norm = " ".join(s.lower().split())
+            if norm in seen:
+                continue
+            seen.add(norm)
+            clean_facts.append(s)
+        return clean_facts
+
+    def _memory_read_first_fact(self, query: str, top_k: int = 1) -> str:
+        try:
+            tool_out = self.tools.run("memory_read", {"query": query, "top_k": top_k})
+            if isinstance(tool_out, dict) and tool_out.get("ok"):
+                first = (tool_out.get("results", []) or [{}])[0]
+                return self._sanitize_memory_fact_line(str(first.get("text") or ""))
+        except Exception:
+            traceback.print_exc()
+        return ""
+
     def _build_memory_read_reply(
         self,
         messages: List[Dict[str, str]],
@@ -1093,18 +1154,7 @@ class MK1Core:
             for ln in (formatted or "").splitlines()
             if ln.strip()
         ]
-
-        clean_facts: List[str] = []
-        seen = set()
-        for ln in raw_lines:
-            s = self._sanitize_memory_fact_line(ln)
-            if not s:
-                continue
-            norm = " ".join(s.lower().split())
-            if norm in seen:
-                continue
-            seen.add(norm)
-            clean_facts.append(s)
+        clean_facts = self._sanitize_unique_facts(raw_lines)
 
         slots = self._extract_memory_slots(user_query)
         used = set()
@@ -1125,13 +1175,10 @@ class MK1Core:
                 if not birth_fact:
                     birth_fact = self._lookup_slot_fact("birthdate", user_query)
                 if not birth_fact and slots.get("age"):
-                    try:
-                        tool_out = self.tools.run("memory_read", {"query": "what is my birthdate", "top_k": 1})
-                        if isinstance(tool_out, dict) and tool_out.get("ok"):
-                            first = (tool_out.get("results", []) or [{}])[0]
-                            birth_fact = self._sanitize_memory_fact_line(str(first.get("text") or ""))
-                    except Exception:
-                        traceback.print_exc()
+                    birth_fact = self._memory_read_first_fact(
+                        query="what is my birthdate",
+                        top_k=1,
+                    )
                 if birth_fact and slots.get("birthdate"):
                     selected.append(birth_fact)
                 if not birth_fact and slots.get("birthdate"):
@@ -2672,9 +2719,13 @@ class MK1Core:
             # HYBRID MEMORY ENGINE MAINTENANCE TICK
             # Runs scheduled backups, trimming, health checks.
             # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            self.memory.maintenance_tick()
+            self._maybe_run_maintenance_tick()
 
-            context = self.build_context(user_input)
+            command_like = self.fast_command_mode and self._is_command_like_query(user_input)
+            if command_like and self.fast_command_skip_context:
+                context = ""
+            else:
+                context = self.build_context(user_input)
 
             messages: List[Dict[str, Any]] = []
 
@@ -2885,6 +2936,55 @@ class MK1Core:
     # MEMORY CONTEXT
     # ========================================================
 
+    def _is_command_like_query(self, text: str) -> bool:
+        q = (text or "").strip().lower()
+        if not q:
+            return False
+
+        starts = (
+            "run ",
+            "execute ",
+            "start ",
+            "stop ",
+            "restart ",
+            "git ",
+            "status",
+            "list ",
+            "show ",
+            "open ",
+            "read ",
+            "write ",
+            "delete ",
+            "create ",
+            "mkdir ",
+        )
+        if q.startswith(starts):
+            return True
+
+        command_tokens = [
+            "git status",
+            "git pull",
+            "git push",
+            "run ps",
+            "run powershell",
+            "execute script",
+            "read file",
+            "open file",
+            "show file",
+            "list aliases",
+            "show aliases",
+        ]
+        return any(tok in q for tok in command_tokens)
+
+    def _maybe_run_maintenance_tick(self) -> None:
+        now = time.monotonic()
+        min_gap = max(0, int(self.maintenance_min_interval_seconds))
+        if (now - self._last_maintenance_tick_ts) < min_gap:
+            return
+
+        self.memory.maintenance_tick()
+        self._last_maintenance_tick_ts = now
+
     def build_context(self, query: str) -> str:
         try:
             recent_turns = self.memory.recent_memories(
@@ -2945,6 +3045,26 @@ class MK1Core:
     # ========================================================
     # FORMAT TOOL RESULT
     # ========================================================
+
+    def _result_payload(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        payload = result.get("result", {})
+        return payload if isinstance(payload, dict) else {}
+
+    def _format_simple_path_result(
+        self,
+        result: Dict[str, Any],
+        fail_prefix: str,
+        ok_prefix: str,
+        ok_key: str,
+        path_key: str = "path",
+        fallback_ok: str = "Operation completed.",
+    ) -> str:
+        if not result.get("ok"):
+            return f"{fail_prefix}: {result.get('error')}"
+        payload = self._result_payload(result)
+        if payload.get(ok_key):
+            return f"{ok_prefix}: {payload.get(path_key)}"
+        return fallback_ok
 
     def _format_tool_result(
         self,
@@ -3309,22 +3429,22 @@ class MK1Core:
             return "\n".join(lines) if lines else "No matching memories found."
 
         if tool_name == "file_write":
-            if not result.get("ok"):
-                return f"File write failed: {result.get('error')}"
-            written = result.get("result", {}).get("written")
-            path = result.get("result", {}).get("path")
-            if written:
-                return f"File written to: {path}"
-            return "File write completed."
+            return self._format_simple_path_result(
+                result=result,
+                fail_prefix="File write failed",
+                ok_prefix="File written to",
+                ok_key="written",
+                fallback_ok="File write completed.",
+            )
 
         if tool_name == "file_append":
-            if not result.get("ok"):
-                return f"File append failed: {result.get('error')}"
-            appended = result.get("result", {}).get("appended")
-            path = result.get("result", {}).get("path")
-            if appended:
-                return f"Content appended to: {path}"
-            return "File append completed."
+            return self._format_simple_path_result(
+                result=result,
+                fail_prefix="File append failed",
+                ok_prefix="Content appended to",
+                ok_key="appended",
+                fallback_ok="File append completed.",
+            )
 
         if tool_name == "file_move":
             if not result.get("ok"):
@@ -3350,13 +3470,13 @@ class MK1Core:
             return "File copy completed."
 
         if tool_name == "file_delete":
-            if not result.get("ok"):
-                return f"File delete failed: {result.get('error')}"
-            deleted = result.get("result", {}).get("deleted")
-            path = result.get("result", {}).get("path")
-            if deleted:
-                return f"File deleted: {path}"
-            return "File delete completed."
+            return self._format_simple_path_result(
+                result=result,
+                fail_prefix="File delete failed",
+                ok_prefix="File deleted",
+                ok_key="deleted",
+                fallback_ok="File delete completed.",
+            )
 
         if tool_name == "memory_write":
             if not result.get("ok"):

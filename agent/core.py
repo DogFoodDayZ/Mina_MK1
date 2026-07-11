@@ -2689,6 +2689,7 @@ class MK1Core:
                 })
 
             # Add tool availability hint if tools are available
+            # NOTE: Don't pass tools to model.chat() - LMStudio hangs with tools parameter
             tool_schemas = self.tools.get_tool_schemas()
             if tool_schemas:
                 tool_names = [t["function"]["name"] for t in tool_schemas]
@@ -2699,7 +2700,7 @@ class MK1Core:
                         f"Use them proactively when the user asks for information you can fetch, files to read/write, "
                         f"or tasks you can perform. For example, use 'web_fetch' to get content from URLs, "
                         f"'file_read' for files, 'ps_run' for PowerShell commands, etc. "
-                        f"Call tools to help the user rather than just discussing what you would do."
+                        f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>"
                     ),
                 })
 
@@ -2775,9 +2776,11 @@ class MK1Core:
                     "content": user_input,
                 })
 
+            # NOTE: Gemma-4 doesn't support OpenAI-style tools parameter; it hangs if passed
+            # Instead, the model will generate tool calls in custom format: <|tool_call>call:name{args}<tool_call|>
             reply = self.model.chat(
                 messages=messages,
-                tools=tool_schemas if tool_schemas else None,
+                tools=None,  # Don't pass tools to avoid LMStudio timeout
             )
 
             # Handle tool calls if present
@@ -2833,7 +2836,7 @@ class MK1Core:
                     try:
                         reply = self.model.chat(
                             messages=messages,
-                            tools=tool_schemas if tool_schemas else None,
+                            tools=None,  # Don't pass tools - LMStudio hangs
                         )
                     except Exception as e:
                         print(f"\n>>> MODEL ERROR: {e}")

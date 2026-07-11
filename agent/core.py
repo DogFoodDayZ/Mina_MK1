@@ -3532,6 +3532,18 @@ class MK1Core:
         if not formatted.strip():
             formatted = "(tool returned no output)"
 
+        if tool_name == "web_fetch":
+            # Keep web fetch output deterministic and avoid accidental shell-like narrative.
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": formatted,
+                        }
+                    }
+                ]
+            }
+
         if tool_name in (
             "__tool_list__",
             "__path_alias_set__",
@@ -4036,6 +4048,39 @@ IMPORTANT RULES:
                 "kind": "fact",
                 "tags": ["user_memory"],
             }
+
+        # ====================================================
+        # WEB FETCH
+        # ====================================================
+
+        url_match = re.search(r'https?://[^\s"\']+', raw_text, re.IGNORECASE)
+        if url_match:
+            url = url_match.group(0).strip().rstrip('.,;)]}')
+            fetch_triggers = [
+                "fetch",
+                "open url",
+                "read url",
+                "check url",
+                "get from",
+                "get content",
+                "summarize",
+                "summarise",
+                "web",
+                "website",
+                "page",
+            ]
+            if any(trigger in t for trigger in fetch_triggers):
+                timeout = 10
+                timeout_match = re.search(r'\btimeout\s*(?:=|:)?\s*(\d{1,2})\b', t)
+                if timeout_match:
+                    try:
+                        timeout = max(1, min(30, int(timeout_match.group(1))))
+                    except Exception:
+                        timeout = 10
+                return "web_fetch", {
+                    "url": url,
+                    "timeout": timeout,
+                }
 
         # ====================================================
         # POWERSHELL SCRIPT EXECUTION (ps_run)

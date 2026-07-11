@@ -2781,109 +2781,66 @@ class MK1Core:
             )
 
             # Handle tool calls if present
-            max_tool_loops = 5
+            max_tool_loops = 3
             loop_count = 0
+            last_assistant_content = ""
+            
             while reply and loop_count < max_tool_loops:
                 loop_count += 1
                 
-                # Try OpenAI format first
+                # Get the message content
                 choice = reply.get("choices", [{}])[0] if reply.get("choices") else {}
-                finish_reason = choice.get("finish_reason", "")
+                message = choice.get("message", {})
+                text_content = message.get("content", "") or choice.get("text", "")
                 
-                # Check for OpenAI-style tool calls
-                if (finish_reason == "tool_calls" or "tool_calls" in str(choice)) and choice.get("message", {}).get("tool_calls"):
-                    content = choice.get("message", {}).get("content")
-                    tool_calls = choice.get("message", {}).get("tool_calls", [])
+                # Parse Gemma custom tool format
+                import re
+                tool_pattern = r'<\|tool_call\>call:(\w+)\{([^}]*)\}<tool_call\|>'
+                matches = re.findall(tool_pattern, text_content)
+                
+                if matches and text_content != last_assistant_content:
+                    # Found new tool calls - prevent infinite loops on same content
+                    last_assistant_content = text_content
+                    cleaned_content = re.sub(tool_pattern, "", text_content).strip()
                     
-                    if not tool_calls:
-                        break
-                    
-                    # Add assistant's response with tool calls to messages
                     messages.append({
                         "role": "assistant",
-                        "content": content or "",
-                        "tool_calls": tool_calls,
+                        "content": cleaned_content or "[processing...]",
                     })
                     
-                    # Execute each tool call
-                    for tool_call in tool_calls:
-                        tool_name = tool_call.get("function", {}).get("name", "")
-                        tool_args_str = tool_call.get("function", {}).get("arguments", "{}")
-                        tool_id = tool_call.get("id", "")
-                        
+                    # Execute each tool
+                    for tool_name, args_str in matches:
+                        tool_args = {}
                         try:
-                            import json
-                            tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
-                        except:
-                            tool_args = {}
-                        
-                        # Run the tool
-                        tool_result = self.tools.run(tool_name, tool_args)
-                        
-                        # Add tool result to messages
-                        messages.append({
-                            "role": "tool",
-                            "tool_use_id": tool_id,
-                            "content": str(tool_result),
-                        })
-                    
-                    # Call model again with tool results
-                    reply = self.model.chat(
-                        messages=messages,
-                        tools=tool_schemas if tool_schemas else None,
-                    )
-                
-                # Try Gemma/custom format: <|tool_call>call:tool_name{arg1: val1, ...}<tool_call|>
-                else:
-                    text_content = choice.get("message", {}).get("content", "") if choice.get("message") else ""
-                    if not text_content:
-                        text_content = reply.get("choices", [{}])[0].get("text", "") if reply.get("choices") else ""
-                    
-                    # Parse custom tool format
-                    import re
-                    tool_pattern = r'<\|tool_call\>call:(\w+)\{([^}]*)\}<tool_call\|>'
-                    matches = re.findall(tool_pattern, text_content)
-                    
-                    if matches:
-                        # Found custom format tools - remove tool calls from output
-                        cleaned_content = re.sub(tool_pattern, "", text_content).strip()
-                        
-                        messages.append({
-                            "role": "assistant",
-                            "content": cleaned_content or "[thinking...]",
-                        })
-                        
-                        for tool_name, args_str in matches:
-                            # Parse simple key:value format
-                            tool_args = {}
                             for pair in args_str.split(", "):
                                 if ":" in pair:
                                     k, v = pair.split(":", 1)
-                                    # Clean up the value (remove quotes, etc.)
                                     v = v.strip().strip('"\'')
                                     tool_args[k.strip()] = v
-                            
-                            print(f"\n>>> CALLING TOOL: {tool_name} with args {tool_args}")
-                            
-                            # Run the tool
-                            tool_result = self.tools.run(tool_name, tool_args)
-                            
-                            print(f">>> TOOL RESULT: {tool_result}")
-                            
-                            # Add tool result to messages
-                            messages.append({
-                                "role": "tool",
-                                "content": str(tool_result),
-                            })
+                        except:
+                            pass
                         
-                        # Call model again with tool results
+                        print(f"\n>>> TOOL CALL: {tool_name} {tool_args}")
+                        tool_result = self.tools.run(tool_name, tool_args)
+                        print(f">>> RESULT: {str(tool_result)[:200]}")
+                        
+                        messages.append({
+                            "role": "tool",
+                            "content": str(tool_result),
+                        })
+                    
+                    # Get model response with tool results
+                    try:
                         reply = self.model.chat(
                             messages=messages,
                             tools=tool_schemas if tool_schemas else None,
                         )
-                    else:
-                        # No tools found
+                    except Exception as e:
+                        print(f"\n>>> MODEL ERROR: {e}")
                         break
+                else:
+                    # No new tools found, exit loop
+                    break
 
             final_text = self._handle_model_response(
                 messages,

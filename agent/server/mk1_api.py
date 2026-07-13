@@ -801,6 +801,12 @@ def _transcribe_audio_file(path: str) -> dict:
 
 def _synthesize_tts(text: str, voice_hint: Optional[str], output_path: Optional[str]) -> dict:
     voice_pref = (voice_hint or os.getenv("MK1_TTS_VOICE", "en-US-AnaNeural") or "").strip()
+    allow_local_fallback = os.getenv("MK1_ALLOW_PYTTSX3_FALLBACK", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     # Prefer Edge TTS for higher quality voices (e.g., en-US-AnaNeural).
     try:
@@ -853,6 +859,13 @@ def _synthesize_tts(text: str, voice_hint: Optional[str], output_path: Optional[
         pass
 
     # Fallback for offline/local environments without edge-tts.
+    if not allow_local_fallback:
+        return {
+            "ok": False,
+            "error": "tts_engine_unavailable",
+            "detail": "Edge TTS failed and pyttsx3 fallback is disabled. Set MK1_ALLOW_PYTTSX3_FALLBACK=1 to allow the local voice fallback.",
+        }
+
     try:
         import pyttsx3  # type: ignore
     except Exception:
@@ -1003,6 +1016,10 @@ def process(req: ProcessRequest):
             if play is not None:
                 out["tts_playback"] = play
 
+    if isinstance(out, dict):
+        out.setdefault("source", "process")
+        out.setdefault("channel", "text")
+
     _push_gui_event(
         source="process",
         input_text=req.input,
@@ -1131,6 +1148,8 @@ if MULTIPART_AVAILABLE:
             response = {
                 "ok": True,
                 "stage": "done",
+                "source": "voice",
+                "channel": "voice",
                 "input_text": user_text,
                 "reply": reply_text,
                 "stt_engine": stt.get("engine"),

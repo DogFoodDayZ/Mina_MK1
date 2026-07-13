@@ -155,3 +155,28 @@ def test_detect_time_question_routes_to_ps_run():
 
     assert tool_name == "ps_run"
     assert args["script"] == "what time is it?"
+
+
+def test_detect_tool_list_routes_tool_inventory_phrase():
+    core = MK1Core.__new__(MK1Core)
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "YOU tool list")
+
+    assert tool_name == "__tool_list__"
+    assert args == {}
+
+
+def test_tool_list_reflex_returns_inventory_text_directly():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    core.tools = SimpleNamespace(
+        tools={"alpha": object(), "beta": object()},
+        get_status=lambda: {"alpha": "ok", "beta": "ok"},
+    )
+
+    out = MK1Core._reflex_tools_and_memory(core, messages=[], reply={}, user_input="tool list")
+    text = out["choices"][0]["message"]["content"]
+
+    assert text.startswith("Available tools:")
+    assert "- alpha" in text
+    assert "- beta" in text

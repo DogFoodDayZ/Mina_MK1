@@ -475,6 +475,37 @@ class MK1Core:
 
         self.tools = ToolLoader(tools_dir)
 
+        # Reflex tool layer controls:
+        # - enabled by default so Mina can actually use tools and memory
+        # - prefixes remain available for explicit triggering when desired
+        self.reflex_enabled = bool(
+            self.config.get(
+                "tools",
+                "reflex_enabled",
+                True,
+            )
+        )
+        self.reflex_requires_prefix = bool(
+            self.config.get(
+                "tools",
+                "reflex_requires_prefix",
+                False,
+            )
+        )
+        reflex_prefixes_cfg = self.config.get(
+            "tools",
+            "reflex_prefixes",
+            ["/tool", "tool:", "run tool"],
+        )
+        if isinstance(reflex_prefixes_cfg, list):
+            self.reflex_prefixes = [
+                str(x).strip().lower()
+                for x in reflex_prefixes_cfg
+                if str(x).strip()
+            ]
+        else:
+            self.reflex_prefixes = ["/tool", "tool:", "run tool"]
+
         self.model = LMStudioClient({
             "endpoint": self.config.get(
                 "model",
@@ -758,6 +789,9 @@ class MK1Core:
         formatted: str,
         tool_ok: bool,
     ) -> str:
+        if tool_name == "__tool_list__":
+            return formatted
+
         if tool_name == "file_read":
             return formatted
 
@@ -779,6 +813,17 @@ class MK1Core:
         try:
             reply = self.model.chat(convo)
             text = self._clean_response_text(self._extract_text(reply))
+            # If the model call failed/timed out, do not leak transport errors to users
+            # when we already have verified tool output to return.
+            low_text = text.lower().strip()
+            if (
+                low_text.startswith("(lm studio error:")
+                or "httpconnectionpool(" in low_text
+                or "read timed out" in low_text
+                or "connect timeout" in low_text
+                or "connection refused" in low_text
+            ):
+                return formatted
             while True:
                 lines = text.splitlines()
                 if not lines:
@@ -2779,6 +2824,34 @@ class MK1Core:
             yield value[idx:idx + size]
             idx += size
 
+    def _should_run_reflex(self, user_input: str) -> bool:
+        if not bool(getattr(self, "reflex_enabled", True)):
+            return False
+
+        text = (user_input or "").strip()
+        if not text:
+            return False
+
+        if not bool(getattr(self, "reflex_requires_prefix", False)):
+            return True
+
+        low = text.lower()
+        prefixes = getattr(self, "reflex_prefixes", ["/tool", "tool:", "run tool"])
+        return any(low.startswith(p) for p in prefixes)
+
+    def _extract_reflex_payload(self, user_input: str) -> str:
+        text = (user_input or "").strip()
+        if not text:
+            return ""
+
+        low = text.lower()
+        prefixes = getattr(self, "reflex_prefixes", ["/tool", "tool:", "run tool"])
+        for p in prefixes:
+            if low.startswith(p):
+                return text[len(p):].strip()
+
+        return text
+
 # ========================================================
 # PROCESS
 # ========================================================
@@ -2803,8 +2876,11 @@ class MK1Core:
             # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             self._maybe_run_maintenance_tick()
 
-            command_like = self.fast_command_mode and self._is_command_like_query(user_input)
-            if command_like and self.fast_command_skip_context:
+            fast_command_mode = bool(getattr(self, "fast_command_mode", True))
+            fast_command_skip_context = bool(getattr(self, "fast_command_skip_context", True))
+
+            command_like = fast_command_mode and self._is_command_like_query(user_input)
+            if command_like and fast_command_skip_context:
                 context = ""
             else:
                 context = self.build_context(user_input)
@@ -2825,7 +2901,8 @@ class MK1Core:
 
             # Add tool availability hint if tools are available
             # NOTE: Don't pass tools to model.chat() - LMStudio hangs with tools parameter
-            tool_schemas = self.tools.get_tool_schemas()
+            tools_obj = getattr(self, "tools", None)
+            tool_schemas = tools_obj.get_tool_schemas() if tools_obj and hasattr(tools_obj, "get_tool_schemas") else []
             if tool_schemas:
                 tool_names = [t["function"]["name"] for t in tool_schemas]
                 messages.append({
@@ -2843,11 +2920,15 @@ class MK1Core:
             # TOOL REFLEX FIRST
             # =================================================
 
-            reflex_reply = self._reflex_tools_and_memory(
-                messages=messages,
-                reply={},
-                user_input=user_input,
-            )
+            reflex_reply = None
+            if self._should_run_reflex(user_input):
+                reflex_input = self._extract_reflex_payload(user_input)
+                if reflex_input:
+                    reflex_reply = self._reflex_tools_and_memory(
+                        messages=messages,
+                        reply={},
+                        user_input=reflex_input,
+                    )
 
             if reflex_reply is not None:
 
@@ -3058,11 +3139,15 @@ class MK1Core:
                     ),
                 })
 
-            reflex_reply = self._reflex_tools_and_memory(
-                messages=messages,
-                reply={},
-                user_input=user_input,
-            )
+            reflex_reply = None
+            if self._should_run_reflex(user_input):
+                reflex_input = self._extract_reflex_payload(user_input)
+                if reflex_input:
+                    reflex_reply = self._reflex_tools_and_memory(
+                        messages=messages,
+                        reply={},
+                        user_input=reflex_input,
+                    )
             if reflex_reply is not None:
                 final_text = self._extract_text(reflex_reply)
                 self._store_turn_memory(
@@ -3172,8 +3257,9 @@ class MK1Core:
 
     def _maybe_run_maintenance_tick(self) -> None:
         now = time.monotonic()
-        min_gap = max(0, int(self.maintenance_min_interval_seconds))
-        if (now - self._last_maintenance_tick_ts) < min_gap:
+        min_gap = max(0, int(getattr(self, "maintenance_min_interval_seconds", 20)))
+        last_tick = float(getattr(self, "_last_maintenance_tick_ts", 0.0))
+        if (now - last_tick) < min_gap:
             return
 
         self.memory.maintenance_tick()
@@ -4985,10 +5071,14 @@ IMPORTANT RULES:
         # ====================================================
 
         if any(x in t for x in [
+            "tool list",
             "list tools",
             "show tools",
             "available tools",
             "what tools",
+            "what can you do",
+            "what do you have",
+            "show me your tools",
         ]):
             return "__tool_list__", {}
 
@@ -5193,7 +5283,6 @@ IMPORTANT RULES:
                 "",
             ).strip()
 
-        text = self._cap_paragraphs(text, max_paragraphs=2)
         text = re.sub(r'<\|tool_call\>call:[^\n]*?<tool_call\|>\.?', '', text, flags=re.IGNORECASE).strip()
         return text or ""
 

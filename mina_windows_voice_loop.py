@@ -135,7 +135,27 @@ def _is_privacy_enabled(privacy_file: str | None, privacy_env: str | None) -> bo
     return False
 
 
-def _handle_voice_result(out: dict) -> None:
+def _touch_privacy_file(privacy_file: str | None) -> None:
+    if not privacy_file:
+        return
+    try:
+        Path(privacy_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(privacy_file).write_text("mute", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _remove_privacy_file(privacy_file: str | None) -> None:
+    if not privacy_file:
+        return
+    try:
+        if os.path.exists(privacy_file):
+            os.remove(privacy_file)
+    except Exception:
+        pass
+
+
+def _handle_voice_result(out: dict, privacy_file: str | None = None) -> None:
     if not out.get("ok"):
         print("Voice request failed:")
         print(out)
@@ -163,7 +183,12 @@ def _handle_voice_result(out: dict) -> None:
         if tts_engine or tts_voice:
             print(f"TTS: {tts_engine or 'unknown'} {tts_voice}".strip())
         if os.path.exists(audio_path):
-            play_audio_windows(audio_path)
+            _touch_privacy_file(privacy_file)
+            try:
+                play_audio_windows(audio_path)
+                time.sleep(2.0)
+            finally:
+                _remove_privacy_file(privacy_file)
 
 
 def _send_audio_to_mina(audio, sr: int, args) -> None:
@@ -171,11 +196,14 @@ def _send_audio_to_mina(audio, sr: int, args) -> None:
         wav = tmp.name
     try:
         sf.write(wav, audio, sr)
+        privacy_file = args.privacy_file or os.path.join(tempfile.gettempdir(), "mina_voice_monitor.mute")
+        _touch_privacy_file(privacy_file)
         out = ask_mina_voice(args.api, wav, args.speak_response, args.voice_hint)
+        _handle_voice_result(out, privacy_file=privacy_file)
     finally:
         if os.path.exists(wav):
             os.remove(wav)
-    _handle_voice_result(out)
+        _remove_privacy_file(args.privacy_file or os.path.join(tempfile.gettempdir(), "mina_voice_monitor.mute"))
 
 
 def run_continuous_loop(args) -> int:
@@ -319,7 +347,12 @@ def main() -> int:
             finally:
                 if os.path.exists(wav):
                     os.remove(wav)
-            _handle_voice_result(out)
+            privacy_file = args.privacy_file or os.path.join(tempfile.gettempdir(), "mina_voice_monitor.mute")
+            _touch_privacy_file(privacy_file)
+            try:
+                _handle_voice_result(out, privacy_file=privacy_file)
+            finally:
+                _remove_privacy_file(privacy_file)
 
         except KeyboardInterrupt:
             print("\nStopped.")

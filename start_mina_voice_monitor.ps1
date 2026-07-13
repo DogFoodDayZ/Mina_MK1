@@ -25,6 +25,74 @@ if (-not (Test-Path $voiceScript)) {
     throw "Voice loop script not found at $voiceScript"
 }
 
+function Get-DefaultVoiceDevice {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PythonExe
+    )
+
+    $code = @'
+import json
+import sounddevice as sd
+
+devices = sd.query_devices()
+default_input = None
+try:
+    default_input = sd.default.device[0]
+except Exception:
+    default_input = None
+
+if default_input is not None:
+    try:
+        default_input = int(default_input)
+    except Exception:
+        default_input = None
+
+if default_input is not None:
+    try:
+        d = devices[default_input]
+        if int(d.get("max_input_channels", 0) or 0) > 0:
+            print(default_input)
+            raise SystemExit(0)
+    except Exception:
+        pass
+
+for i, d in enumerate(devices):
+    try:
+        if int(d.get("max_input_channels", 0) or 0) > 0:
+            print(i)
+            raise SystemExit(0)
+    except Exception:
+        continue
+
+raise SystemExit(1)
+'@
+
+    $tmpPy = [System.IO.Path]::GetTempFileName() + '.py'
+    try {
+        Set-Content -Path $tmpPy -Value $code -Encoding UTF8
+        $out = & $PythonExe $tmpPy
+        if ($LASTEXITCODE -ne 0) {
+            return $null
+        }
+
+        $text = ($out | Select-Object -Last 1)
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            return $null
+        }
+
+        return [int]$text.Trim()
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if (Test-Path $tmpPy) {
+            Remove-Item -Path $tmpPy -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 if (Test-Path $pidFile) {
     try {
         $oldPid = [int](Get-Content -Path $pidFile -Raw).Trim()
@@ -60,6 +128,17 @@ function Test-ApiUp {
 }
 
 try {
+    if ($VoiceDevice -lt 0) {
+        $detectedDevice = Get-DefaultVoiceDevice -PythonExe $pythonExe
+        if ($null -ne $detectedDevice) {
+            $VoiceDevice = [int]$detectedDevice
+            Write-MonitorLog "Auto-selected input device index: $VoiceDevice"
+        }
+        else {
+            Write-MonitorLog "No usable input device detected; voice loop may fail until a device is configured."
+        }
+    }
+
     Write-MonitorLog "Voice monitor started. ApiUrl=$ApiUrl VoiceDevice=$VoiceDevice VoiceHint=$VoiceHint"
 
     while ($true) {

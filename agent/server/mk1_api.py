@@ -9,11 +9,13 @@ import json
 import hashlib
 import wave
 import sys
+import difflib
 from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
 import uvicorn
+import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -36,6 +38,7 @@ class ProcessRequest(BaseModel):
     speak_response: Optional[bool] = None
     voice_hint: Optional[str] = None
     image_attachment: Optional[dict] = None
+    input_source: Optional[str] = None
 
 
 class TTSRequest(BaseModel):
@@ -55,6 +58,37 @@ class MemoryDeleteRequest(BaseModel):
     memory_id: Optional[int] = None
     include_kinds: Optional[list[str]] = None
     include_tags: Optional[list[str]] = None
+
+
+class ModelSelectRequest(BaseModel):
+    model: str
+    autoload: bool = True
+    persist: bool = False
+    force_reload: bool = False
+
+
+def _resolve_tts_rate() -> float:
+    """
+    Resolve TTS speaking rate multiplier.
+    Priority: env MK1_TTS_RATE -> config voice.tts_rate -> default 1.15
+    Clamped to a safe intelligibility range.
+    """
+    default_rate = 1.15
+
+    env_raw = (os.getenv("MK1_TTS_RATE", "") or "").strip()
+    if env_raw:
+        try:
+            val = float(env_raw)
+            return max(0.75, min(2.0, val))
+        except Exception:
+            pass
+
+    try:
+        cfg_val = core.config.get("voice", "tts_rate", default_rate)
+        val = float(cfg_val)
+        return max(0.75, min(2.0, val))
+    except Exception:
+        return default_rate
 
 
 # ------------------------------------------------------------
@@ -300,6 +334,7 @@ PHONE_HTML = """<!doctype html>
         endpoint.textContent = apiBase;
 
         let phoneVoiceOn = true;
+        const PHONE_TTS_RATE = 1.2;
         let avatarTalkTimer = null;
         let avatarAlt = false;
         let currentAvatarState = '';
@@ -362,7 +397,7 @@ PHONE_HTML = """<!doctype html>
         function speakOnPhone(text) {
             if (!phoneVoiceOn || !window.speechSynthesis) return;
             const msg = new SpeechSynthesisUtterance(text);
-            msg.rate = 1.0;
+            msg.rate = PHONE_TTS_RATE;
             msg.pitch = 1.0;
             msg.onstart = () => setAvatarTalk(true);
             msg.onend = () => setAvatarTalk(false);
@@ -385,6 +420,8 @@ PHONE_HTML = """<!doctype html>
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         input: text,
+                        // Treat phone-origin turns as voice relay events for desktop sync.
+                        input_source: 'voice',
                         // Let phone do playback to avoid desktop speaker dependency.
                         speak_response: false
                     })
@@ -486,7 +523,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RESTORE_SCRIPT = PROJECT_ROOT / "restore" / "restore.py"
 VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 START_API_SCRIPT = PROJECT_ROOT / "start_mk1_api.ps1"
-FANCY_GUI_DIR = Path(os.getenv("MK1_FANCY_GUI_DIR", "C:/dev/mina-gui"))
+CONFIG_GUI_DIR = str(getattr(core, "config", None).get("gui", "fancy_dir", "") if getattr(core, "config", None) else "").strip()
+FANCY_GUI_DIR = Path(os.getenv("MK1_FANCY_GUI_DIR", CONFIG_GUI_DIR or "C:/dev/mina-gui"))
 FANCY_AVATAR_FILES = {
     "idle": "avatar_idle.png",
     "talk": "avatar_talk.png",
@@ -582,6 +620,52 @@ def _extract_tool_output(reply_text: str) -> str:
     return tail.strip()
 
 
+def _norm_echo_text(text: str) -> str:
+    t = str(text or "").lower()
+    t = t.replace("\n", " ").replace("\r", " ")
+    t = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in t)
+    t = " ".join(t.split())
+    return t
+
+
+def _is_probable_self_echo(transcript: str) -> bool:
+    probe = _norm_echo_text(transcript)
+    if not probe:
+        return False
+
+    # Keep this conservative to avoid suppressing normal short utterances.
+    if len(probe.split()) < 6:
+        return False
+
+    with _gui_event_lock:
+        recent = list(_gui_events)[-20:]
+
+    now = time.time()
+    for ev in reversed(recent):
+        try:
+            ts = float(ev.get("ts") or 0.0)
+        except Exception:
+            ts = 0.0
+
+        # Only compare to very recent assistant outputs.
+        if ts <= 0 or (now - ts) > 180:
+            continue
+
+        reply = _norm_echo_text(ev.get("reply", ""))
+        if len(reply.split()) < 6:
+            continue
+
+        # Exact/near containment catches classic feedback snippets.
+        if probe in reply or reply in probe:
+            return True
+
+        score = difflib.SequenceMatcher(None, probe, reply).ratio()
+        if score >= 0.82:
+            return True
+
+    return False
+
+
 def _push_gui_event(source: str, input_text: str, reply_text: str, extra: Optional[dict[str, Any]] = None) -> None:
     global _gui_event_seq
 
@@ -612,6 +696,14 @@ def _get_gui_events_since(since_id: int, limit: int, source: str = "") -> list[d
     with _gui_event_lock:
         items = list(_gui_events)
 
+    # If the API restarts, event IDs reset to low values while GUI clients may
+    # continue polling with an old high since_id. In that case, recover by
+    # returning the latest available events for the requested source.
+    if items:
+        max_id = max(int(ev.get("id", 0)) for ev in items)
+    else:
+        max_id = 0
+
     out = []
     for ev in items:
         if int(ev.get("id", 0)) <= int(since_id):
@@ -622,6 +714,17 @@ def _get_gui_events_since(since_id: int, limit: int, source: str = "") -> list[d
 
     if len(out) > lim:
         out = out[-lim:]
+
+    if not out and int(since_id) > 0 and max_id > 0 and int(since_id) > max_id:
+        fallback = []
+        for ev in items:
+            if src and str(ev.get("source", "")).lower() != src:
+                continue
+            fallback.append(ev)
+        if len(fallback) > lim:
+            fallback = fallback[-lim:]
+        return fallback
+
     return out
 
 
@@ -629,6 +732,212 @@ def _safe_logs_dir() -> str:
     base = os.path.abspath("logs")
     os.makedirs(base, exist_ok=True)
     return base
+
+
+def _derive_models_endpoint(chat_url: str) -> str:
+    base = str(chat_url or "").strip()
+    if not base:
+        return "http://127.0.0.1:1234/v1/models"
+
+    if "/v1/chat/completions" in base:
+        return base.replace("/v1/chat/completions", "/v1/models")
+
+    if "/v1/chat" in base:
+        return base.replace("/v1/chat", "/v1/models")
+
+    return base.rstrip("/") + "/models"
+
+
+def _list_lmstudio_models() -> dict:
+    chat_url = str(getattr(core.model, "chat_url", "") or "")
+    endpoint = _derive_models_endpoint(chat_url)
+
+    try:
+        resp = requests.get(endpoint, timeout=10)
+        body = {}
+        try:
+            body = resp.json() if resp.content else {}
+        except Exception:
+            body = {}
+
+        if resp.status_code >= 400:
+            return {
+                "ok": False,
+                "endpoint": endpoint,
+                "status_code": resp.status_code,
+                "error": "models_list_failed",
+                "detail": (resp.text or "")[:500],
+            }
+
+        items = body.get("data") if isinstance(body, dict) else None
+        out = []
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    model_id = str(item.get("id") or "").strip()
+                    if model_id:
+                        out.append(model_id)
+
+        return {
+            "ok": True,
+            "endpoint": endpoint,
+            "models": out,
+            "count": len(out),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "endpoint": endpoint,
+            "error": "models_list_exception",
+            "detail": str(e),
+        }
+
+
+def _persist_default_model(model_name: str) -> dict:
+    cfg_path = PROJECT_ROOT / "config" / "mk1_config.json"
+    try:
+        if not cfg_path.exists():
+            return {
+                "ok": False,
+                "error": "config_missing",
+                "path": str(cfg_path),
+            }
+
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {
+                "ok": False,
+                "error": "config_invalid",
+                "path": str(cfg_path),
+            }
+
+        model_cfg = data.get("model")
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+            data["model"] = model_cfg
+
+        model_cfg["default_model"] = model_name
+        cfg_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return {
+            "ok": True,
+            "path": str(cfg_path),
+            "default_model": model_name,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "config_write_failed",
+            "detail": str(e),
+            "path": str(cfg_path),
+        }
+
+
+def _allowed_switch_models() -> list[str]:
+    cfg = getattr(core, "config", None)
+    if cfg is None:
+        return []
+
+    raw = cfg.get("model", "switch_allowed", [])
+    if not isinstance(raw, list):
+        return []
+
+    out = []
+    seen = set()
+    for item in raw:
+        name = str(item or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def _switch_model_runtime(
+    model_name: str,
+    autoload: bool = True,
+    persist: bool = False,
+    force_reload: bool = False,
+) -> dict:
+    target = str(model_name or "").strip()
+    if not target:
+        return {
+            "ok": False,
+            "error": "model_required",
+        }
+
+    previous = str(getattr(core.model, "default_model", "") or "")
+    allowed = _allowed_switch_models()
+    if allowed:
+        allowed_map = {m.lower(): m for m in allowed}
+        mapped = allowed_map.get(target.lower())
+        if mapped is None:
+            return {
+                "ok": False,
+                "error": "model_not_allowed",
+                "active_model": previous,
+                "requested_model": target,
+                "allowed_models": allowed,
+            }
+        target = mapped
+
+    load_endpoint = str(getattr(core, "config", None).get("model", "load_endpoint", "") if getattr(core, "config", None) else "").strip()
+
+    load_attempted = False
+    load_ok = False
+    load_error = None
+
+    skip_reason = None
+    same_model = previous.strip().lower() == target.strip().lower()
+    if same_model and autoload and not force_reload:
+        skip_reason = "same_model_already_active"
+        autoload = False
+
+    if autoload and load_endpoint:
+        load_attempted = True
+        payload_candidates = [
+            {"model": target},
+            {"identifier": target},
+            {"id": target},
+        ]
+
+        for payload in payload_candidates:
+            try:
+                resp = requests.post(load_endpoint, json=payload, timeout=30)
+                if resp.status_code < 400:
+                    load_ok = True
+                    load_error = None
+                    break
+                load_error = (resp.text or "")[:500]
+            except Exception as e:
+                load_error = str(e)
+
+    setattr(core.model, "default_model", target)
+    setattr(core.model, "_vision_support_cache_value", None)
+    setattr(core.model, "_vision_support_cache_until", 0.0)
+
+    persisted = None
+    if persist:
+        persisted = _persist_default_model(target)
+
+    return {
+        "ok": True,
+        "previous_model": previous,
+        "active_model": target,
+        "same_model": same_model,
+        "autoload": bool(autoload),
+        "force_reload": bool(force_reload),
+        "load_attempted": load_attempted,
+        "load_ok": load_ok,
+        "skip_reason": skip_reason,
+        "load_endpoint": load_endpoint or None,
+        "load_error": load_error,
+        "allowed_models": allowed,
+        "persist": bool(persist),
+        "persist_result": persisted,
+    }
 
 
 def _play_audio_local(path: str) -> dict:
@@ -801,6 +1110,7 @@ def _transcribe_audio_file(path: str) -> dict:
 
 def _synthesize_tts(text: str, voice_hint: Optional[str], output_path: Optional[str]) -> dict:
     voice_pref = (voice_hint or os.getenv("MK1_TTS_VOICE", "en-US-AnaNeural") or "").strip()
+    tts_rate = _resolve_tts_rate()
     allow_local_fallback = os.getenv("MK1_ALLOW_PYTTSX3_FALLBACK", "0").strip().lower() in {
         "1",
         "true",
@@ -814,7 +1124,10 @@ def _synthesize_tts(text: str, voice_hint: Optional[str], output_path: Optional[
         import edge_tts  # type: ignore
 
         async def _save_edge_tts(tts_text: str, tts_voice: str, tts_out: str):
-            communicate = edge_tts.Communicate(tts_text, voice=tts_voice)
+            # edge-tts expects a signed percent string, e.g. "+15%".
+            rate_pct = int(round((tts_rate - 1.0) * 100.0))
+            rate_str = f"{rate_pct:+d}%"
+            communicate = edge_tts.Communicate(tts_text, voice=tts_voice, rate=rate_str)
             await communicate.save(tts_out)
 
         def _run_edge_tts_sync(tts_text: str, tts_voice: str, tts_out: str):
@@ -854,6 +1167,7 @@ def _synthesize_tts(text: str, voice_hint: Optional[str], output_path: Optional[
             "audio_path": edge_out,
             "engine": "edge-tts",
             "voice": (voice_pref or "en-US-AnaNeural"),
+            "rate": tts_rate,
         }
     except Exception:
         pass
@@ -881,6 +1195,11 @@ def _synthesize_tts(text: str, voice_hint: Optional[str], output_path: Optional[
 
     try:
         engine = pyttsx3.init()
+        base_rate = engine.getProperty("rate") or 200
+        try:
+            engine.setProperty("rate", int(float(base_rate) * float(tts_rate)))
+        except Exception:
+            pass
         selected_voice = ""
         if voice_pref:
             hint = voice_pref.lower()
@@ -899,6 +1218,7 @@ def _synthesize_tts(text: str, voice_hint: Optional[str], output_path: Optional[
             "audio_path": out,
             "engine": "pyttsx3",
             "voice": selected_voice or "system-default",
+            "rate": tts_rate,
         }
     except Exception as e:
         return {"ok": False, "error": "tts_failed", "detail": str(e)}
@@ -955,6 +1275,9 @@ def process(req: ProcessRequest):
     """
     fp = _build_process_fingerprint(req)
     now = time.time()
+    source_hint = str(req.input_source or "").strip().lower()
+    event_source = "voice" if source_hint == "voice" else "process"
+    channel = "voice" if event_source == "voice" else "text"
 
     with _process_dedupe_lock:
         cached_fp = _process_dedupe_cache.get("fingerprint")
@@ -970,7 +1293,7 @@ def process(req: ProcessRequest):
             out = dict(cached_out)
             out["deduped"] = True
             _push_gui_event(
-                source="process",
+                source=event_source,
                 input_text=req.input,
                 reply_text=str(out.get("reply") or ""),
                 extra={"deduped": True},
@@ -1017,11 +1340,11 @@ def process(req: ProcessRequest):
                 out["tts_playback"] = play
 
     if isinstance(out, dict):
-        out.setdefault("source", "process")
-        out.setdefault("channel", "text")
+        out.setdefault("source", event_source)
+        out.setdefault("channel", channel)
 
     _push_gui_event(
-        source="process",
+        source=event_source,
         input_text=req.input,
         reply_text=str((out or {}).get("reply") or ""),
         extra={"deduped": bool(out.get("deduped"))} if isinstance(out, dict) else None,
@@ -1142,6 +1465,18 @@ if MULTIPART_AVAILABLE:
             if not user_text:
                 return {"ok": False, "stage": "stt", "error": "empty_transcript"}
 
+            if _is_probable_self_echo(user_text):
+                return {
+                    "ok": True,
+                    "stage": "filtered",
+                    "source": "voice",
+                    "channel": "voice",
+                    "input_text": user_text,
+                    "reply": "",
+                    "filtered": "self_echo",
+                    "stt_engine": stt.get("engine"),
+                }
+
             proc = core.process(user_text)
             reply_text = str(proc.get("reply") or "").strip()
 
@@ -1219,18 +1554,35 @@ def db_status(force_refresh: bool = False):
 
 
 @app.get("/model/status")
-def model_status(force_refresh: bool = False):
+def model_status(force_refresh: bool = False, check_vision: bool = False):
     model_name = str(getattr(core.model, "default_model", "") or "unknown")
     supports_vision = bool(
         getattr(core.model, "supports_vision", lambda *_args, **_kwargs: False)(
-            force_refresh=force_refresh
+            force_refresh=force_refresh,
+            allow_probe=bool(check_vision),
         )
     )
     return {
         "model": model_name,
         "supports_vision": supports_vision,
         "mode": "VISION_READY" if supports_vision else "TEXT_ONLY",
+        "allowed_switch_models": _allowed_switch_models(),
     }
+
+
+@app.get("/model/list")
+def model_list():
+    return _list_lmstudio_models()
+
+
+@app.post("/model/select")
+def model_select(req: ModelSelectRequest):
+    return _switch_model_runtime(
+        model_name=req.model,
+        autoload=bool(req.autoload),
+        persist=bool(req.persist),
+        force_reload=bool(req.force_reload),
+    )
 
 
 @app.get("/events/recent")

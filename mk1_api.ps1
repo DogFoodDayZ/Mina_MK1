@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('start', 'stop', 'status', 'restart', 'smoke', 'setup', 'gui', 'voice', 'voice-check', 'voice-devices', 'voice-monitor')]
+    [ValidateSet('start', 'stop', 'status', 'restart', 'smoke', 'setup', 'gui', 'voice', 'voice-check', 'voice-devices', 'voice-monitor', 'model-status', 'model-list', 'model-set')]
     [string]$Action = 'status',
 
     [int]$Port = 8000,
@@ -8,6 +8,10 @@ param(
     [string]$EmbedHost = '127.0.0.1',
     [int]$VoiceDevice = -1,
     [string]$VoiceHint = 'en-US-AnaNeural',
+    [string]$ModelName = '',
+    [switch]$NoAutoLoad,
+    [switch]$PersistModel,
+    [switch]$ForceReload,
     [switch]$GuiSpeak,
     [switch]$AutoVoice,
     [switch]$Foreground,
@@ -440,5 +444,53 @@ switch ($Action) {
 
         Write-Host "Tip: run .\mk1_api.ps1 voice -VoiceDevice <index>"
         exit 0
+    }
+
+    'model-status' {
+        try {
+            $resp = Invoke-RestMethod -Uri "$baseUrl/model/status" -Method Get -TimeoutSec 10
+            $resp | ConvertTo-Json -Depth 6
+            exit 0
+        }
+        catch {
+            Write-Error "Model status failed: $($_.Exception.Message)"
+            exit 1
+        }
+    }
+
+    'model-list' {
+        try {
+            $resp = Invoke-RestMethod -Uri "$baseUrl/model/list" -Method Get -TimeoutSec 15
+            $resp | ConvertTo-Json -Depth 8
+            exit 0
+        }
+        catch {
+            Write-Error "Model list failed: $($_.Exception.Message)"
+            exit 1
+        }
+    }
+
+    'model-set' {
+        if ([string]::IsNullOrWhiteSpace($ModelName)) {
+            Write-Error "ModelName is required. Example: .\mk1_api.ps1 model-set -ModelName qwen2.5-7b-instruct"
+            exit 1
+        }
+
+        try {
+            $payload = @{
+                model        = $ModelName
+                autoload     = (-not $NoAutoLoad)
+                persist      = [bool]$PersistModel
+                force_reload = [bool]$ForceReload
+            } | ConvertTo-Json -Compress
+
+            $resp = Invoke-RestMethod -Uri "$baseUrl/model/select" -Method Post -ContentType 'application/json' -Body $payload -TimeoutSec 45
+            $resp | ConvertTo-Json -Depth 8
+            exit 0
+        }
+        catch {
+            Write-Error "Model set failed: $($_.Exception.Message)"
+            exit 1
+        }
     }
 }

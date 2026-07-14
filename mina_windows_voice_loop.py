@@ -213,11 +213,26 @@ def run_continuous_loop(args) -> int:
     silence_chunks = max(1, int(args.silence_ms / args.frame_ms))
     min_voice_chunks = max(1, int(args.min_speech_ms / args.frame_ms))
     device = None if args.device < 0 else args.device
+    effective_privacy_file = args.privacy_file or os.path.join(tempfile.gettempdir(), "mina_voice_monitor.mute")
+
+    # Recover from stale mute files left by crashed runs.
+    if effective_privacy_file and os.path.exists(effective_privacy_file):
+        try:
+            age = max(0.0, time.time() - os.path.getmtime(effective_privacy_file))
+        except Exception:
+            age = 0.0
+        if age >= 15.0:
+            try:
+                os.remove(effective_privacy_file)
+                print(f"[privacy] removed stale mute file ({age:.1f}s old)")
+            except Exception:
+                pass
 
     print("Mina real-time voice monitor ready.")
     print(f"TTS voice hint: {args.voice_hint}")
-    if args.privacy_file:
-        print(f"Privacy file: {args.privacy_file} (exists => muted)")
+    if effective_privacy_file:
+        present = os.path.exists(effective_privacy_file)
+        print(f"Privacy file: {effective_privacy_file} (present={present})")
     if args.privacy_env:
         print(f"Privacy env: {args.privacy_env}=1 (muted)")
     print("Ctrl+C to stop.")
@@ -238,7 +253,7 @@ def run_continuous_loop(args) -> int:
         last_heartbeat = time.monotonic()
 
         while True:
-            muted = _is_privacy_enabled(args.privacy_file, args.privacy_env)
+            muted = _is_privacy_enabled(effective_privacy_file, args.privacy_env)
             if muted:
                 if not was_muted:
                     print("[privacy] capture muted")

@@ -3,6 +3,7 @@
 import os
 import time
 import json
+import hashlib
 import html
 import traceback
 import re
@@ -51,6 +52,100 @@ class LMStudioClient:
                 os.getenv("MK1_VISION_REASONING_EFFORT", "none"),
             )
         ).strip()
+
+    def _has_system_messages(self, messages: List[Dict[str, Any]]) -> bool:
+        return any(str(m.get("role", "")).strip().lower() == "system" for m in (messages or []))
+
+    def _extract_text_content(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    txt = item.get("text")
+                    if isinstance(txt, str) and txt.strip():
+                        parts.append(txt)
+                elif isinstance(item, str) and item.strip():
+                    parts.append(item)
+            return "\n".join(parts).strip()
+        if isinstance(content, dict):
+            txt = content.get("text")
+            if isinstance(txt, str):
+                return txt
+        return ""
+
+    def _flatten_system_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        system_parts: List[str] = []
+        non_system: List[Dict[str, Any]] = []
+
+        for m in (messages or []):
+            role = str(m.get("role", "")).strip().lower()
+            if role == "system":
+                txt = self._extract_text_content(m.get("content"))
+                if txt.strip():
+                    system_parts.append(txt.strip())
+                continue
+            non_system.append(dict(m))
+
+        if not system_parts:
+            return list(messages or [])
+
+        preamble = "[System instructions]\n" + "\n\n".join(system_parts).strip()
+        merged = False
+
+        for idx, m in enumerate(non_system):
+            role = str(m.get("role", "")).strip().lower()
+            if role != "user":
+                continue
+
+            content = m.get("content")
+            if isinstance(content, str):
+                m["content"] = f"{preamble}\n\n{content}" if content else preamble
+                non_system[idx] = m
+                merged = True
+                break
+
+            if isinstance(content, list):
+                text_idx = None
+                for j, part in enumerate(content):
+                    if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                        text_idx = j
+                        break
+
+                if text_idx is not None:
+                    part = dict(content[text_idx])
+                    part["text"] = f"{preamble}\n\n{part.get('text', '')}".strip()
+                    new_content = list(content)
+                    new_content[text_idx] = part
+                    m["content"] = new_content
+                else:
+                    m["content"] = [{"type": "text", "text": preamble}] + list(content)
+
+                non_system[idx] = m
+                merged = True
+                break
+
+            m["content"] = preamble
+            non_system[idx] = m
+            merged = True
+            break
+
+        if not merged:
+            non_system.insert(0, {"role": "user", "content": preamble})
+
+        return non_system
+
+    def _is_system_role_unsupported_error(self, body_text: str) -> bool:
+        low = str(body_text or "").lower()
+        markers = [
+            "system role not supported",
+            "role not supported",
+            "unsupported role",
+            "jinja exception",
+            "automatic parser generation failed",
+        ]
+        return any(m in low for m in markers)
 
     def _supports_vision_by_name(self) -> bool:
         model_name = str(self.default_model or "").lower()
@@ -166,7 +261,7 @@ class LMStudioClient:
         except Exception:
             return self._supports_vision_by_name()
 
-    def supports_vision(self, force_refresh: bool = False) -> bool:
+    def supports_vision(self, force_refresh: bool = False, allow_probe: bool = False) -> bool:
         now = time.monotonic()
 
         # Fast path: known vision model families should not need active probing.
@@ -182,10 +277,9 @@ class LMStudioClient:
         ):
             return bool(self._vision_support_cache_value)
 
-        value = bool(self._probe_vision_support())
-        self._vision_support_cache_value = value
-        self._vision_support_cache_until = now + max(1.0, self._vision_support_cache_ttl)
-        return value
+        # Synthetic capability probing is disabled to avoid background
+        # image turns and context churn. Use model-name hints/cache only.
+        return bool(self._vision_support_cache_value) if self._vision_support_cache_value is not None else False
 
     def chat(
         self,
@@ -258,6 +352,23 @@ class LMStudioClient:
                         timeout=120,
                     )
 
+            # Some templates reject system role entirely (e.g. specific GGUF chat templates).
+            if resp.status_code >= 400 and self._has_system_messages(payload.get("messages", [])):
+                body = ""
+                try:
+                    body = resp.text or ""
+                except Exception:
+                    body = ""
+
+                if self._is_system_role_unsupported_error(body):
+                    retry_payload = dict(payload)
+                    retry_payload["messages"] = self._flatten_system_messages(payload.get("messages", []))
+                    resp = requests.post(
+                        self.chat_url,
+                        json=retry_payload,
+                        timeout=120,
+                    )
+
             print("\n========================================")
             print("LM STUDIO STATUS")
             print("========================================")
@@ -322,59 +433,92 @@ class LMStudioClient:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
-        with requests.post(
-            self.chat_url,
-            json=payload,
-            stream=True,
-            timeout=180,
-        ) as resp:
-            resp.raise_for_status()
+        attempts = [dict(payload)]
+        if self._has_system_messages(payload.get("messages", [])):
+            fallback_payload = dict(payload)
+            fallback_payload["messages"] = self._flatten_system_messages(payload.get("messages", []))
+            attempts.append(fallback_payload)
 
-            for raw_line in resp.iter_lines(decode_unicode=True):
-                if not raw_line:
-                    continue
+        last_http_error: Optional[Exception] = None
 
-                line = str(raw_line).strip()
-                if not line:
-                    continue
+        for idx, attempt in enumerate(attempts):
+            resp = requests.post(
+                self.chat_url,
+                json=attempt,
+                stream=True,
+                timeout=180,
+            )
+            try:
+                if resp.status_code >= 400:
+                    body = ""
+                    try:
+                        body = resp.text or ""
+                    except Exception:
+                        body = ""
 
-                if line.startswith("data:"):
-                    line = line[5:].strip()
+                    if (
+                        idx == 0
+                        and len(attempts) > 1
+                        and self._is_system_role_unsupported_error(body)
+                    ):
+                        continue
 
-                if line == "[DONE]":
-                    break
+                    resp.raise_for_status()
 
-                try:
-                    item = json.loads(line)
-                except Exception:
-                    continue
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
 
-                choices = item.get("choices") or []
-                if not choices:
-                    continue
+                    line = str(raw_line).strip()
+                    if not line:
+                        continue
 
-                choice0 = choices[0] if isinstance(choices[0], dict) else {}
-                delta = choice0.get("delta") if isinstance(choice0, dict) else {}
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
 
-                piece = ""
-                if isinstance(delta, dict):
-                    content = delta.get("content")
-                    if isinstance(content, str):
-                        piece = content
-                    elif isinstance(content, list):
-                        out_parts: List[str] = []
-                        for part in content:
-                            if isinstance(part, dict):
-                                txt = part.get("text")
-                                if isinstance(txt, str) and txt:
-                                    out_parts.append(txt)
-                        piece = "".join(out_parts)
+                    if line == "[DONE]":
+                        break
 
-                if not piece and isinstance(choice0.get("text"), str):
-                    piece = str(choice0.get("text"))
+                    try:
+                        item = json.loads(line)
+                    except Exception:
+                        continue
 
-                if piece:
-                    yield piece
+                    choices = item.get("choices") or []
+                    if not choices:
+                        continue
+
+                    choice0 = choices[0] if isinstance(choices[0], dict) else {}
+                    delta = choice0.get("delta") if isinstance(choice0, dict) else {}
+
+                    piece = ""
+                    if isinstance(delta, dict):
+                        content = delta.get("content")
+                        if isinstance(content, str):
+                            piece = content
+                        elif isinstance(content, list):
+                            out_parts: List[str] = []
+                            for part in content:
+                                if isinstance(part, dict):
+                                    txt = part.get("text")
+                                    if isinstance(txt, str) and txt:
+                                        out_parts.append(txt)
+                            piece = "".join(out_parts)
+
+                    if not piece and isinstance(choice0.get("text"), str):
+                        piece = str(choice0.get("text"))
+
+                    if piece:
+                        yield piece
+
+                return
+            except Exception as e:
+                last_http_error = e
+            finally:
+                resp.close()
+
+        if last_http_error is not None:
+            raise last_http_error
 
 
 # ============================================================
@@ -609,7 +753,42 @@ class MK1Core:
         self._ensure_workspace_structure()
         self.startup_context = self._build_startup_context()
         self._seed_startup_memory_facts()
+        self._seed_authoritative_identity_memory()
+        self._seed_runtime_capability_snapshot()
         self.last_active_project_path: Optional[str] = None
+
+        self._validate_required_tool_routes()
+
+    def _validate_required_tool_routes(self) -> None:
+        """
+        Fail fast if critical intent routes are missing.
+
+        This protects against silent regressions where key commands fall back to
+        model chat instead of local tool execution.
+        """
+        if str(os.getenv("MK1_SKIP_ROUTE_GUARD", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            return
+
+        probes: List[Tuple[str, str]] = [
+            ("execute this code: print(1)", "code_execute"),
+            ("run this powershell: Write-Output ok", "code_execute"),
+        ]
+
+        missing: List[str] = []
+        for sample, expected_tool in probes:
+            try:
+                got_tool, _ = self.detect_tool_intent(sample)
+            except Exception as e:
+                missing.append(f"{sample} -> exception: {type(e).__name__}: {e}")
+                continue
+
+            if got_tool != expected_tool:
+                missing.append(f"{sample} -> expected {expected_tool}, got {got_tool}")
+
+        if missing:
+            raise RuntimeError(
+                "required_tool_routes_missing: " + "; ".join(missing)
+            )
 
     def _store_turn_memory(
         self,
@@ -689,7 +868,7 @@ class MK1Core:
                 existing = self.memory.recent_memories(
                     top_k=500,
                     include_kinds=["fact"],
-                    include_tags=["user_memory", "profile_auto"],
+                    include_tags=["user_memory", "profile_auto", "authoritative_profile"],
                 )
                 delete_ids = []
                 for item in existing or []:
@@ -718,7 +897,7 @@ class MK1Core:
                 self.memory.add_memory(
                     f,
                     kind="fact",
-                    tags=["user_memory", "profile_auto"],
+                    tags=self._authoritative_tags_for_fact(f),
                 )
         except Exception:
             traceback.print_exc()
@@ -781,6 +960,77 @@ class MK1Core:
 
         return f"{out}\n\n{flair}"
 
+    def _wants_grounded_tool_analysis(self, user_input: str) -> bool:
+        q = (user_input or "").lower()
+        if not q:
+            return False
+
+        patterns = [
+            r"\banaly[sz]e\b",
+            r"\bexplain\b",
+            r"\breview\b",
+            r"\bimprove\b",
+            r"\bsuggest\b",
+            r"\brecommend\b",
+            r"\bfix\b",
+            r"\brefactor\b",
+            r"\bwhat do you think\b",
+            r"\banything wrong\b",
+            r"\bchanges?\b",
+            r"\btell me about\b",
+        ]
+        return any(re.search(p, q) is not None for p in patterns)
+
+    def _render_grounded_tool_analysis(
+        self,
+        messages: List[Dict[str, Any]],
+        user_input: str,
+        tool_name: str,
+        formatted: str,
+        tool_ok: bool,
+    ) -> str:
+        convo = list(messages)
+        convo.append({
+            "role": "user",
+            "content": user_input,
+        })
+        convo.append({
+            "role": "system",
+            "content": (
+                "You are answering from verified tool output. "
+                "First sentence must state one concrete fact from VERIFIED OUTPUT. "
+                "After that, you may give concise suggestions, interpretation, or next steps. "
+                "Do not invent missing data, file contents, failures, or tool results. "
+                "If the output shows an error, say the error plainly first, then suggest what to do next. "
+                "Keep it concise and in Mina voice."
+            ),
+        })
+        convo.append({
+            "role": "assistant",
+            "content": f"VERIFIED OUTPUT:\n```text\n{formatted}\n```",
+        })
+
+        try:
+            reply = self.model.chat(convo)
+            text = self._clean_response_text(self._extract_text(reply)).strip()
+            low_text = text.lower().strip()
+            if (
+                not text
+                or low_text.startswith("(lm studio error:")
+                or "httpconnectionpool(" in low_text
+                or "read timed out" in low_text
+                or "connect timeout" in low_text
+                or "connection refused" in low_text
+            ):
+                return f"VERIFIED OUTPUT:\n```text\n{formatted}\n```"
+
+            if text[-1] not in ".!?":
+                text += "."
+            return f"{text}\n\nVERIFIED OUTPUT:\n```text\n{formatted}\n```"
+        except Exception:
+            traceback.print_exc()
+            return f"VERIFIED OUTPUT:\n```text\n{formatted}\n```"
+
     def _render_tool_response_as_mina(
         self,
         messages: List[Dict[str, Any]],
@@ -792,8 +1042,17 @@ class MK1Core:
         if tool_name == "__tool_list__":
             return formatted
 
-        if tool_name == "file_read":
+        if tool_name == "file_read" and not self._wants_grounded_tool_analysis(user_input):
             return formatted
+
+        if tool_name in {"file_read", "ps_run", "code_execute", "__project_test_run__"} and self._wants_grounded_tool_analysis(user_input):
+            return self._render_grounded_tool_analysis(
+                messages=messages,
+                user_input=user_input,
+                tool_name=tool_name,
+                formatted=formatted,
+                tool_ok=tool_ok,
+            )
 
         convo = list(messages)
         convo.append({
@@ -857,6 +1116,37 @@ class MK1Core:
 
         return out
 
+    def _reinforce_memory_texts(self, texts: List[str], add_tags: Optional[List[str]] = None) -> None:
+        try:
+            if not hasattr(self.memory, "touch_memory_by_text"):
+                return
+            for txt in texts or []:
+                clean = str(txt or "").strip()
+                if not clean:
+                    continue
+                self.memory.touch_memory_by_text(
+                    clean,
+                    include_kinds=["fact", "preference", "procedure"],
+                    include_tags=["user_memory"],
+                    add_tags=add_tags or ["reinforced_recall"],
+                )
+        except Exception:
+            traceback.print_exc()
+
+    def _extract_name_value(self, fact_text: str) -> str:
+        src = (fact_text or "").strip().rstrip(".")
+        if not src:
+            return ""
+
+        m = re.search(r"\b(?:my|your)\s+name\s+is\s+(.+)$", src, re.IGNORECASE)
+        if not m:
+            return ""
+
+        value = m.group(1).strip().strip(".,;:!? ")
+        # Trim trailing helper phrases that may sneak in from noisy memory lines.
+        value = re.split(r"\b(?:and|but)\b", value, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        return value
+
     def _cap_sentences(self, text: str, max_sentences: int = 2) -> str:
         value = (text or "").strip()
         if not value or max_sentences < 1:
@@ -905,11 +1195,208 @@ class MK1Core:
     def _extract_memory_slots(self, user_query: str) -> Dict[str, bool]:
         q = (user_query or "").lower()
         return {
+            "name": bool(re.search(r"\b(what\s+is\s+my\s+name|my\s+name|who\s+am\s+i)\b", q)),
             "birthdate": bool(re.search(r"\b(birthdate|birthday|date of birth|dob)\b", q)),
             "eye_color": bool(re.search(r"\b(eye color|eyes color|eye|eyes)\b", q)),
             "favorite_color": bool(re.search(r"\b(favorite|favourite)\s+color\b", q)),
             "age": bool(re.search(r"\bhow old\b|\bage\b", q)),
         }
+
+    def _is_transformative_memory_query(self, user_query: str) -> bool:
+        q = (user_query or "").lower()
+        if not q:
+            return False
+
+        patterns = [
+            r"\btell me about\b",
+            r"\brelate\b",
+            r"\banalogy\b",
+            r"\bmetaphor\b",
+            r"\bcompare\b",
+            r"\blike\b",
+            r"\bsimilar\b",
+            r"\bsuggest\b",
+            r"\brecommend\b",
+            r"\bnext step",
+            r"\bapply\b",
+            r"\bconnect\b",
+            r"\bwhat else\b",
+            r"\bwho am i\b",
+        ]
+        return any(re.search(p, q) is not None for p in patterns)
+
+    def _render_memory_transform_reply(
+        self,
+        messages: List[Dict[str, str]],
+        user_query: str,
+        fact_lines: List[str],
+        missing_lines: List[str],
+    ) -> str:
+        facts = [str(x or "").strip() for x in (fact_lines or []) if str(x or "").strip()]
+        if not facts:
+            return ""
+
+        strict_facts = "\n".join([f"- {f}" for f in facts])
+        missing = "\n".join([f"- {m}" for m in (missing_lines or []) if str(m or "").strip()])
+
+        convo = list(messages or [])
+        convo.append(
+            {
+                "role": "system",
+                "content": (
+                    "You are answering a memory transformation request. "
+                    "Use Mina voice, but keep factual truth locked. "
+                    "These facts are authoritative and immutable:\n"
+                    f"{strict_facts}\n"
+                    "Never change or contradict those facts. "
+                    "Your first sentence must explicitly restate the relevant fact before any analogy or suggestion. "
+                    "You may relate, compare, suggest, and add analogies based on them. "
+                    "Do not say a lookup failed, a tool failed, or data could not be fetched unless the provided facts explicitly say that. "
+                    "Do not invent new personal facts. Keep it concise (2-4 short lines)."
+                    + (f"\nIf useful, mention missing info:\n{missing}" if missing else "")
+                ),
+            }
+        )
+
+        try:
+            reply = self.model.chat(convo)
+            text = self._clean_response_text(self._extract_text(reply)).strip()
+            return text
+        except Exception:
+            traceback.print_exc()
+            return ""
+
+    def _extract_profile_slot_value(self, slot: str, fact_text: str) -> str:
+        src = (fact_text or "").strip().rstrip(".")
+        if not src:
+            return ""
+
+        if slot == "name":
+            return self._extract_name_value(src)
+
+        if slot == "eye_color":
+            patterns = [
+                r"\b(?:my|your)\s+eye\s+color\s+is\s+(.+)$",
+                r"\b(?:my|your)\s+eyes\s+are\s+(.+)$",
+                r"\b(?:my|your)\s+eyes\s+color\s+is\s+(.+)$",
+            ]
+            for pattern in patterns:
+                m = re.search(pattern, src, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip().strip(".,;:!? ")
+
+        if slot == "favorite_color":
+            patterns = [
+                r"\b(?:my|your)\s+favorite\s+color\s+is\s+(.+)$",
+                r"\b(?:my|your)\s+favourite\s+color\s+is\s+(.+)$",
+            ]
+            for pattern in patterns:
+                m = re.search(pattern, src, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip().strip(".,;:!? ")
+
+        if slot == "birthdate":
+            bdt = self._parse_birthdate_from_text(src)
+            if bdt:
+                return self._format_birthdate_pretty(bdt)
+
+        return src.strip().strip(".,;:!? ")
+
+    def _build_memory_fact_anchor_lines(
+        self,
+        user_query: str,
+        name_fact: str,
+        eye_fact: str,
+        favorite_fact: str,
+        birth_fact: str,
+        age_sentence: str,
+    ) -> List[str]:
+        anchors: List[str] = []
+
+        if name_fact:
+            name_value = self._extract_profile_slot_value("name", name_fact)
+            if name_value:
+                anchors.append(f"Your name is {name_value}.")
+
+        if eye_fact:
+            eye_value = self._extract_profile_slot_value("eye_color", eye_fact)
+            if eye_value:
+                anchors.append(f"Your eye color is {eye_value}.")
+
+        if favorite_fact:
+            fav_value = self._extract_profile_slot_value("favorite_color", favorite_fact)
+            if fav_value:
+                anchors.append(f"Your favorite color is {fav_value}.")
+
+        if birth_fact:
+            birth_value = self._extract_profile_slot_value("birthdate", birth_fact)
+            if birth_value:
+                anchors.append(f"Your birthdate is {birth_value}.")
+
+        if age_sentence:
+            anchors.append(age_sentence.rstrip())
+
+        deduped: List[str] = []
+        seen = set()
+        for anchor in anchors:
+            key = " ".join(anchor.lower().split())
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(anchor)
+        return deduped
+
+    def _anchor_line_satisfied(self, anchor: str, reply_text: str) -> bool:
+        anchor_txt = str(anchor or "").strip()
+        reply_txt = str(reply_text or "").strip()
+        if not anchor_txt or not reply_txt:
+            return False
+
+        anchor_low = " ".join(anchor_txt.lower().split())
+        reply_low = " ".join(reply_txt.lower().split())
+        if anchor_low in reply_low:
+            return True
+
+        m = re.match(r"^your name is (.+)\.$", anchor_txt, re.IGNORECASE)
+        if m:
+            value = re.escape(m.group(1).strip())
+            return re.search(rf"\b(?:your\s+name\s+is|you'?re|you\s+are)\s+{value}\b", reply_txt, re.IGNORECASE) is not None
+
+        m = re.match(r"^your eye color is (.+)\.$", anchor_txt, re.IGNORECASE)
+        if m:
+            value = re.escape(m.group(1).strip())
+            return re.search(rf"\b(?:your\s+eye\s+color\s+is|your\s+eyes\s+are|eyes\s+are)\s+{value}\b", reply_txt, re.IGNORECASE) is not None
+
+        m = re.match(r"^your favorite color is (.+)\.$", anchor_txt, re.IGNORECASE)
+        if m:
+            value = re.escape(m.group(1).strip())
+            return re.search(rf"\b(?:your\s+favou?rite\s+color\s+is)\s+{value}\b", reply_txt, re.IGNORECASE) is not None
+
+        m = re.match(r"^your birthdate is (.+)\.$", anchor_txt, re.IGNORECASE)
+        if m:
+            value = re.escape(m.group(1).strip())
+            return re.search(rf"\b(?:your\s+birthdate\s+is|your\s+birthday\s+is)\s+{value}\b", reply_txt, re.IGNORECASE) is not None
+
+        return False
+
+    def _enforce_memory_fact_anchors(self, reply_text: str, anchors: List[str]) -> str:
+        text = (reply_text or "").strip()
+        required = [str(a or "").strip() for a in (anchors or []) if str(a or "").strip()]
+        if not required:
+            return text
+
+        missing = []
+        for anchor in required:
+            if not self._anchor_line_satisfied(anchor, text):
+                missing.append(anchor)
+
+        if not missing:
+            return text
+
+        prefix = " ".join(missing).strip()
+        if not text:
+            return prefix
+        return f"{prefix} {text}".strip()
 
     def _is_broad_memory_recall_query(self, user_query: str) -> bool:
         q = (user_query or "").strip().lower()
@@ -1130,8 +1617,35 @@ class MK1Core:
 
         return candidates
 
+    def _slot_fact_matches(self, slot: str, fact_text: str) -> bool:
+        low = (fact_text or "").lower()
+        if not low:
+            return False
+
+        if slot == "name":
+            return "my name is" in low or "name is" in low
+
+        if slot == "eye_color":
+            # Avoid matching generic color facts that are not about eyes.
+            return ("eye color" in low) or ("eyes are" in low) or ("eye is" in low) or (
+                ("eye" in low or "eyes" in low) and "color" in low
+            )
+
+        if slot == "birthdate":
+            return any(x in low for x in ["birthdate", "birthday", "date of birth", "dob", "born"])
+
+        if slot == "favorite_color":
+            return (
+                ("favorite color" in low)
+                or ("favourite color" in low)
+                or (("favorite" in low or "favourite" in low) and ("color" in low or "colour" in low))
+            )
+
+        return False
+
     def _lookup_slot_fact(self, slot: str, user_query: str) -> str:
         slot_queries = {
+            "name": ["my name is", "name", "what is my name"],
             "eye_color": ["eye color", "eyes", "eye"],
             "birthdate": ["birthdate", "birthday", "date of birth", "dob"],
             "favorite_color": ["favorite color", "favourite color", "color", "colour"],
@@ -1140,63 +1654,77 @@ class MK1Core:
         if not probes:
             return ""
 
-        candidates = self._search_memory_candidates(
+        def _first_slot_match(candidates: List[str]) -> str:
+            seen = set()
+            for c in candidates:
+                n = " ".join(c.lower().split())
+                if n in seen:
+                    continue
+                seen.add(n)
+                if self._slot_fact_matches(slot, c):
+                    return c
+            return ""
+
+        # Try multiple sources in priority order; continue until a real slot match is found.
+        cand_user_sem = self._search_memory_candidates(
             probes=probes,
             user_only=True,
             top_k=8,
         )
+        hit = _first_slot_match(cand_user_sem)
+        if hit:
+            return hit
 
-        if not candidates:
-            candidates = self._search_memory_candidates(
-                probes=probes,
-                user_only=False,
-                top_k=8,
-            )
+        cand_any_sem = self._search_memory_candidates(
+            probes=probes,
+            user_only=False,
+            top_k=8,
+        )
+        hit = _first_slot_match(cand_any_sem)
+        if hit:
+            return hit
 
         # Lexical fallback over recent explicit facts.
-        if not candidates:
-            candidates = self._recent_memory_candidates(
-                user_only=True,
-                top_k=800,
-            )
+        cand_user_recent = self._recent_memory_candidates(
+            user_only=True,
+            top_k=800,
+        )
+        hit = _first_slot_match(cand_user_recent)
+        if hit:
+            return hit
 
-        if not candidates:
-            candidates = self._recent_memory_candidates(
-                user_only=False,
-                top_k=800,
-            )
+        cand_any_recent = self._recent_memory_candidates(
+            user_only=False,
+            top_k=800,
+        )
+        hit = _first_slot_match(cand_any_recent)
+        if hit:
+            return hit
 
         # Final fallback: reuse memory_read tool query behavior.
-        if not candidates:
-            tool_queries = {
-                "eye_color": "what is my eye color",
-                "birthdate": "what is my birthdate",
-            }
-            tq = tool_queries.get(slot)
-            if tq:
-                try:
-                    tool_out = self.tools.run("memory_read", {"query": tq, "top_k": 3})
-                    if isinstance(tool_out, dict) and tool_out.get("ok"):
-                        for item in tool_out.get("results", []) or []:
-                            raw = str(item.get("text") or "")
-                            s = self._sanitize_memory_fact_line(raw)
-                            if s:
-                                candidates.append(s)
-                except Exception:
-                    traceback.print_exc()
+        tool_queries = {
+            "name": "what is my name",
+            "eye_color": "what is my eye color",
+            "birthdate": "what is my birthdate",
+            "favorite_color": "what is my favorite color",
+        }
+        tq = tool_queries.get(slot)
+        if tq:
+            tool_candidates: List[str] = []
+            try:
+                tool_out = self.tools.run("memory_read", {"query": tq, "top_k": 3})
+                if isinstance(tool_out, dict) and tool_out.get("ok"):
+                    for item in tool_out.get("results", []) or []:
+                        raw = str(item.get("text") or "")
+                        s = self._sanitize_memory_fact_line(raw)
+                        if s:
+                            tool_candidates.append(s)
+            except Exception:
+                traceback.print_exc()
 
-        seen = set()
-        for c in candidates:
-            n = " ".join(c.lower().split())
-            if n in seen:
-                continue
-            seen.add(n)
-
-            low = c.lower()
-            if slot == "eye_color" and any(x in low for x in ["eye", "eyes", "color"]):
-                return c
-            if slot == "birthdate" and any(x in low for x in ["birth", "birthday", "dob", "date of birth"]):
-                return c
+            hit = _first_slot_match(tool_candidates)
+            if hit:
+                return hit
 
         return ""
 
@@ -1279,16 +1807,34 @@ class MK1Core:
         missing: List[str] = []
 
         if any(slots.values()):
+            name_fact = ""
             birth_fact = ""
             eye_fact = ""
             favorite_fact = ""
 
+            if slots.get("name"):
+                for idx, fact in enumerate(clean_facts):
+                    if idx in used:
+                        continue
+                    if self._slot_fact_matches("name", fact):
+                        name_fact = fact
+                        used.add(idx)
+                        break
+                if not name_fact:
+                    name_fact = self._lookup_slot_fact("name", user_query)
+                if name_fact:
+                    selected.append(name_fact)
+                else:
+                    missing.append("name")
+
             if slots.get("birthdate") or slots.get("age"):
-                birth_fact = self._pick_fact_for_keywords(
-                    clean_facts,
-                    ["birthdate", "birthday", "date of birth", "dob"],
-                    used,
-                )
+                for idx, fact in enumerate(clean_facts):
+                    if idx in used:
+                        continue
+                    if self._slot_fact_matches("birthdate", fact):
+                        birth_fact = fact
+                        used.add(idx)
+                        break
                 if not birth_fact:
                     birth_fact = self._lookup_slot_fact("birthdate", user_query)
                 if not birth_fact and slots.get("age"):
@@ -1302,11 +1848,13 @@ class MK1Core:
                     missing.append("birthdate")
 
             if slots.get("eye_color"):
-                eye_fact = self._pick_fact_for_keywords(
-                    clean_facts,
-                    ["eye color", "eyes", "eye"],
-                    used,
-                )
+                for idx, fact in enumerate(clean_facts):
+                    if idx in used:
+                        continue
+                    if self._slot_fact_matches("eye_color", fact):
+                        eye_fact = fact
+                        used.add(idx)
+                        break
                 if not eye_fact:
                     eye_fact = self._lookup_slot_fact("eye_color", user_query)
                 if eye_fact:
@@ -1315,11 +1863,13 @@ class MK1Core:
                     missing.append("eye color")
 
             if slots.get("favorite_color"):
-                favorite_fact = self._pick_fact_for_keywords(
-                    clean_facts,
-                    ["favorite color", "favourite color", "color", "colour"],
-                    used,
-                )
+                for idx, fact in enumerate(clean_facts):
+                    if idx in used:
+                        continue
+                    if self._slot_fact_matches("favorite_color", fact):
+                        favorite_fact = fact
+                        used.add(idx)
+                        break
                 if not favorite_fact:
                     favorite_fact = self._lookup_slot_fact("favorite_color", user_query)
                 if favorite_fact:
@@ -1383,9 +1933,32 @@ class MK1Core:
 
         # Multipart response style for slot-based memory questions.
         if any(slots.values()):
+            anchor_lines = self._build_memory_fact_anchor_lines(
+                user_query=user_query,
+                name_fact=name_fact,
+                eye_fact=eye_fact,
+                favorite_fact=favorite_fact,
+                birth_fact=birth_fact,
+                age_sentence=age_sentence,
+            )
+            self._reinforce_memory_texts(
+                [fact for fact in [name_fact, eye_fact, favorite_fact, birth_fact] if fact],
+                add_tags=["reinforced_recall", "authoritative_recall"] if any([name_fact, eye_fact, favorite_fact, birth_fact]) else ["reinforced_recall"],
+            )
             lines: List[str] = [
                 "Gremlin memory check, incoming. *gears whir softly*",
             ]
+
+            if name_fact:
+                name_value = self._extract_name_value(name_fact)
+                if name_value:
+                    lines.append(f"Name: {name_value}.")
+                else:
+                    name_line = self._normalize_memory_reply_perspective(user_query, name_fact)
+                    name_line = re.sub(r"[.!?]+$", "", name_line).strip()
+                    lines.append(f"Name: {name_line}.")
+            elif slots.get("name"):
+                lines.append("Name: I do not have that in memory yet.")
 
             if eye_fact:
                 eye_line = self._normalize_memory_reply_perspective(user_query, eye_fact)
@@ -1419,12 +1992,41 @@ class MK1Core:
                 elif not birth_fact:
                     lines.append("Age: I need your birthdate in memory to compute this.")
 
+            if self._is_transformative_memory_query(user_query):
+                fact_constraints: List[str] = []
+                if name_fact:
+                    name_value = self._extract_name_value(name_fact)
+                    fact_constraints.append(f"Name: {name_value}." if name_value else f"Name fact: {name_fact}")
+                if eye_fact:
+                    fact_constraints.append(f"Eye color fact: {self._normalize_memory_reply_perspective(user_query, eye_fact)}")
+                if favorite_fact:
+                    fact_constraints.append(f"Favorite color fact: {self._normalize_memory_reply_perspective(user_query, favorite_fact)}")
+                if birth_fact:
+                    bdt = self._parse_birthdate_from_text(birth_fact)
+                    if bdt:
+                        fact_constraints.append(f"Birthdate: {self._format_birthdate_pretty(bdt)}.")
+                    else:
+                        fact_constraints.append(f"Birthdate fact: {self._normalize_memory_reply_perspective(user_query, birth_fact)}")
+                if age_sentence:
+                    fact_constraints.append(age_sentence)
+
+                creative = self._render_memory_transform_reply(
+                    messages=messages,
+                    user_query=user_query,
+                    fact_lines=fact_constraints,
+                    missing_lines=missing,
+                )
+                if creative:
+                    return self._enforce_memory_fact_anchors(creative, anchor_lines)
+
             return "\n".join(lines)
 
         if self._is_broad_memory_recall_query(user_query):
             picks = clean_facts[:5]
             if not picks:
                 return "Gremlin memory ping: I do not have that in memory yet."
+
+            self._reinforce_memory_texts(picks, add_tags=["reinforced_recall"])
 
             lines = ["Gremlin memory check, incoming. Here's what I remember:"]
             for p in picks:
@@ -2126,6 +2728,263 @@ class MK1Core:
                         kind="procedure",
                         tags=["user_memory", "system_seed", "startup_fact"],
                     )
+        except Exception:
+            traceback.print_exc()
+
+    def _authoritative_tags_for_fact(self, fact_text: str) -> List[str]:
+        low = str(fact_text or "").strip().lower()
+        tags = ["user_memory", "profile_auto"]
+
+        if not low:
+            return tags
+
+        if any(x in low for x in [
+            "my name is",
+            "eye color",
+            "eyes are",
+            "birthdate",
+            "birthday",
+            "date of birth",
+            "favorite color",
+            "favourite color",
+        ]):
+            tags.append("authoritative_profile")
+
+        return tags
+
+    def _seed_authoritative_identity_memory(self) -> None:
+        try:
+            identity_facts = [
+                "Mina is the chaotic gremlin-fox assistant.",
+                "Mina is loyal to Travis.",
+                "Mina is Travis's ride or die buddy.",
+            ]
+
+            for fact in identity_facts:
+                fact_clean = (fact or "").strip()
+                if not fact_clean:
+                    continue
+
+                exists = False
+                if hasattr(self.memory, "find_memory_id_by_text"):
+                    exists = self.memory.find_memory_id_by_text(
+                        fact_clean,
+                        include_kinds=["fact", "procedure"],
+                        include_tags=["authoritative_identity"],
+                    ) is not None
+
+                if not exists:
+                    self.memory.add_memory(
+                        fact_clean,
+                        kind="fact",
+                        tags=["user_memory", "system_seed", "startup_fact", "authoritative_identity", "relationship_identity"],
+                    )
+
+            for slot in ["name", "eye_color", "birthdate", "favorite_color"]:
+                fact = self._lookup_slot_fact(slot, f"what is my {slot.replace('_', ' ')}")
+                fact_clean = (fact or "").strip()
+                if not fact_clean:
+                    continue
+
+                exists = False
+                if hasattr(self.memory, "find_memory_id_by_text"):
+                    exists = self.memory.find_memory_id_by_text(
+                        fact_clean,
+                        include_kinds=["fact", "preference", "procedure"],
+                        include_tags=["authoritative_profile"],
+                    ) is not None
+
+                if not exists:
+                    self.memory.add_memory(
+                        fact_clean,
+                        kind="fact",
+                        tags=["user_memory", "profile_auto", "authoritative_profile"],
+                    )
+        except Exception:
+            traceback.print_exc()
+
+    def _build_runtime_capability_snapshot(self) -> Dict[str, Any]:
+        tool_names: List[str] = []
+        try:
+            tools_map = getattr(self.tools, "tools", {})
+            if isinstance(tools_map, dict):
+                tool_names = sorted([str(k) for k in tools_map.keys()])
+        except Exception:
+            tool_names = []
+
+        model_switch_allowed = self.config.get("model", "switch_allowed", [])
+        if not isinstance(model_switch_allowed, list):
+            model_switch_allowed = []
+
+        return {
+            "identity": "Mina",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "workspace_root": self.workspace_root,
+            "projects_root": self._projects_root(),
+            "model": {
+                "default_model": self.config.get("model", "default_model", ""),
+                "switch_allowed": [str(x) for x in model_switch_allowed],
+                "vision_max_tokens": self.config.get("model", "vision_max_tokens", None),
+                "vision_reasoning_effort": self.config.get("model", "vision_reasoning_effort", None),
+            },
+            "memory": {
+                "db_path": getattr(self.memory, "db_path", ""),
+                "faiss_small_path": getattr(self.memory, "faiss_small_path", ""),
+                "faiss_base_path": getattr(self.memory, "faiss_base_path", ""),
+                "backup_dir": getattr(self.memory, "backup_dir", ""),
+                "auto_backup_every_writes": self.config.get("memory", "auto_backup_every_writes", None),
+                "auto_backup_every_seconds": self.config.get("memory", "auto_backup_every_seconds", None),
+            },
+            "performance": {
+                "fast_command_mode": bool(getattr(self, "fast_command_mode", True)),
+                "fast_command_skip_context": bool(getattr(self, "fast_command_skip_context", True)),
+                "maintenance_min_interval_seconds": int(getattr(self, "maintenance_min_interval_seconds", 20)),
+            },
+            "reflex": {
+                "enabled": bool(getattr(self, "reflex_enabled", True)),
+                "requires_prefix": bool(getattr(self, "reflex_requires_prefix", False)),
+                "prefixes": list(getattr(self, "reflex_prefixes", [])),
+            },
+            "tools": {
+                "count": len(tool_names),
+                "available": tool_names,
+            },
+        }
+
+    def _snapshot_without_timestamp(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(snapshot or {})
+        out.pop("timestamp", None)
+        return out
+
+    def _flatten_snapshot(self, value: Any, prefix: str = "") -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        if isinstance(value, dict):
+            for k in sorted(value.keys()):
+                key = f"{prefix}.{k}" if prefix else str(k)
+                out.update(self._flatten_snapshot(value.get(k), key))
+            return out
+
+        if isinstance(value, list):
+            out[prefix] = json.dumps(value, sort_keys=True, ensure_ascii=True)
+            return out
+
+        out[prefix] = json.dumps(value, ensure_ascii=True)
+        return out
+
+    def _capability_delta_lines(self, old_snapshot: Dict[str, Any], new_snapshot: Dict[str, Any]) -> List[str]:
+        old_flat = self._flatten_snapshot(self._snapshot_without_timestamp(old_snapshot))
+        new_flat = self._flatten_snapshot(self._snapshot_without_timestamp(new_snapshot))
+
+        keys = sorted(set(old_flat.keys()) | set(new_flat.keys()))
+        lines: List[str] = []
+        for k in keys:
+            ov = old_flat.get(k)
+            nv = new_flat.get(k)
+            if ov == nv:
+                continue
+            if ov is None:
+                lines.append(f"added {k}={nv}")
+            elif nv is None:
+                lines.append(f"removed {k}")
+            else:
+                lines.append(f"changed {k}: {ov} -> {nv}")
+        return lines
+
+    def _parse_capability_snapshot_record(self, text: str) -> Tuple[str, Dict[str, Any]]:
+        src = (text or "").strip()
+        m = re.match(r"^mina_capability_snapshot::([a-f0-9]{40})::(\{.*\})$", src, re.IGNORECASE)
+        if not m:
+            return "", {}
+        digest = m.group(1).lower()
+        payload_raw = m.group(2)
+        try:
+            payload = json.loads(payload_raw)
+            if isinstance(payload, dict):
+                return digest, payload
+        except Exception:
+            pass
+        return digest, {}
+
+    def _seed_runtime_capability_snapshot(self) -> None:
+        """
+        Persist a startup capability baseline in memory and record a delta fact
+        whenever runtime capabilities/config differ from the previous snapshot.
+        """
+        try:
+            snapshot = self._build_runtime_capability_snapshot()
+            canonical_payload = self._snapshot_without_timestamp(snapshot)
+            canonical = json.dumps(canonical_payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+            digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+
+            record_text = f"mina_capability_snapshot::{digest}::{json.dumps(snapshot, sort_keys=True, ensure_ascii=True)}"
+            active_tools = snapshot.get("tools", {}).get("available", []) if isinstance(snapshot.get("tools", {}), dict) else []
+            active_tools_text = "active_tools::" + ", ".join([str(x) for x in active_tools])
+
+            # Find most recent prior capability snapshot for delta calculation.
+            previous_snapshot: Dict[str, Any] = {}
+            previous_digest = ""
+            recent = self.memory.recent_memories(
+                top_k=800,
+                include_kinds=["procedure", "fact"],
+                include_tags=["capability_snapshot"],
+            )
+            for item in recent or []:
+                txt = str(item.get("text") or "")
+                d, snap = self._parse_capability_snapshot_record(txt)
+                if d:
+                    previous_digest = d
+                    previous_snapshot = snap
+                    break
+
+            exists = False
+            if hasattr(self.memory, "find_memory_id_by_text"):
+                exists = self.memory.find_memory_id_by_text(
+                    record_text,
+                    include_kinds=["procedure"],
+                    include_tags=["capability_snapshot"],
+                ) is not None
+
+            if not exists:
+                self.memory.add_memory(
+                    record_text,
+                    kind="procedure",
+                    tags=["user_memory", "system_seed", "startup_fact", "capability_snapshot"],
+                )
+
+            active_tools_exists = False
+            if hasattr(self.memory, "find_memory_id_by_text"):
+                active_tools_exists = self.memory.find_memory_id_by_text(
+                    active_tools_text,
+                    include_kinds=["procedure"],
+                    include_tags=["capability_snapshot", "active_tools"],
+                ) is not None
+            if not active_tools_exists:
+                self.memory.add_memory(
+                    active_tools_text,
+                    kind="procedure",
+                    tags=["user_memory", "system_seed", "startup_fact", "capability_snapshot", "active_tools"],
+                )
+
+            # If configuration/capability digest changed since the last startup snapshot,
+            # store a concise delta fact that Mina can recall for "what changed" queries.
+            if previous_digest and previous_digest != digest and previous_snapshot:
+                delta_lines = self._capability_delta_lines(previous_snapshot, snapshot)
+                if delta_lines:
+                    delta_summary = " | ".join(delta_lines[:16])
+                    delta_text = f"mina_capability_delta::{previous_digest}->{digest}::{delta_summary}"
+                    delta_exists = False
+                    if hasattr(self.memory, "find_memory_id_by_text"):
+                        delta_exists = self.memory.find_memory_id_by_text(
+                            delta_text,
+                            include_kinds=["procedure"],
+                            include_tags=["capability_delta"],
+                        ) is not None
+                    if not delta_exists:
+                        self.memory.add_memory(
+                            delta_text,
+                            kind="procedure",
+                            tags=["user_memory", "system_seed", "capability_delta", "suggestion_context"],
+                        )
         except Exception:
             traceback.print_exc()
 
@@ -2885,6 +3744,8 @@ class MK1Core:
             else:
                 context = self.build_context(user_input)
 
+            working_memory = self._build_turn_working_memory(user_input)
+
             messages: List[Dict[str, Any]] = []
 
             if self.system_prompt:
@@ -2897,6 +3758,15 @@ class MK1Core:
                 messages.append({
                     "role": "system",
                     "content": f"Relevant memory context:\n{context}",
+                })
+
+            if working_memory:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"{working_memory}\n"
+                        "Prefer these DB-backed facts over guessing."
+                    ),
                 })
 
             # Add tool availability hint if tools are available
@@ -2912,7 +3782,9 @@ class MK1Core:
                         f"Use them proactively when the user asks for information you can fetch, files to read/write, "
                         f"or tasks you can perform. For example, use 'web_fetch' to get content from URLs, "
                         f"'file_read' for files, 'ps_run' for PowerShell commands, etc. "
-                        f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>"
+                        f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>. "
+                        f"Never claim a tool was run unless you actually emitted a tool call token in this response. "
+                        f"If the user asks to list tools, output the COMPLETE inventory from this list without omissions."
                     ),
                 })
 
@@ -2960,7 +3832,7 @@ class MK1Core:
 
             image_forwarded = False
             if image_meta and image_meta.get("data_url"):
-                if self.model.supports_vision():
+                if self.model.supports_vision(allow_probe=True):
                     messages.append({
                         "role": "user",
                         "content": [
@@ -3014,7 +3886,7 @@ class MK1Core:
                 
                 # Parse Gemma custom tool format
                 import re
-                tool_pattern = r'<\|tool_call\>call:(\w+)\{([^}]*)\}<tool_call\|>'
+                tool_pattern = r'(?:<\|tool_call\>|<\|[^|>\n]+\|)\s*call:(\w+)\{([^}]*)\}(?:<tool_call\|>|\|>)'
                 matches = re.findall(tool_pattern, text_content)
                 
                 if matches and text_content != last_assistant_content:
@@ -3081,7 +3953,7 @@ class MK1Core:
                     "name": image_meta.get("name"),
                     "type": image_meta.get("type"),
                     "size": image_meta.get("size"),
-                    "vision_model": self.model.supports_vision(),
+                    "vision_model": bool(image_forwarded),
                     "forwarded_to_model": image_forwarded,
                 }
 
@@ -3093,7 +3965,7 @@ class MK1Core:
             traceback.print_exc()
 
             return {
-                "reply": f"(core error: {str(e)})"
+                "reply": f"(Mina error: {str(e)})"
             }
 
     def process_stream(
@@ -3111,6 +3983,8 @@ class MK1Core:
             else:
                 context = self.build_context(user_input)
 
+            working_memory = self._build_turn_working_memory(user_input)
+
             messages: List[Dict[str, Any]] = []
 
             if self.system_prompt:
@@ -3125,6 +3999,15 @@ class MK1Core:
                     "content": f"Relevant memory context:\n{context}",
                 })
 
+            if working_memory:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"{working_memory}\n"
+                        "Prefer these DB-backed facts over guessing."
+                    ),
+                })
+
             tool_schemas = self.tools.get_tool_schemas()
             if tool_schemas:
                 tool_names = [t["function"]["name"] for t in tool_schemas]
@@ -3135,7 +4018,9 @@ class MK1Core:
                         f"Use them proactively when the user asks for information you can fetch, files to read/write, "
                         f"or tasks you can perform. For example, use 'web_fetch' to get content from URLs, "
                         f"'file_read' for files, 'ps_run' for PowerShell commands, etc. "
-                        f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>"
+                        f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>. "
+                        f"Never claim a tool was run unless you actually emitted a tool call token in this response. "
+                        f"If the user asks to list tools, output the COMPLETE inventory from this list without omissions."
                     ),
                 })
 
@@ -3167,7 +4052,7 @@ class MK1Core:
                     "data_url": str(image_attachment.get("data_url") or ""),
                 }
 
-            if image_meta and image_meta.get("data_url") and self.model.supports_vision():
+            if image_meta and image_meta.get("data_url") and self.model.supports_vision(allow_probe=True):
                 messages.append({
                     "role": "user",
                     "content": [
@@ -3206,6 +4091,12 @@ class MK1Core:
                 final_text,
                 flags=re.IGNORECASE,
             ).strip()
+            final_text = re.sub(
+                r'(?:<\|[^|>\n]+\|)\s*call:[^\n]*?\|>\.?',
+                '',
+                final_text,
+                flags=re.IGNORECASE,
+            ).strip()
 
             if not final_text:
                 # Fallback in case backend didn't emit stream chunks.
@@ -3221,7 +4112,7 @@ class MK1Core:
 
         except Exception as e:
             traceback.print_exc()
-            yield f"(core error: {str(e)})"
+            yield f"(Mina error: {str(e)})"
     # ========================================================
     # MEMORY CONTEXT
     # ========================================================
@@ -3264,6 +4155,160 @@ class MK1Core:
 
         self.memory.maintenance_tick()
         self._last_maintenance_tick_ts = now
+
+    def _is_turn_working_memory_record(self, text: str) -> bool:
+        low = (text or "").strip().lower()
+        if not low:
+            return False
+
+        if low.startswith("tool '") and "called with args=" in low:
+            return True
+
+        if any(low.startswith(p) for p in [
+            "hardware_snapshot::",
+            "test_run_result::",
+            "code_run_result::",
+            "mina_capability_snapshot::",
+            "mina_capability_delta::",
+            "path_alias::",
+        ]):
+            return True
+
+        return False
+
+    def _authoritative_working_memory_lines(self, query: str, max_lines: int = 6) -> List[str]:
+        lines: List[str] = []
+        seen = set()
+        include_tags = ["authoritative_identity", "authoritative_profile", "relationship_identity"]
+
+        try:
+            recent = self.memory.recent_memories(
+                top_k=24,
+                include_kinds=["fact", "procedure", "preference"],
+                include_tags=include_tags,
+            )
+        except Exception:
+            recent = []
+
+        for item in recent or []:
+            item_tags = item.get("tags") or []
+            if not any(tag in item_tags for tag in include_tags):
+                continue
+            compact = self._compact_working_memory_line(str(item.get("text") or ""))
+            if not compact:
+                continue
+            key = compact.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(compact)
+            if len(lines) >= max_lines:
+                return lines
+
+        try:
+            sem = self.memory.search(
+                query,
+                top_k=max_lines,
+                include_kinds=["fact", "procedure", "preference"],
+                include_tags=include_tags,
+            )
+        except Exception:
+            sem = []
+
+        for item in sem or []:
+            item_tags = item.get("tags") or []
+            if not any(tag in item_tags for tag in include_tags):
+                continue
+            compact = self._compact_working_memory_line(str(item.get("text") or ""))
+            if not compact:
+                continue
+            key = compact.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(compact)
+            if len(lines) >= max_lines:
+                break
+
+        return lines
+
+    def _compact_working_memory_line(self, text: str, max_chars: int = 280) -> str:
+        s = " ".join(str(text or "").strip().split())
+        if not s:
+            return ""
+        if len(s) <= max_chars:
+            return s
+        return s[:max_chars].rstrip() + "..."
+
+    def _build_turn_working_memory(self, query: str) -> str:
+        """
+        Build a compact, authoritative per-turn working-memory block from DB.
+        This complements semantic recall and helps prevent same-turn detail loss.
+        """
+        try:
+            recent = self.memory.recent_memories(
+                top_k=240,
+                include_kinds=["tool", "procedure", "fact"],
+            )
+        except Exception:
+            recent = []
+
+        lines: List[str] = self._authoritative_working_memory_lines(query=query, max_lines=6)
+        seen = {ln.lower() for ln in lines}
+
+        for item in recent or []:
+            txt = str(item.get("text") or "").strip()
+            if not txt:
+                continue
+            if not self._is_turn_working_memory_record(txt):
+                continue
+
+            compact = self._compact_working_memory_line(txt)
+            if not compact:
+                continue
+
+            k = compact.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            lines.append(compact)
+
+            if len(lines) >= 10:
+                break
+
+        try:
+            sem = self.memory.search(
+                query,
+                top_k=5,
+                include_kinds=["tool", "procedure", "fact"],
+                include_tags=["suggestion_context", "tool_result", "capability_delta", "capability_snapshot"],
+            )
+        except Exception:
+            sem = []
+
+        for item in sem or []:
+            txt = str(item.get("text") or "").strip()
+            compact = self._compact_working_memory_line(txt)
+            if not compact:
+                continue
+
+            k = compact.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            lines.append(compact)
+
+            if len(lines) >= 12:
+                break
+
+        if not lines:
+            return ""
+
+        out = ["Turn working memory (authoritative DB facts):"]
+        for ln in lines[:12]:
+            out.append(f"- {ln}")
+
+        return "\n".join(out)
 
     def build_context(self, query: str) -> str:
         try:
@@ -3833,7 +4878,154 @@ class MK1Core:
                 return stderr
             return f"PowerShell exited with code {exit_code}."
 
+        if tool_name == "code_execute":
+            stdout = str(result.get("stdout") or "")
+            stderr = str(result.get("stderr") or "")
+            exit_code = result.get("exit_code")
+            warning = str(result.get("warning") or "").strip()
+
+            lines: List[str] = []
+            if warning:
+                lines.append(warning)
+
+            if stdout.strip():
+                lines.append("STDOUT:")
+                lines.append(stdout.rstrip())
+
+            if stderr.strip():
+                lines.append("STDERR:")
+                lines.append(stderr.rstrip())
+
+            if not lines:
+                if exit_code is None:
+                    return "Code executed with no output."
+                return f"Code exited with code {exit_code} and no output."
+
+            if exit_code is not None:
+                lines.append(f"EXIT CODE: {exit_code}")
+
+            return "\n".join(lines)
+
         return json.dumps(result, indent=2)
+
+    def _is_hardware_like_query(self, text: str) -> bool:
+        t = (text or "").lower()
+        if not t:
+            return False
+        hardware_terms = [
+            "cpu",
+            "gpu",
+            "ram",
+            "memory",
+            "system",
+            "os",
+            "platform",
+            "hardware",
+            "spec",
+            "motherboard",
+            "disk",
+            "storage",
+        ]
+        return any(term in t for term in hardware_terms)
+
+    def _compress_multiline(self, text: str, max_lines: int = 8, max_chars: int = 900) -> str:
+        src = (text or "").strip()
+        if not src:
+            return ""
+        lines = [ln.strip() for ln in src.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        picked = lines[:max(1, int(max_lines))]
+        out = " | ".join(picked)
+        out = re.sub(r"\s+", " ", out).strip()
+        if len(out) > max_chars:
+            out = out[:max_chars].rstrip() + "..."
+        return out
+
+    def _remember_tool_output(
+        self,
+        tool_name: str,
+        user_input: str,
+        tool_args: Dict[str, Any],
+        result: Dict[str, Any],
+        formatted: str,
+    ) -> None:
+        try:
+            if not isinstance(result, dict):
+                return
+
+            low_query = (user_input or "").strip().lower()
+
+            if tool_name == "ps_run" and result.get("ok") and self._is_hardware_like_query(user_input):
+                snapshot = self._compress_multiline(formatted, max_lines=10, max_chars=1000)
+                if snapshot:
+                    mem_text = f"hardware_snapshot::{low_query} => {snapshot}"
+                    self.memory.add_memory(
+                        mem_text,
+                        kind="tool",
+                        tags=["tool_result", "hardware_snapshot", "suggestion_context"],
+                    )
+                return
+
+            if tool_name == "__project_test_run__":
+                payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+                cmd = str(payload.get("command") or "").strip()
+                project_path = str(payload.get("project_path") or "").strip()
+                exit_code = payload.get("exit_code")
+                ok_flag = bool(result.get("ok"))
+                error_text = str(result.get("error") or "").strip()
+                changed_files = payload.get("changed_files", []) if isinstance(payload.get("changed_files", []), list) else []
+
+                stdout_short = self._compress_multiline(str(payload.get("stdout") or ""), max_lines=6, max_chars=420)
+                stderr_short = self._compress_multiline(str(payload.get("stderr") or ""), max_lines=6, max_chars=420)
+
+                parts: List[str] = []
+                if cmd:
+                    parts.append(f"cmd={cmd}")
+                if project_path:
+                    parts.append(f"project={project_path}")
+                parts.append(f"ok={ok_flag}")
+                parts.append(f"exit_code={exit_code}")
+                if error_text:
+                    parts.append(f"error={error_text}")
+                if changed_files:
+                    parts.append("changed_files=" + ",".join([str(p) for p in changed_files[:8]]))
+                if stdout_short:
+                    parts.append(f"stdout={stdout_short}")
+                if stderr_short:
+                    parts.append(f"stderr={stderr_short}")
+
+                if parts:
+                    mem_text = "test_run_result::" + " ; ".join(parts)
+                    self.memory.add_memory(
+                        mem_text,
+                        kind="tool",
+                        tags=["tool_result", "test_result", "suggestion_context"],
+                    )
+                return
+
+            if tool_name == "code_execute" and result.get("ok"):
+                code = str(tool_args.get("code") or "").strip()
+                lang = str(tool_args.get("language") or "").strip() or "unknown"
+                stdout = self._compress_multiline(str(result.get("stdout") or ""), max_lines=4, max_chars=300)
+                stderr = self._compress_multiline(str(result.get("stderr") or ""), max_lines=4, max_chars=300)
+                exit_code = result.get("exit_code")
+
+                if code:
+                    code_short = code if len(code) <= 180 else (code[:180].rstrip() + "...")
+                    mem_text = f"code_run_result::lang={lang}; exit_code={exit_code}; code={code_short}"
+                    if stdout:
+                        mem_text += f"; stdout={stdout}"
+                    if stderr:
+                        mem_text += f"; stderr={stderr}"
+
+                    self.memory.add_memory(
+                        mem_text,
+                        kind="tool",
+                        tags=["tool_result", "code_result", "suggestion_context"],
+                    )
+        except Exception:
+            traceback.print_exc()
 
     # ========================================================
     # REFLEX LAYER
@@ -3859,6 +5051,17 @@ class MK1Core:
         print("TOOL ARGS")
         print("========================================")
         print(tool_args)
+
+        if tool_name == "__mina_identity__":
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "I am Mina, your chaotic gremlin-fox assistant.",
+                        }
+                    }
+                ]
+            }
 
         if tool_name in ("file_write", "file_append"):
             existing = str(tool_args.get("content", "") or "").strip()
@@ -3986,6 +5189,14 @@ class MK1Core:
         if not formatted.strip():
             formatted = "(tool returned no output)"
 
+        self._remember_tool_output(
+            tool_name=tool_name,
+            user_input=user_input,
+            tool_args=tool_args,
+            result=result,
+            formatted=formatted,
+        )
+
         if tool_name in (
             "__tool_list__",
             "__path_alias_set__",
@@ -4018,6 +5229,7 @@ class MK1Core:
             "safe_copy",
             "github_repo",
             "ps_run",
+            "code_execute",
         ):
             content = self._render_tool_response_as_mina(
                 messages=messages,
@@ -4096,8 +5308,26 @@ IMPORTANT RULES:
         raw_text = text.strip()
         t = raw_text.lower().strip()
 
+        # Users often prefix requests with vocatives like "you" or "mina".
+        # Strip these so intent routing still matches tool/memory patterns.
+        raw_text = re.sub(r'^\s*(?:hey\s+)?(?:you|mina)[,\s:;-]+', '', raw_text, flags=re.IGNORECASE).strip()
+        t = raw_text.lower().strip()
+
         if t.startswith("please "):
             t = t[7:].strip()
+
+        # ====================================================
+        # IDENTITY REFLEX
+        # ====================================================
+        identity_patterns = [
+            r"\bwho\s+are\s+you\b",
+            r"\bwhat\s+are\s+you\b",
+            r"\bwhat\s+is\s+your\s+name\b",
+            r"\bare\s+you\s+mina\b",
+            r"\byour\s+name\s+mina\b",
+        ]
+        if any(re.search(p, t) for p in identity_patterns):
+            return "__mina_identity__", {}
 
         # ====================================================
         # COMBINED MEMORY REFLEX
@@ -4181,6 +5411,15 @@ IMPORTANT RULES:
                 return "memory_read"
 
             if re.search(r"\b(how old am i|what color are my eyes?|my birthdate|my birthday|date of birth)\b", t):
+                return "memory_read"
+
+            if re.search(r"\bwho am i\b", t):
+                return "memory_read"
+
+            if re.search(r"\btell me about my\s+(name|eyes|eye color|birthdate|birthday|favorite color|favourite color)\b", t):
+                return "memory_read"
+
+            if re.search(r"\bdescribe my\s+(eyes|eye color|name)\b", t):
                 return "memory_read"
 
             if ("how old" in t and " i " in f" {t} ") or ("eye color" in t and "my" in t):
@@ -4295,6 +5534,9 @@ IMPORTANT RULES:
             "where is the workspace",
         ]):
             return "__workspace_info__", {}
+
+        if re.search(r"\b(anything new|see anything new|what(?:'s|\s+is) new|any updates?)\b", t):
+            return "__git_status__", {}
 
         if any(x in t for x in [
             "git init",
@@ -4492,6 +5734,87 @@ IMPORTANT RULES:
                 "kind": "fact",
                 "tags": ["user_memory"],
             }
+
+        # ====================================================
+        # CODE EXECUTION
+        # ====================================================
+
+        def _extract_code_payload(raw: str) -> Tuple[str, str]:
+            def _trim_trailing_advisory(code_body: str) -> str:
+                text = (code_body or "").strip()
+                if not text:
+                    return ""
+
+                advisory_patterns = [
+                    r"\s+and\s+explain\b.*$",
+                    r"\s+and\s+tell\s+me\b.*$",
+                    r"\s+and\s+describe\b.*$",
+                    r"\s+and\s+suggest\b.*$",
+                    r"\s+then\s+explain\b.*$",
+                    r"\s+then\s+tell\s+me\b.*$",
+                    r"\s+then\s+describe\b.*$",
+                    r"\s+then\s+suggest\b.*$",
+                ]
+
+                for pat in advisory_patterns:
+                    trimmed = re.sub(pat, "", text, flags=re.IGNORECASE).strip()
+                    if trimmed != text and trimmed:
+                        return trimmed
+
+                return text
+
+            # Prefer fenced code blocks if present.
+            fence = re.search(r"```([A-Za-z0-9_+-]*)\n([\s\S]*?)```", raw)
+            if fence:
+                lang_hint = (fence.group(1) or "").strip().lower()
+                code_body = _trim_trailing_advisory((fence.group(2) or "").strip("\n"))
+                if lang_hint in {"ps", "powershell", "pwsh"}:
+                    return "powershell", code_body
+                if lang_hint in {"python", "py"}:
+                    return "python", code_body
+                return "python", code_body
+
+            # Inline formats like: "execute this code: print(2+2)"
+            inline_patterns = [
+                r"\b(?:execute|run)\s+(?:this\s+)?code\s*:\s*([\s\S]+)$",
+                r"\b(?:execute|run)\s+(?:this\s+)?python\s*:\s*([\s\S]+)$",
+                r"\b(?:execute|run)\s+(?:this\s+)?powershell\s*:\s*([\s\S]+)$",
+                r"\b(?:powershell|ps)\s*:\s*([\s\S]+)$",
+                r"\bpython\s*:\s*([\s\S]+)$",
+            ]
+
+            for pat in inline_patterns:
+                m = re.search(pat, raw, re.IGNORECASE)
+                if not m:
+                    continue
+                code_body = _trim_trailing_advisory((m.group(1) or "").strip())
+                if not code_body:
+                    continue
+
+                low_raw = raw.lower()
+                if "powershell" in low_raw or re.search(r"\bps\s*:", low_raw):
+                    return "powershell", code_body
+                return "python", code_body
+
+            return "", ""
+
+        exec_trigger = (
+            re.search(r"\b(execute|run)\s+(?:this\s+)?(code|python|powershell)\b", t) is not None
+            or "```" in raw_text
+            or re.search(r"\b(?:python|powershell|ps)\s*:", t) is not None
+        )
+
+        if exec_trigger:
+            language, code = _extract_code_payload(raw_text)
+            if code:
+                if not language:
+                    language = "python"
+                return "code_execute", {
+                    "code": code,
+                    "language": language,
+                    "timeout": 30,
+                    "check_dangerous": True,
+                }
 
         # ====================================================
         # WEB FETCH
@@ -5073,9 +6396,13 @@ IMPORTANT RULES:
         if any(x in t for x in [
             "tool list",
             "list tools",
+            "list your tools",
+            "list all tools",
             "show tools",
+            "show your tools",
             "available tools",
             "what tools",
+            "what tools do you have",
             "what can you do",
             "what do you have",
             "show me your tools",

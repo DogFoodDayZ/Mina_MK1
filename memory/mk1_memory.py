@@ -624,6 +624,8 @@ class MK1Memory:
                 # Keep explicit user-memory and durable fact/procedure lines.
                 if "user_memory" in tag_set:
                     return False
+                if "authoritative_identity" in tag_set or "authoritative_profile" in tag_set:
+                    return False
 
                 if not t:
                     return True
@@ -632,10 +634,17 @@ class MK1Memory:
                     r"^mina-style output\s*:",
                     r"^mina-sign-off\s*:",
                     r"^verified output\s*:",
+                    r"^stored memory\s*:",
+                    r"^memory write (?:ok|failed)\s*:",
                     r"^```text$",
                     r"^```$",
                     r"^gremlin memory ping:\s*i do not have that in memory yet\.?$",
                     r"^gremlin memory check, incoming\.?",
+                    r"^what is my name\??$",
+                    r"^who am i\??$",
+                    r"^what color are my eyes\??$",
+                    r"^tell me about my eyes\.?$",
+                    r"^can you relate my eye color to something else\.?$",
                 ]
 
                 return any(re.search(p, low) is not None for p in noise_patterns)
@@ -1069,6 +1078,64 @@ class MK1Memory:
         except Exception as e:
             self._set_error(f"delete_memory_by_text_error: {e}")
             return 0
+
+    def touch_memory_by_text(
+        self,
+        text: str,
+        include_kinds: Optional[List[str]] = None,
+        include_tags: Optional[List[str]] = None,
+        add_tags: Optional[List[str]] = None,
+    ) -> bool:
+        target = self._normalize_text(text)
+        if not target:
+            return False
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT id, text, kind, tags, timestamp FROM memories ORDER BY timestamp DESC")
+            rows = cur.fetchall()
+
+            now_ts = time.time()
+            touched = False
+            for row in rows:
+                row_id = int(row[0])
+                row_text = row[1] or ""
+                row_kind = row[2]
+                row_tags = json.loads(row[3]) if row[3] else []
+                row_ts = float(row[4])
+
+                if not self._matches_filters(
+                    kind=row_kind,
+                    tags=row_tags,
+                    timestamp=row_ts,
+                    include_kinds=include_kinds,
+                    include_tags=include_tags,
+                    since_ts=None,
+                ):
+                    continue
+
+                if self._normalize_text(row_text) != target:
+                    continue
+
+                merged_tags = list(row_tags)
+                for tag in add_tags or []:
+                    if tag and tag not in merged_tags:
+                        merged_tags.append(tag)
+
+                cur.execute(
+                    "UPDATE memories SET tags = ?, timestamp = ? WHERE id = ?",
+                    (json.dumps(merged_tags), now_ts, row_id),
+                )
+                conn.commit()
+                touched = True
+                break
+
+            conn.close()
+            return touched
+        except Exception as e:
+            self._set_error(f"touch_memory_by_text_error: {e}")
+            return False
 
     def auto_promote_short_term(
         self,

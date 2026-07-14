@@ -13,6 +13,7 @@ $pythonExe = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 $voiceScript = Join-Path $PSScriptRoot 'mina_windows_voice_loop.py'
 $logPath = Join-Path $PSScriptRoot 'logs\voice_monitor.log'
 $logDir = Split-Path -Parent $logPath
+$privacyFile = Join-Path $env:TEMP 'mina_voice_monitor.mute'
 
 if (-not (Test-Path $logDir)) {
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -23,6 +24,11 @@ if (-not (Test-Path $pythonExe)) {
 }
 if (-not (Test-Path $voiceScript)) {
     throw "Voice loop script not found at $voiceScript"
+}
+
+# Recover from prior crashed runs that may leave mute state latched.
+if (Test-Path $privacyFile) {
+    Remove-Item -Path $privacyFile -Force -ErrorAction SilentlyContinue
 }
 
 function Get-DefaultVoiceDevice {
@@ -164,6 +170,7 @@ try {
         Write-MonitorLog "Launching voice loop..."
         & $pythonExe @args
         $exitCode = $LASTEXITCODE
+
         Write-MonitorLog "Voice loop exited with code $exitCode. Restarting in 2 seconds..."
         Start-Sleep -Seconds 2
     }

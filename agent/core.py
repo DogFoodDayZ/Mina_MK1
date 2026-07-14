@@ -5823,6 +5823,41 @@ IMPORTANT RULES:
         url_match = re.search(r'https?://[^\s"\']+', raw_text, re.IGNORECASE)
         if url_match:
             url = url_match.group(0).strip().rstrip('.,;)]}')
+            gh_match = re.search(r'https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/tree/([A-Za-z0-9_.\-/]+))?', url, re.IGNORECASE)
+            if gh_match:
+                owner = gh_match.group(1)
+                repo = gh_match.group(2).removesuffix('.git')
+                branch = gh_match.group(3) if gh_match.group(3) else 'main'
+                commit_sha_match = re.search(r'latest\s+commit\s*:?\s*([0-9a-f]{7,40})', raw_text, re.IGNORECASE)
+                review_terms = ["review", "architecture", "implementation", "design", "decisions"]
+
+                action = 'repo_info'
+                if 'open issues' in t or 'issues' in t:
+                    action = 'open_issues'
+                elif 'release' in t:
+                    action = 'list_releases'
+                elif 'commit' in t or 'latest commit' in t:
+                    action = 'latest_commit'
+                elif 'branch' in t:
+                    action = 'list_branches'
+
+                # If the prompt includes an explicit latest commit SHA, query that commit directly.
+                if commit_sha_match:
+                    action = 'latest_commit'
+                    branch = commit_sha_match.group(1)
+
+                # Review prompts should not get stuck on branch listing metadata.
+                if action == 'list_branches' and any(term in t for term in review_terms):
+                    action = 'repo_info'
+
+                return 'github_repo', {
+                    'action': action,
+                    'owner': owner,
+                    'repo': repo,
+                    'branch': branch,
+                    'per_page': 20,
+                }
+
             fetch_triggers = [
                 "fetch",
                 "open url",
@@ -5836,6 +5871,26 @@ IMPORTANT RULES:
                 "website",
                 "page",
             ]
+            # Review-style requests that provide a repo/page URL should always fetch,
+            # even when users do not explicitly say "fetch".
+            review_triggers = [
+                "review",
+                "architecture",
+                "implementation",
+                "decision",
+                "decisions",
+                "audit",
+                "assess",
+                "analyze",
+                "analyse",
+            ]
+            repo_context_triggers = [
+                "repo:",
+                "repository:",
+                "branch:",
+                "latest commit",
+                "commit:",
+            ]
             if any(trigger in t for trigger in fetch_triggers):
                 timeout = 10
                 timeout_match = re.search(r'\btimeout\s*(?:=|:)?\s*(\d{1,2})\b', t)
@@ -5847,6 +5902,12 @@ IMPORTANT RULES:
                 return "web_fetch", {
                     "url": url,
                     "timeout": timeout,
+                }
+
+            if any(trigger in t for trigger in review_triggers) or any(trigger in t for trigger in repo_context_triggers):
+                return "web_fetch", {
+                    "url": url,
+                    "timeout": 15,
                 }
 
         # ====================================================
@@ -6292,14 +6353,16 @@ IMPORTANT RULES:
         )
         if github_related:
             action = "repo_info"
+            commit_sha_match = re.search(r'latest\s+commit\s*:?\s*([0-9a-f]{7,40})', raw_text, re.IGNORECASE)
+            review_terms = ["review", "architecture", "implementation", "design", "decisions"]
             if "open issues" in t or "issues" in t:
                 action = "open_issues"
             elif "release" in t:
                 action = "list_releases"
-            elif "branch" in t:
-                action = "list_branches"
             elif "commit" in t or "latest commit" in t:
                 action = "latest_commit"
+            elif "branch" in t:
+                action = "list_branches"
             elif (
                 "list repos" in t
                 or "github repos" in t
@@ -6325,11 +6388,19 @@ IMPORTANT RULES:
                     owner = m.group(1)
                     repo = m.group(2)
 
+            if commit_sha_match:
+                action = "latest_commit"
+
+            if action == "list_branches" and any(term in t for term in review_terms):
+                action = "repo_info"
+
+            branch_value = commit_sha_match.group(1) if commit_sha_match else "main"
+
             return "github_repo", {
                 "action": action,
                 "owner": owner,
                 "repo": repo,
-                "branch": "main",
+                "branch": branch_value,
                 "per_page": 20,
             }
 

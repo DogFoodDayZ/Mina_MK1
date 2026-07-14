@@ -14,6 +14,49 @@ $pidFile = Join-Path $PSScriptRoot '.mk1_api.pid'
 $embedScript = Join-Path $PSScriptRoot 'Memory_server\mk1_embed_server.py'
 $embedHealthUrl = "http://${EmbedHost}:${EmbedPort}/health"
 
+function Import-LocalEnvFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$EnvFilePath
+    )
+
+    if (-not (Test-Path $EnvFilePath)) {
+        return
+    }
+
+    $lines = Get-Content -Path $EnvFilePath -ErrorAction Stop
+    foreach ($line in $lines) {
+        $trimmed = ($line -as [string]).Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+        if ($trimmed -notmatch '^[A-Za-z_][A-Za-z0-9_]*\s*=\s*.*$') { continue }
+
+        $pair = $trimmed -split '=', 2
+        if ($pair.Count -ne 2) { continue }
+
+        $key = $pair[0].Trim()
+        $value = $pair[1].Trim()
+
+        # Remove optional surrounding quotes.
+        if ($value.Length -ge 2) {
+            if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+
+        # Respect env vars already set in the shell/session.
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($key, 'Process'))) {
+            continue
+        }
+
+        [Environment]::SetEnvironmentVariable($key, $value, 'Process')
+    }
+}
+
+# Auto-load local env files (not committed) for secrets like MK1_GITHUB_TOKEN.
+Import-LocalEnvFile -EnvFilePath (Join-Path $PSScriptRoot '.env')
+Import-LocalEnvFile -EnvFilePath (Join-Path $PSScriptRoot '.env.local')
+
 function Test-EmbedHealth {
     param(
         [string]$Url,

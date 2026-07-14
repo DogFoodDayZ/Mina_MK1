@@ -1,5 +1,6 @@
 import urllib.request
 import urllib.error
+from urllib.parse import urlparse
 from typing import Any, Dict
 
 def web_fetch_impl(url: str, timeout: int = 10) -> Dict[str, Any]:
@@ -20,7 +21,14 @@ def web_fetch_impl(url: str, timeout: int = 10) -> Dict[str, Any]:
         }
 
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             ctype = r.headers.get("Content-Type", "")
 
             # Only allow text-like content
@@ -61,6 +69,19 @@ def web_fetch_impl(url: str, timeout: int = 10) -> Dict[str, Any]:
         }
 
     except urllib.error.HTTPError as e:
+        host = ""
+        try:
+            host = (urlparse(url).netloc or "").lower()
+        except Exception:
+            host = ""
+
+        if e.code == 404 and "github.com" in host:
+            return {
+                "ok": False,
+                "result": None,
+                "error": "http_error_404: github_not_found_or_private_repo_or_invalid_path",
+            }
+
         return {
             "ok": False,
             "result": None,

@@ -1,7 +1,10 @@
 param(
     [string]$ApiUrl = 'http://127.0.0.1:8000',
     [int]$VoiceDevice = -1,
-    [string]$VoiceHint = 'en-US-AnaNeural'
+    [string]$VoiceHint = 'en-US-AnaNeural',
+    [double]$SpeechThreshold = 0.002,
+    [int]$MinSpeechMs = 120,
+    [int]$SilenceMs = 700
 )
 
 Set-StrictMode -Version Latest
@@ -145,7 +148,7 @@ try {
         }
     }
 
-    Write-MonitorLog "Voice monitor started. ApiUrl=$ApiUrl VoiceDevice=$VoiceDevice VoiceHint=$VoiceHint"
+    Write-MonitorLog "Voice monitor started. ApiUrl=$ApiUrl VoiceDevice=$VoiceDevice VoiceHint=$VoiceHint SpeechThreshold=$SpeechThreshold MinSpeechMs=$MinSpeechMs SilenceMs=$SilenceMs"
 
     while ($true) {
         if (-not (Test-ApiUp -Url $ApiUrl)) {
@@ -160,8 +163,9 @@ try {
             '--speak-response',
             '--voice-hint', $VoiceHint,
             '--continuous',
-            '--speech-threshold', '0.002',
-            '--min-speech-ms', '120'
+            '--speech-threshold', [string]$SpeechThreshold,
+            '--silence-ms', [string]$SilenceMs,
+            '--min-speech-ms', [string]$MinSpeechMs
         )
         if ($VoiceDevice -ge 0) {
             $args += @('--device', [string]$VoiceDevice)

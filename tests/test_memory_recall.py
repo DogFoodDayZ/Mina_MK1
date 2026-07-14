@@ -290,6 +290,56 @@ def test_detect_code_execute_strips_trailing_explanation_phrase():
     assert args["code"] == "Get-Date -Format o"
 
 
+def test_detect_repo_review_with_url_routes_to_github_repo():
+    core = MK1Core.__new__(MK1Core)
+
+    prompt = (
+        "Hey Mina, can you review what I shipped in K8? "
+        "Repo: https://github.com/DogFoodDayZ/K8-donation-system "
+        "Branch: main Latest commit: 3bb939b "
+        "Please review architecture and implementation decisions only."
+    )
+
+    tool_name, args = MK1Core.detect_tool_intent(core, prompt)
+
+    assert tool_name == "github_repo"
+    assert args["owner"] == "DogFoodDayZ"
+    assert args["repo"] == "K8-donation-system"
+
+
+def test_detect_github_repo_url_routes_to_github_repo_tool():
+    core = MK1Core.__new__(MK1Core)
+
+    prompt = (
+        "Review this private repo architecture: "
+        "https://github.com/DogFoodDayZ/K8-donation-system/tree/main "
+        "latest commit"
+    )
+
+    tool_name, args = MK1Core.detect_tool_intent(core, prompt)
+
+    assert tool_name == "github_repo"
+    assert args["owner"] == "DogFoodDayZ"
+    assert args["repo"] == "K8-donation-system"
+    assert args["branch"] == "main"
+    assert args["action"] == "latest_commit"
+
+
+def test_detect_github_review_branch_and_latest_commit_prefers_commit_sha():
+    core = MK1Core.__new__(MK1Core)
+
+    prompt = (
+        "Review architecture for https://github.com/DogFoodDayZ/K8-donation-system "
+        "Branch: main Latest commit: 3bb939b"
+    )
+
+    tool_name, args = MK1Core.detect_tool_intent(core, prompt)
+
+    assert tool_name == "github_repo"
+    assert args["action"] == "latest_commit"
+    assert args["branch"] == "3bb939b"
+
+
 def test_slot_fact_matches_are_strict_per_slot():
     core = MK1Core.__new__(MK1Core)
 

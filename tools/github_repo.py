@@ -1,7 +1,9 @@
 import json
+import os
 import urllib.request
 import urllib.error
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 GITHUB_API_BASE = "https://api.github.com"
 MAX_RESPONSE_BYTES = 2_000_000
@@ -84,11 +86,89 @@ def _validate_owner_repo(owner: str, repo: str) -> Optional[str]:
     return None
 
 
+def _compact_latest_commit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce GitHub commit payload size so review prompts do not exceed context limits."""
+    if not isinstance(payload, dict):
+        return payload
+
+    out: Dict[str, Any] = {
+        "sha": payload.get("sha"),
+        "html_url": payload.get("html_url"),
+        "stats": payload.get("stats") if isinstance(payload.get("stats"), dict) else None,
+    }
+
+    commit = payload.get("commit") if isinstance(payload.get("commit"), dict) else {}
+    if commit:
+        author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+        committer = commit.get("committer") if isinstance(commit.get("committer"), dict) else {}
+        out["commit"] = {
+            "message": commit.get("message"),
+            "author": {
+                "name": author.get("name"),
+                "email": author.get("email"),
+                "date": author.get("date"),
+            },
+            "committer": {
+                "name": committer.get("name"),
+                "email": committer.get("email"),
+                "date": committer.get("date"),
+            },
+        }
+
+    files = payload.get("files") if isinstance(payload.get("files"), list) else []
+    compact_files = []
+    for f in files[:80]:
+        if not isinstance(f, dict):
+            continue
+        compact_files.append(
+            {
+                "filename": f.get("filename"),
+                "status": f.get("status"),
+                "additions": f.get("additions"),
+                "deletions": f.get("deletions"),
+                "changes": f.get("changes"),
+            }
+        )
+    out["files"] = compact_files
+    out["files_total"] = len(files)
+    if len(files) > len(compact_files):
+        out["files_truncated"] = True
+
+    return out
+
+
+def _normalize_owner_repo(owner: str, repo: str) -> tuple[str, str]:
+    owner = (owner or "").strip()
+    repo = (repo or "").strip()
+
+    if owner and repo:
+        return owner, repo
+
+    # Support "owner/repo" passed in repo field.
+    if not owner and "/" in repo and "github.com" not in repo.lower():
+        parts = [p for p in repo.split("/") if p]
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+
+    # Support full GitHub URL passed in repo field.
+    if not owner and "github.com" in repo.lower():
+        try:
+            parsed = urlparse(repo)
+            path_parts = [p for p in parsed.path.split("/") if p]
+            if len(path_parts) >= 2:
+                return path_parts[0], path_parts[1].removesuffix(".git")
+        except Exception:
+            pass
+
+    return owner, repo
+
+
 def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     action = (args.get("action") or "repo_info").strip().lower()
     owner = args.get("owner") or ""
     repo = args.get("repo") or ""
-    token = args.get("token")
+    owner, repo = _normalize_owner_repo(owner, repo)
+    token = args.get("token") or os.getenv("MK1_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN")
     branch = args.get("branch") or "main"
     per_page = int(args.get("per_page", 20) or 20)
     issue_state = (args.get("issue_state") or "open").strip().lower()
@@ -110,7 +190,10 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
 
         if action == "latest_commit":
             url = _build_repo_url(owner, repo, f"commits/{branch}")
-            return _fetch_url(url, token)
+            fetched = _fetch_url(url, token)
+            if fetched.get("ok") and isinstance(fetched.get("result"), dict):
+                fetched["result"] = _compact_latest_commit_payload(fetched["result"])
+            return fetched
 
         if action == "open_issues":
             url = _build_repo_url(owner, repo, "issues") + f"?state={issue_state}&per_page={per_page}"

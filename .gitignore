@@ -28,3 +28,6 @@ Thumbs.db
 
 # Local secrets
 .env.local
+
+# Local personality profile
+config/personality.txt

@@ -31,3 +31,19 @@ def file_delete_impl(path: str) -> Dict[str, Any]:
 def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     path = args.get("path") or ""
     return file_delete_impl(path)
+
+
+tool_entry.schema = {
+    "description": "Delete a file at the given path.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "File path to delete.",
+            },
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+}

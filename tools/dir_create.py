@@ -31,3 +31,19 @@ def dir_create_impl(path: str) -> Dict[str, Any]:
 def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     path = args.get("path") or ""
     return dir_create_impl(path)
+
+
+tool_entry.schema = {
+    "description": "Create a directory path if it does not already exist.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Directory path to create.",
+            },
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+}

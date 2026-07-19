@@ -17,3 +17,18 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     # Accept "path" or fallback to default
     path = args.get("path") or ""
     return dir_list_impl(path)
+
+
+tool_entry.schema = {
+    "description": "List the contents of a directory.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Directory path to list. Defaults to the workspace root when omitted.",
+            },
+        },
+        "additionalProperties": False,
+    },
+}

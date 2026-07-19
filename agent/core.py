@@ -5,11 +5,13 @@ import time
 import json
 import hashlib
 import html
+import atexit
 import traceback
 import re
 import subprocess
 import sys
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -618,6 +620,7 @@ class MK1Core:
         )
 
         self.tools = ToolLoader(tools_dir)
+        self._seed_tool_inventory_memory()
 
         # Reflex tool layer controls:
         # - enabled by default so Mina can actually use tools and memory
@@ -723,7 +726,29 @@ class MK1Core:
                 20,
             )
         )
+        self.idle_clock_interval_seconds = max(
+            1,
+            int(self.config.get("performance", "idle_clock_interval_seconds", 5)),
+        )
+        self.idle_checkin_interval_seconds = max(
+            60,
+            int(self.config.get("performance", "idle_checkin_interval_seconds", 1800)),
+        )
         self._last_maintenance_tick_ts: float = 0.0
+        self._turn_clock_lock = threading.Lock()
+        self._turn_clock_stop_event = threading.Event()
+        self._turn_clock_thread: Optional[threading.Thread] = None
+        self._turn_clock_started_monotonic: float = time.monotonic()
+        self._turn_clock_started_at: str = datetime.now().isoformat(timespec="seconds")
+        self._turn_clock_tick: int = 0
+        self._turn_clock_last_tick_monotonic: float = self._turn_clock_started_monotonic
+        self._turn_clock_last_tick_at: str = self._turn_clock_started_at
+        self._turn_clock_last_elapsed_seconds: float = 0.0
+        self._last_user_activity_monotonic: float = self._turn_clock_started_monotonic
+        self._last_user_activity_at: str = self._turn_clock_started_at
+        self._last_time_passage_note_monotonic: float = self._turn_clock_started_monotonic
+        self._idle_checkin_pending: bool = False
+        self._idle_checkin_due_since_at: Optional[str] = None
 
         workspace_root_cfg = self.config.get(
             "workspace",
@@ -758,6 +783,8 @@ class MK1Core:
         self.last_active_project_path: Optional[str] = None
 
         self._validate_required_tool_routes()
+        self._start_turn_clock_heartbeat()
+        atexit.register(self.close)
 
     def _validate_required_tool_routes(self) -> None:
         """
@@ -941,6 +968,18 @@ class MK1Core:
         out = re.sub(r"\n{3,}", "\n\n", out)
         return out
 
+    def _tool_call_pattern(self) -> re.Pattern:
+        return re.compile(
+            r'(?:<\|tool_call\>|<\|[\w.-]+\|)\s*call:(\w+)\{([\s\S]*?)\}(?:<tool_call\|>|\|>|>)',
+            flags=re.IGNORECASE,
+        )
+
+    def _strip_tool_call_markup(self, text: str) -> str:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+        return self._tool_call_pattern().sub("", cleaned).strip()
+
     def _with_mina_flair(self, text: str, tool_name: str = "") -> str:
         out = (text or "").strip()
         if not out:
@@ -1092,7 +1131,7 @@ class MK1Core:
                     text = "\n".join(lines[1:]).strip()
                     continue
                 break
-            text = re.sub(r'<\|tool_call\>call:[^\n]*?<tool_call\|>\.?', '', text, flags=re.IGNORECASE).strip()
+            text = self._strip_tool_call_markup(text)
             flair = text.strip()
             if not flair:
                 flair = "Gremlin check complete."
@@ -2325,36 +2364,31 @@ class MK1Core:
 
     def _load_project_tracker(self) -> Dict[str, Any]:
         path = self._project_tracker_path()
-        if not os.path.isfile(path):
-            return {
-                "updated_at": None,
-                "projects": {},
-            }
+        if not os.path.exists(path):
+            return {"updated_at": None, "projects": {}}
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return {"updated_at": None, "projects": {}}
-            projects = data.get("projects", {})
-            if not isinstance(projects, dict):
-                projects = {}
-            return {
-                "updated_at": data.get("updated_at"),
-                "projects": projects,
-            }
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                projects = data.get("projects", {})
+                if not isinstance(projects, dict):
+                    data["projects"] = {}
+                return data
         except Exception:
             traceback.print_exc()
-            return {
-                "updated_at": None,
-                "projects": {},
-            }
+
+        return {"updated_at": None, "projects": {}}
 
     def _save_project_tracker(self, tracker: Dict[str, Any]) -> None:
         path = self._project_tracker_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(tracker, f, indent=2, ensure_ascii=True)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(tracker if isinstance(tracker, dict) else {"projects": {}}, handle, indent=2, sort_keys=True, ensure_ascii=True)
+        except Exception:
+            traceback.print_exc()
+
 
     def _sync_project_tracker(self, scanned_projects: List[Dict[str, Any]]) -> Dict[str, Any]:
         tracker = self._load_project_tracker()
@@ -2688,10 +2722,223 @@ class MK1Core:
             "workspace_root": self.workspace_root,
             "projects_root": self._projects_root(),
             "project_tracker_path": self._project_tracker_path(),
+            "turn_clock_started_at": self._turn_clock_started_at,
+            "turn_clock_tick": self._turn_clock_tick,
+            "last_user_activity_at": self._last_user_activity_at,
+            "idle_checkin_interval_seconds": self.idle_checkin_interval_seconds,
+            "idle_checkin_pending": self._idle_checkin_pending,
+            "idle_checkin_due_since_at": self._idle_checkin_due_since_at,
             "project_count": len(projects),
             "last_worked_project": last_project,
             "incomplete_projects": incomplete,
         }
+
+    def _advance_turn_clock(self) -> Dict[str, Any]:
+        with self._turn_clock_lock:
+            now_monotonic = time.monotonic()
+            elapsed_seconds = max(0.0, now_monotonic - float(self._turn_clock_started_monotonic))
+            since_last_seconds = max(0.0, now_monotonic - float(self._turn_clock_last_tick_monotonic))
+
+            self._turn_clock_tick += 1
+            self._turn_clock_last_tick_monotonic = now_monotonic
+            self._turn_clock_last_tick_at = datetime.now().isoformat(timespec="seconds")
+            self._turn_clock_last_elapsed_seconds = elapsed_seconds
+
+            if isinstance(getattr(self, "startup_context", None), dict):
+                self.startup_context["turn_clock_tick"] = self._turn_clock_tick
+                self.startup_context["turn_clock_started_at"] = self._turn_clock_started_at
+                self.startup_context["turn_clock_last_tick_at"] = self._turn_clock_last_tick_at
+                self.startup_context["turn_clock_last_elapsed_seconds"] = self._turn_clock_last_elapsed_seconds
+
+            return {
+                "tick": self._turn_clock_tick,
+                "started_at": self._turn_clock_started_at,
+                "current_at": self._turn_clock_last_tick_at,
+                "elapsed_seconds": elapsed_seconds,
+                "since_last_tick_seconds": since_last_seconds,
+            }
+
+    def _start_turn_clock_heartbeat(self) -> None:
+        if self._turn_clock_thread and self._turn_clock_thread.is_alive():
+            return
+
+        def _heartbeat() -> None:
+            interval = float(getattr(self, "idle_clock_interval_seconds", 5))
+            while not self._turn_clock_stop_event.wait(interval):
+                try:
+                    self._advance_turn_clock()
+                    self._refresh_idle_checkin_state()
+                except Exception:
+                    traceback.print_exc()
+
+        self._turn_clock_thread = threading.Thread(
+            target=_heartbeat,
+            name="mk1-turn-clock-heartbeat",
+            daemon=True,
+        )
+        self._turn_clock_thread.start()
+
+    def close(self) -> None:
+        self._turn_clock_stop_event.set()
+        thread = self._turn_clock_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+    def _refresh_idle_checkin_state(self) -> None:
+        now_monotonic = time.monotonic()
+        with self._turn_clock_lock:
+            if self._idle_checkin_pending:
+                return
+
+            idle_seconds = max(0.0, now_monotonic - float(self._last_user_activity_monotonic))
+            if idle_seconds < float(self.idle_checkin_interval_seconds):
+                return
+
+            self._idle_checkin_pending = True
+            self._idle_checkin_due_since_at = datetime.now().isoformat(timespec="seconds")
+
+            self._record_time_passage_note(idle_seconds=idle_seconds)
+
+            if isinstance(getattr(self, "startup_context", None), dict):
+                self.startup_context["idle_checkin_pending"] = True
+                self.startup_context["idle_checkin_due_since_at"] = self._idle_checkin_due_since_at
+
+    def _record_time_passage_note(self, idle_seconds: float) -> None:
+        try:
+            if hasattr(self.memory, "add_time_passage_note"):
+                note = (
+                    f"Time passage note: {idle_seconds:.0f} seconds elapsed since the last user activity. "
+                    f"Turn clock tick {self._turn_clock_tick}."
+                )
+                mem_id = self.memory.add_time_passage_note(
+                    note,
+                    tags=["idle_checkin", "time_passage"],
+                )
+                if mem_id is not None:
+                    self._last_time_passage_note_monotonic = time.monotonic()
+        except Exception:
+            traceback.print_exc()
+
+    def _consume_idle_checkin_prompt(self) -> str:
+        with self._turn_clock_lock:
+            if not self._idle_checkin_pending:
+                return ""
+
+            self._idle_checkin_pending = False
+            due_since_at = self._idle_checkin_due_since_at
+            self._idle_checkin_due_since_at = None
+
+            if isinstance(getattr(self, "startup_context", None), dict):
+                self.startup_context["idle_checkin_pending"] = False
+                self.startup_context["idle_checkin_due_since_at"] = None
+
+        if due_since_at:
+            return (
+                "Idle check-in due: the user has been away for a while. "
+                "Briefly check in on them before continuing with the answer."
+            )
+        return ""
+
+    def _extract_repeat_seconds_from_tags(self, tags: Any) -> Optional[int]:
+        try:
+            if not isinstance(tags, list):
+                return None
+            for tag in tags:
+                tag_text = str(tag or "").strip().lower()
+                m = re.match(r"repeat_(\d+)s$", tag_text)
+                if not m:
+                    continue
+                value = int(m.group(1))
+                if value > 0:
+                    return value
+        except Exception:
+            traceback.print_exc()
+        return None
+
+    def _task_is_alarm(self, task: Dict[str, Any]) -> bool:
+        try:
+            tags = task.get("tags") if isinstance(task, dict) else []
+            if isinstance(tags, list):
+                lowered = {str(t or "").strip().lower() for t in tags}
+                if "alarm_task" in lowered:
+                    return True
+
+            text = str((task or {}).get("text") or "").strip().lower()
+            return text.startswith("alarm")
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _build_due_task_prompt(self, max_tasks: int = 5) -> str:
+        try:
+            if not hasattr(self.memory, "get_due_tasks"):
+                return ""
+
+            tasks = self.memory.get_due_tasks(top_k=max_tasks, include_tags=["scheduled_task"])
+        except Exception:
+            traceback.print_exc()
+            tasks = []
+
+        if not tasks:
+            return ""
+
+        lines = ["Due tasks from memory:"]
+        for task in tasks[:max(1, int(max_tasks))]:
+            text = str(task.get("text") or "").strip()
+            due_at = task.get("due_at")
+            repeat_seconds = self._extract_repeat_seconds_from_tags(task.get("tags"))
+            is_alarm = self._task_is_alarm(task)
+            if due_at:
+                try:
+                    due_text = datetime.fromtimestamp(float(due_at)).isoformat(timespec="seconds")
+                except Exception:
+                    due_text = str(due_at)
+                suffix_parts: List[str] = [f"due {due_text}"]
+                if repeat_seconds:
+                    repeat_minutes = max(1, int(round(float(repeat_seconds) / 60.0)))
+                    suffix_parts.append(f"repeats every {repeat_minutes} min")
+                if is_alarm:
+                    suffix_parts.append("alarm")
+                lines.append(f"- {text} ({', '.join(suffix_parts)})")
+            else:
+                if is_alarm:
+                    lines.append(f"- {text} (alarm)")
+                else:
+                    lines.append(f"- {text}")
+
+            # Keep recurring tasks alive by moving their due_at forward once surfaced.
+            if repeat_seconds and hasattr(self.memory, "snooze_task"):
+                try:
+                    task_id = int(task.get("id") or 0)
+                    if task_id > 0:
+                        self.memory.snooze_task(task_id, int(repeat_seconds))
+                except Exception:
+                    traceback.print_exc()
+
+        lines.append("Pick the highest-priority due task and work on that before unrelated replies.")
+        return "\n".join(lines)
+
+    def _register_user_activity(self) -> None:
+        now_monotonic = time.monotonic()
+        now_text = datetime.now().isoformat(timespec="seconds")
+        with self._turn_clock_lock:
+            self._last_user_activity_monotonic = now_monotonic
+            self._last_user_activity_at = now_text
+
+            if isinstance(getattr(self, "startup_context", None), dict):
+                self.startup_context["last_user_activity_at"] = self._last_user_activity_at
+
+    def _format_turn_clock_line(self, clock_state: Dict[str, Any]) -> str:
+        tick = int(clock_state.get("tick") or 0)
+        elapsed_seconds = float(clock_state.get("elapsed_seconds") or 0.0)
+        since_last = float(clock_state.get("since_last_tick_seconds") or 0.0)
+        current_at = str(clock_state.get("current_at") or "")
+        idle_due = bool(getattr(self, "_idle_checkin_pending", False))
+        return (
+            f"Turn clock: tick {tick}, elapsed {elapsed_seconds:.1f}s, "
+            f"{since_last:.1f}s since prior turn, now {current_at}; "
+            f"idle check-in {'due' if idle_due else 'not due'}"
+        )
 
     def _seed_startup_memory_facts(self) -> None:
         """
@@ -2701,8 +2948,12 @@ class MK1Core:
         """
         try:
             facts = [
-                f"Mina workspace root is {self.workspace_root}",
-                f"Mina projects root is {self._projects_root()}",
+                f"Mina workspace root is {self.workspace_root} and it is her full working workspace",
+                f"Mina can read and write within the workspace root {self.workspace_root}",
+                f"Mina projects root is {self._projects_root()} for active project work",
+                f"Mina scratch root is {os.path.join(self.workspace_root, 'scratch')} for quick notes, reminders, and temporary working files",
+                f"Mina templates root is {os.path.join(self.workspace_root, 'templates')} for reusable starting files and patterns",
+                f"Mina archive root is {os.path.join(self.workspace_root, 'archive')} for finished or retired workspace items",
                 f"Mina memory database path is {getattr(self.memory, 'db_path', '')}",
                 f"Mina FAISS small index path is {getattr(self.memory, 'faiss_small_path', '')}",
                 f"Mina FAISS base index path is {getattr(self.memory, 'faiss_base_path', '')}",
@@ -2806,9 +3057,7 @@ class MK1Core:
     def _build_runtime_capability_snapshot(self) -> Dict[str, Any]:
         tool_names: List[str] = []
         try:
-            tools_map = getattr(self.tools, "tools", {})
-            if isinstance(tools_map, dict):
-                tool_names = sorted([str(k) for k in tools_map.keys()])
+            tool_names = [item["name"] for item in self._usable_tool_inventory()]
         except Exception:
             tool_names = []
 
@@ -2850,6 +3099,64 @@ class MK1Core:
                 "available": tool_names,
             },
         }
+
+    def _usable_tool_inventory(self) -> List[Dict[str, str]]:
+        inventory: List[Dict[str, str]] = []
+        try:
+            schemas = self.tools.get_tool_schemas() if getattr(self, "tools", None) else []
+        except Exception:
+            schemas = []
+
+        for schema in schemas or []:
+            fn = schema.get("function", {}) if isinstance(schema, dict) else {}
+            name = str(fn.get("name") or "").strip()
+            if not name:
+                continue
+            inventory.append({
+                "name": name,
+                "description": str(fn.get("description") or "").strip(),
+            })
+
+        inventory.sort(key=lambda item: item["name"].lower())
+        return inventory
+
+    def _scratch_root(self) -> str:
+        return os.path.join(self.workspace_root, "scratch")
+
+    def _sanitize_scratch_note_name(self, text: str, max_len: int = 32) -> str:
+        raw = re.sub(r"\s+", " ", str(text or "").strip())
+        if not raw:
+            return "note"
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_").lower()
+        if not slug:
+            slug = "note"
+        return slug[:max_len].strip("_") or "note"
+
+    def _write_scratch_note(self, note_text: str, title_hint: str = "note") -> Dict[str, Any]:
+        body = str(note_text or "").strip()
+        if not body:
+            return {"ok": False, "result": None, "error": "no_note_content_provided"}
+
+        scratch_root = self._scratch_root()
+        os.makedirs(scratch_root, exist_ok=True)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        title = self._sanitize_scratch_note_name(title_hint)
+        path = os.path.join(scratch_root, f"{stamp}_{title}.md")
+        content = (
+            f"# Scratch Note\n\n"
+            f"Created: {datetime.now().isoformat(timespec='seconds')}\n\n"
+            f"{body}\n"
+        )
+
+        return self.tools.run(
+            "file_write",
+            {
+                "path": path,
+                "content": content,
+                "overwrite": True,
+            },
+        )
 
     def _snapshot_without_timestamp(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(snapshot or {})
@@ -2985,6 +3292,44 @@ class MK1Core:
                             kind="procedure",
                             tags=["user_memory", "system_seed", "capability_delta", "suggestion_context"],
                         )
+        except Exception:
+            traceback.print_exc()
+
+    def _seed_tool_inventory_memory(self) -> None:
+        """
+        Persist a compact inventory of available tools and their descriptions
+        so Mina can recall what each tool is for across sessions.
+        """
+        try:
+            inventory = self._usable_tool_inventory()
+            if not inventory:
+                return
+
+            lines = ["Mina tool inventory:"]
+            for item in inventory:
+                if item.get("description"):
+                    lines.append(f"- {item['name']}: {item['description']}")
+                else:
+                    lines.append(f"- {item['name']}")
+
+            record_text = "\n".join(lines).strip()
+            if not record_text:
+                return
+
+            exists = False
+            if hasattr(self.memory, "find_memory_id_by_text"):
+                exists = self.memory.find_memory_id_by_text(
+                    record_text,
+                    include_kinds=["procedure"],
+                    include_tags=["tool_inventory"],
+                ) is not None
+
+            if not exists:
+                self.memory.add_memory(
+                    record_text,
+                    kind="procedure",
+                    tags=["user_memory", "system_seed", "startup_fact", "tool_inventory"],
+                )
         except Exception:
             traceback.print_exc()
 
@@ -3222,6 +3567,10 @@ class MK1Core:
                     "current_datetime": datetime.now().isoformat(timespec="seconds"),
                     "startup_time": self.startup_context.get("startup_time"),
                     "workspace_root": self.workspace_root,
+                    "last_user_activity_at": self.startup_context.get("last_user_activity_at"),
+                    "idle_checkin_interval_seconds": self.startup_context.get("idle_checkin_interval_seconds"),
+                    "idle_checkin_pending": self.startup_context.get("idle_checkin_pending"),
+                    "idle_checkin_due_since_at": self.startup_context.get("idle_checkin_due_since_at"),
                     "last_worked_project": self.startup_context.get("last_worked_project"),
                     "incomplete_projects": self.startup_context.get("incomplete_projects", []),
                 },
@@ -3729,6 +4078,11 @@ class MK1Core:
             print("USER INPUT:")
             print(user_input)
 
+            turn_clock = self._advance_turn_clock()
+            self._refresh_idle_checkin_state()
+            checkin_prompt = self._consume_idle_checkin_prompt()
+            self._register_user_activity()
+
             # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             # HYBRID MEMORY ENGINE MAINTENANCE TICK
             # Runs scheduled backups, trimming, health checks.
@@ -3769,6 +4123,24 @@ class MK1Core:
                     ),
                 })
 
+            if checkin_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": checkin_prompt,
+                })
+
+            due_task_prompt = self._build_due_task_prompt()
+            if due_task_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": due_task_prompt,
+                })
+
+            messages.append({
+                "role": "system",
+                "content": self._format_turn_clock_line(turn_clock),
+            })
+
             # Add tool availability hint if tools are available
             # NOTE: Don't pass tools to model.chat() - LMStudio hangs with tools parameter
             tools_obj = getattr(self, "tools", None)
@@ -3781,7 +4153,7 @@ class MK1Core:
                         f"You have access to these tools: {', '.join(tool_names)}. "
                         f"Use them proactively when the user asks for information you can fetch, files to read/write, "
                         f"or tasks you can perform. For example, use 'web_fetch' to get content from URLs, "
-                        f"'file_read' for files, 'ps_run' for PowerShell commands, etc. "
+                        f"'file_read' for files, and 'powershell' or 'ps_run' for PowerShell commands and batches. "
                         f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>. "
                         f"Never claim a tool was run unless you actually emitted a tool call token in this response. "
                         f"If the user asks to list tools, output the COMPLETE inventory from this list without omissions."
@@ -3875,6 +4247,7 @@ class MK1Core:
             max_tool_loops = 3
             loop_count = 0
             last_assistant_content = ""
+            tool_pattern = self._tool_call_pattern()
             
             while reply and loop_count < max_tool_loops:
                 loop_count += 1
@@ -3885,14 +4258,12 @@ class MK1Core:
                 text_content = message.get("content", "") or choice.get("text", "")
                 
                 # Parse Gemma custom tool format
-                import re
-                tool_pattern = r'(?:<\|tool_call\>|<\|[^|>\n]+\|)\s*call:(\w+)\{([^}]*)\}(?:<tool_call\|>|\|>)'
                 matches = re.findall(tool_pattern, text_content)
                 
                 if matches and text_content != last_assistant_content:
                     # Found new tool calls - prevent infinite loops on same content
                     last_assistant_content = text_content
-                    cleaned_content = re.sub(tool_pattern, "", text_content).strip()
+                    cleaned_content = tool_pattern.sub("", text_content).strip()
                     
                     messages.append({
                         "role": "assistant",
@@ -3975,6 +4346,10 @@ class MK1Core:
     ):
 
         try:
+            turn_clock = self._advance_turn_clock()
+            self._refresh_idle_checkin_state()
+            checkin_prompt = self._consume_idle_checkin_prompt()
+            self._register_user_activity()
             self._maybe_run_maintenance_tick()
 
             command_like = self.fast_command_mode and self._is_command_like_query(user_input)
@@ -4008,6 +4383,24 @@ class MK1Core:
                     ),
                 })
 
+            if checkin_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": checkin_prompt,
+                })
+
+            due_task_prompt = self._build_due_task_prompt()
+            if due_task_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": due_task_prompt,
+                })
+
+            messages.append({
+                "role": "system",
+                "content": self._format_turn_clock_line(turn_clock),
+            })
+
             tool_schemas = self.tools.get_tool_schemas()
             if tool_schemas:
                 tool_names = [t["function"]["name"] for t in tool_schemas]
@@ -4017,7 +4410,7 @@ class MK1Core:
                         f"You have access to these tools: {', '.join(tool_names)}. "
                         f"Use them proactively when the user asks for information you can fetch, files to read/write, "
                         f"or tasks you can perform. For example, use 'web_fetch' to get content from URLs, "
-                        f"'file_read' for files, 'ps_run' for PowerShell commands, etc. "
+                        f"'file_read' for files, and 'powershell' or 'ps_run' for PowerShell commands and batches. "
                         f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>. "
                         f"Never claim a tool was run unless you actually emitted a tool call token in this response. "
                         f"If the user asks to list tools, output the COMPLETE inventory from this list without omissions."
@@ -4401,13 +4794,39 @@ class MK1Core:
             return str(result)
 
         if tool_name == "__tool_list__":
-            tools = result.get("tools", [])
-            if not tools:
-                return "No tools available."
+            inventory = result.get("inventory", [])
+            if not inventory:
+                tools = result.get("tools", [])
+                if not tools:
+                    return "No tools available."
+                lines = ["Available tools:", ""]
+                for t in tools:
+                    lines.append(f"- {t}")
+                return "\n".join(lines)
+
             lines = ["Available tools:", ""]
-            for t in tools:
-                lines.append(f"- {t}")
+            for item in inventory:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or "").strip()
+                    desc = str(item.get("description") or "").strip()
+                    if not name:
+                        continue
+                    if desc:
+                        lines.append(f"- {name}: {desc}")
+                    else:
+                        lines.append(f"- {name}")
+                else:
+                    lines.append(f"- {item}")
             return "\n".join(lines)
+
+        if tool_name == "__scratch_note__":
+            if not result.get("ok"):
+                return f"Scratch note failed: {result.get('error')}"
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            path = payload.get("path") or payload.get("written_path") or payload.get("dst") or ""
+            if path:
+                return f"Scratch note saved: {path}"
+            return "Scratch note saved."
 
         if tool_name == "file_read":
             if not result.get("ok"):
@@ -4811,6 +5230,14 @@ class MK1Core:
                 return f"Stored memory: {stored}"
             return "Memory stored successfully."
 
+        if tool_name == "__task_memory_write__":
+            if not result.get("ok"):
+                return f"Task memory write failed: {result.get('error')}"
+            stored = result.get("stored")
+            if stored:
+                return f"Scheduled task stored: {stored}"
+            return "Scheduled task stored successfully."
+
         if tool_name == "web_fetch":
             if not result.get("ok"):
                 return f"Web fetch failed: {result.get('error')}"
@@ -5109,11 +5536,18 @@ class MK1Core:
                     tool_args["script"] = f'& "{resolved_script}"'
 
         if tool_name == "__tool_list__":
+            inventory = self._usable_tool_inventory()
             result = {
                 "ok": True,
-                "tools": list(self.tools.tools.keys()),
+                "tools": [item["name"] for item in inventory],
+                "inventory": inventory,
                 "status": self.tools.get_status(),
             }
+        elif tool_name == "__scratch_note__":
+            result = self._write_scratch_note(
+                note_text=str(tool_args.get("text", "") or ""),
+                title_hint=str(tool_args.get("title", "note") or "note"),
+            )
         elif tool_name == "__path_alias_set__":
             result = self._store_path_alias(
                 alias=str(tool_args.get("alias", "") or ""),
@@ -5159,6 +5593,27 @@ class MK1Core:
             result = self._memory_tidy(
                 dry_run=bool(tool_args.get("dry_run", False)),
             )
+        elif tool_name == "__task_memory_write__":
+            write_tags = tool_args.get("tags", ["user_memory"])
+            if not isinstance(write_tags, list):
+                write_tags = ["user_memory"]
+            memory_id = self.memory.add_task_memory(
+                str(tool_args.get("text", "") or ""),
+                due_at=tool_args.get("due_at"),
+                tags=write_tags,
+                status=str(tool_args.get("status") or "pending"),
+            )
+            result = {
+                "ok": memory_id is not None,
+                "stored": str(tool_args.get("text", "") or ""),
+                "result": {
+                    "memory_id": memory_id,
+                    "text": str(tool_args.get("text", "") or ""),
+                    "due_at": tool_args.get("due_at"),
+                    "status": str(tool_args.get("status") or "pending"),
+                    "tags": write_tags,
+                },
+            }
         elif tool_name == "__project_bootstrap__":
             result = self._bootstrap_project(
                 project_name=str(tool_args.get("project", "") or ""),
@@ -5199,6 +5654,7 @@ class MK1Core:
 
         if tool_name in (
             "__tool_list__",
+            "__scratch_note__",
             "__path_alias_set__",
             "__path_alias_list__",
             "__path_alias_forget__",
@@ -5311,6 +5767,12 @@ IMPORTANT RULES:
         # Users often prefix requests with vocatives like "you" or "mina".
         # Strip these so intent routing still matches tool/memory patterns.
         raw_text = re.sub(r'^\s*(?:hey\s+)?(?:you|mina)[,\s:;-]+', '', raw_text, flags=re.IGNORECASE).strip()
+        raw_text = re.sub(
+            r'^\s*(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}[,\s:;-]+(?=(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\b|in\s+\d+\s*(?:seconds?|minutes?|hours?)\b)',
+            '',
+            raw_text,
+            flags=re.IGNORECASE,
+        ).strip()
         t = raw_text.lower().strip()
 
         if t.startswith("please "):
@@ -5376,7 +5838,242 @@ IMPORTANT RULES:
 
             return cleaned or raw_text.strip()
 
+        scheduled_task_payload: Optional[Dict[str, Any]] = None
+
         def detect_memory_intent(t: str):
+            nonlocal scheduled_task_payload
+
+            def extract_scheduled_task(raw_text: str) -> Optional[Dict[str, Any]]:
+                cleaned = (raw_text or "").strip()
+                if not cleaned:
+                    return None
+
+                # Users often preface commands with one or more names (e.g., "Travis mina ...").
+                # Keep a normalized variant so scheduling patterns still match.
+                normalized = re.sub(
+                    r"^\s*(?:(?:hey|yo)\s+)?(?:[A-Za-z][A-Za-z0-9_-]{1,30}[,\s:;-]+){0,3}(?=(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of|set|create|start|schedule)\b|in\s+\d+\s*(?:seconds?|minutes?|hours?)\b)",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                ).strip()
+
+                parse_inputs: List[str] = [cleaned]
+                if normalized and normalized != cleaned:
+                    parse_inputs.append(normalized)
+
+                weekday_aliases = {
+                    "mon": 0,
+                    "monday": 0,
+                    "tue": 1,
+                    "tues": 1,
+                    "tuesday": 1,
+                    "wed": 2,
+                    "wednesday": 2,
+                    "thu": 3,
+                    "thur": 3,
+                    "thurs": 3,
+                    "thursday": 3,
+                    "fri": 4,
+                    "friday": 4,
+                    "sat": 5,
+                    "saturday": 5,
+                    "sun": 6,
+                    "sunday": 6,
+                }
+
+                def _clock_due_at(
+                    hour_text: str,
+                    minute_text: Optional[str],
+                    ampm_text: Optional[str],
+                    day_text: Optional[str] = None,
+                ) -> Optional[float]:
+                    try:
+                        hour = int(hour_text)
+                        minute = int(minute_text or "0")
+                    except Exception:
+                        return None
+
+                    if minute < 0 or minute > 59:
+                        return None
+
+                    ampm = (ampm_text or "").strip().lower().replace(".", "")
+                    if ampm:
+                        if hour < 1 or hour > 12:
+                            return None
+                        if ampm.startswith("p") and hour != 12:
+                            hour += 12
+                        if ampm.startswith("a") and hour == 12:
+                            hour = 0
+                    elif hour < 0 or hour > 23:
+                        return None
+
+                    now_local = datetime.now()
+                    day_token = str(day_text or "").strip().lower().rstrip(".?!,")
+
+                    if day_token == "tomorrow":
+                        base_dt = now_local + timedelta(days=1)
+                        due_dt = base_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    elif day_token in weekday_aliases:
+                        target_weekday = weekday_aliases[day_token]
+                        days_ahead = (target_weekday - now_local.weekday()) % 7
+                        due_dt = (now_local + timedelta(days=days_ahead)).replace(
+                            hour=hour,
+                            minute=minute,
+                            second=0,
+                            microsecond=0,
+                        )
+                        if due_dt <= now_local:
+                            due_dt = due_dt + timedelta(days=7)
+                    else:
+                        due_dt = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                        if due_dt <= now_local:
+                            due_dt = due_dt + timedelta(days=1)
+
+                    return due_dt.timestamp()
+
+                schedule_patterns = [
+                    r"^(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+(?:in\s+)?(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)\s+(?:to\s+)?(?P<task>.+)$",
+                    r"^in\s+(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)\s+(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+(?:to\s+)?(?P<task>.+)$",
+                    r"^(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+(?:in\s+)?(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)\s+(?:to\s+)?(?P<task>.+)$",
+                    r"^(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?remind\s+me\s+(?:to\s+)?(?P<task>.+?)\s+in\s+(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)$",
+                ]
+
+                alarm_relative_patterns = [
+                    r"^(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)\s+(?:to\s+)?(?:go\s+off\s+)?(?:in|for)\s+(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)(?:\s*(?:from\s+now)?)?(?:\s*(?:for|about|to)\s+(?P<task>.+))?$",
+                    r"^in\s+(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)\s+(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)(?:\s*(?:for|about|to)\s+(?P<task>.+))?$",
+                ]
+
+                for parse_text in parse_inputs:
+                    for pat in schedule_patterns:
+                        m = re.search(pat, parse_text, re.IGNORECASE)
+                        if not m:
+                            continue
+
+                        task = str(m.group("task") or "").strip().rstrip(".?!")
+                        if not task:
+                            continue
+
+                        amount = int(m.group("num") or 0)
+                        unit = str(m.group("unit") or "").strip().lower()
+                        if amount <= 0:
+                            continue
+
+                        if unit.startswith("second"):
+                            delta = amount
+                        elif unit.startswith("minute"):
+                            delta = amount * 60
+                        else:
+                            delta = amount * 3600
+
+                        matched = str(m.group(0) or "").lower()
+                        is_reminder = ("remind me" in matched) or ("check in" in matched)
+                        tags = ["user_memory"]
+                        if is_reminder:
+                            tags.extend(["recurring_task", "repeat_300s", "reminder_task"])
+
+                        return {
+                            "text": task,
+                            "due_at": time.time() + float(delta),
+                            "tags": tags,
+                        }
+
+                    for pat in alarm_relative_patterns:
+                        m = re.search(pat, parse_text, re.IGNORECASE)
+                        if not m:
+                            continue
+
+                        amount = int(m.group("num") or 0)
+                        unit = str(m.group("unit") or "").strip().lower()
+                        if amount <= 0:
+                            continue
+
+                        if unit.startswith("second"):
+                            delta = amount
+                        elif unit.startswith("minute"):
+                            delta = amount * 60
+                        else:
+                            delta = amount * 3600
+
+                        task = str(m.groupdict().get("task") or "").strip().rstrip(".?!")
+                        task_text = f"Alarm: {task}" if task else "Alarm"
+
+                        return {
+                            "text": task_text,
+                            "due_at": time.time() + float(delta),
+                            "tags": ["user_memory", "recurring_task", "repeat_120s", "alarm_task", "beep"],
+                        }
+
+                absolute_patterns = [
+                    r"^(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun)\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?\s+(?:to\s+)?(?P<task>.+)$",
+                    r"^(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+(?:to\s+)?(?P<task>.+?)\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun)\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?$",
+                    r"^(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun)\s+(?:to\s+)?(?P<task>.+)$",
+                    r"^(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun)\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?\s+(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+(?:to\s+)?(?P<task>.+)$",
+                    r"^at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun)\s+(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+(?:to\s+)?(?P<task>.+)$",
+                    r"^(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+(?:to\s+)?(?P<task>.+?)\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?$",
+                    r"^(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?\s+(?:to\s+)?(?P<task>.+)$",
+                    r"^at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?\s+(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}\s+)?(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\s+(?:to\s+)?(?P<task>.+)$",
+                ]
+
+                alarm_absolute_patterns = [
+                    r"^(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)\s+(?:for|at)\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?(?:\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun))?(?:\s*(?:for|about|to)\s+(?P<task>.+))?$",
+                    r"^(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun)\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?(?:\s*(?:for|about|to)\s+(?P<task>.+))?$",
+                ]
+
+                for parse_text in parse_inputs:
+                    for pat in absolute_patterns:
+                        m = re.search(pat, parse_text, re.IGNORECASE)
+                        if not m:
+                            continue
+
+                        task = str(m.group("task") or "").strip().rstrip(".?!")
+                        if not task:
+                            continue
+
+                        due_at = _clock_due_at(
+                            str(m.group("hour") or ""),
+                            m.group("minute"),
+                            m.group("ampm"),
+                            m.groupdict().get("day"),
+                        )
+                        if due_at is None:
+                            continue
+
+                        matched = str(m.group(0) or "").lower()
+                        is_reminder = ("remind me" in matched) or ("check in" in matched)
+                        tags = ["user_memory"]
+                        if is_reminder:
+                            tags.extend(["recurring_task", "repeat_300s", "reminder_task"])
+
+                        return {
+                            "text": task,
+                            "due_at": float(due_at),
+                            "tags": tags,
+                        }
+
+                    for pat in alarm_absolute_patterns:
+                        m = re.search(pat, parse_text, re.IGNORECASE)
+                        if not m:
+                            continue
+
+                        due_at = _clock_due_at(
+                            str(m.group("hour") or ""),
+                            m.group("minute"),
+                            m.group("ampm"),
+                            m.groupdict().get("day"),
+                        )
+                        if due_at is None:
+                            continue
+
+                        task = str(m.groupdict().get("task") or "").strip().rstrip(".?!")
+                        task_text = f"Alarm: {task}" if task else "Alarm"
+                        return {
+                            "text": task_text,
+                            "due_at": float(due_at),
+                            "tags": ["user_memory", "recurring_task", "repeat_120s", "alarm_task", "beep"],
+                        }
+
+                return None
+
             # MEMORY READ (questions)
             read_triggers = [
                 "what do you know",
@@ -5447,6 +6144,11 @@ IMPORTANT RULES:
 
             if any(t.startswith(x) for x in write_triggers):
                 return "memory_write"
+
+            scheduled_task = extract_scheduled_task(raw_text)
+            if scheduled_task:
+                scheduled_task_payload = scheduled_task
+                return "__task_memory_write__"
 
             # Allow more natural phrasing that includes memory commands later in the sentence
             suffix_write_triggers = [
@@ -5607,7 +6309,13 @@ IMPORTANT RULES:
         ]):
             return "__startup_status__", {}
 
-        if any(x in t for x in [
+        is_scheduled_phrase = re.search(
+            r"\b(remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\b.*\b(?:in\s+\d+\s*(seconds?|minutes?|hours?)|at\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?)\b",
+            t,
+            re.IGNORECASE,
+        ) is not None
+
+        if (not is_scheduled_phrase) and any(x in t for x in [
             "memory status",
             "memory health",
             "how is your memory",
@@ -5733,6 +6441,14 @@ IMPORTANT RULES:
                 "text": extract_memory_write_text(raw_text),
                 "kind": "fact",
                 "tags": ["user_memory"],
+            }
+
+        if intent == "__task_memory_write__":
+            return "__task_memory_write__", {
+                "text": str((scheduled_task_payload or {}).get("text") or raw_text.strip()),
+                "due_at": float((scheduled_task_payload or {}).get("due_at") or time.time()),
+                "status": "pending",
+                "tags": (scheduled_task_payload or {}).get("tags", ["user_memory"]),
             }
 
         # ====================================================
@@ -6480,6 +7196,33 @@ IMPORTANT RULES:
         ]):
             return "__tool_list__", {}
 
+        scratch_note_triggers = [
+            "put this in scratch",
+            "save this in scratch",
+            "note this in scratch",
+            "keep this in scratch",
+            "add this to scratch",
+            "write this to scratch",
+            "scratch note",
+        ]
+
+        if any(trigger in t for trigger in scratch_note_triggers):
+            note_text = raw_text.strip()
+            note_text = re.sub(
+                r'^(?:please\s+)?(?:put|save|note|keep|add|write)\s+(?:this|that|it|the following)\s+(?:in\s+)?scratch\s*[:,-]?\s*',
+                "",
+                note_text,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            if not note_text:
+                note_text = raw_text.strip()
+
+            return "__scratch_note__", {
+                "text": note_text,
+                "title": self._sanitize_scratch_note_name(note_text),
+            }
+
         planner_triggers = [
             "search",
             "find",
@@ -6510,6 +7253,7 @@ IMPORTANT RULES:
             "memory_read",
             "file_read",
             "dir_list",
+            "powershell",
             "ps_run",
         ]
         return [name for name in preferred if name in self.tools.tools]
@@ -6681,7 +7425,7 @@ IMPORTANT RULES:
                 "",
             ).strip()
 
-        text = re.sub(r'<\|tool_call\>call:[^\n]*?<tool_call\|>\.?', '', text, flags=re.IGNORECASE).strip()
+        text = self._strip_tool_call_markup(text)
         return text or ""
 
     # ========================================================
@@ -6768,6 +7512,9 @@ IMPORTANT RULES:
                 "tool_count": len(self.tools.tools),
                 "memory_enabled": self.memory is not None,
                 "personality_loaded": bool(self.system_prompt),
+                "idle_checkin_pending": self._idle_checkin_pending,
+                "idle_checkin_interval_seconds": self.idle_checkin_interval_seconds,
+                "last_user_activity_at": self._last_user_activity_at,
                 "memory_engine": self.memory.verify_integrity(),
                 "level": "NORMAL",
             }

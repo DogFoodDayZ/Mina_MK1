@@ -40,3 +40,23 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     src = args.get("src") or ""
     dst = args.get("dst") or ""
     return file_move_impl(src, dst)
+
+
+tool_entry.schema = {
+    "description": "Move or rename a file from one path to another.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "src": {
+                "type": "string",
+                "description": "Source file path.",
+            },
+            "dst": {
+                "type": "string",
+                "description": "Destination file path.",
+            },
+        },
+        "required": ["src", "dst"],
+        "additionalProperties": False,
+    },
+}

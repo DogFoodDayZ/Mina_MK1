@@ -31,3 +31,23 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     path = args.get("path") or ""
     content = args.get("content") or ""
     return file_append_impl(path, content)
+
+
+tool_entry.schema = {
+    "description": "Append text content to the end of a file, creating it if needed.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "File path to append to.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Content to append to the file.",
+            },
+        },
+        "required": ["path", "content"],
+        "additionalProperties": False,
+    },
+}

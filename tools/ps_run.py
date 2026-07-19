@@ -40,6 +40,9 @@ def _normalize_command(script: str) -> str:
     if lowered in {"memory info", "ram info"}:
         return "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory"
 
+    if "get-physicalmemory" in lowered:
+        return "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory"
+
     if lowered in {"what time is it", "current time", "local time", "time now"}:
         return "Get-Date -Format \"yyyy-MM-dd HH:mm:ss\""
 

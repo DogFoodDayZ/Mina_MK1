@@ -263,3 +263,26 @@ def tool_entry(args):
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+tool_entry.schema = {
+    "description": "Read memory entries relevant to a query.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Memory query text.",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Maximum number of results to return.",
+                "default": 3,
+                "minimum": 1,
+                "maximum": 10,
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}

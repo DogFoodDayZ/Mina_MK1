@@ -13,6 +13,7 @@ class FakeMemory:
         self.writes = []
         self.promotions = []
         self.touches = []
+        self.lookups = []
         self.promoted_items = [
             {
                 "id": 101,
@@ -44,6 +45,14 @@ class FakeMemory:
     def add_memory(self, text, kind="fact", tags=None, meta=None, **kwargs):
         self.writes.append({"text": text, "kind": kind, "tags": tags or []})
         return len(self.writes)
+
+    def find_memory_id_by_text(self, text, include_kinds=None, include_tags=None):
+        self.lookups.append({
+            "text": text,
+            "include_kinds": include_kinds,
+            "include_tags": include_tags,
+        })
+        return None
 
     def auto_promote_short_term(self, seed_text, min_hits=2, recent_window=40, semantic_top_k=8):
         self.promotions.append({
@@ -244,11 +253,53 @@ def test_detect_tool_list_routes_tool_inventory_phrase():
     assert args == {}
 
 
+def test_detect_scratch_note_routes_to_scratch_note_tool():
+    core = MK1Core.__new__(MK1Core)
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "put this in scratch: buy milk and batteries")
+
+    assert tool_name == "__scratch_note__"
+    assert args["text"] == "buy milk and batteries"
+
+
+def test_write_scratch_note_uses_workspace_scratch_dir(tmp_path):
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path)
+
+    captured = {}
+
+    class _FakeTools:
+        def run(self, tool_name, args):
+            captured["tool_name"] = tool_name
+            captured["args"] = dict(args)
+            return {
+                "ok": True,
+                "result": {
+                    "path": args["path"],
+                },
+                "error": None,
+            }
+
+    core.tools = _FakeTools()
+
+    out = MK1Core._write_scratch_note(core, "random scratch note", title_hint="random scratch note")
+
+    assert out["ok"] is True
+    assert captured["tool_name"] == "file_write"
+    assert captured["args"]["path"].startswith(str(tmp_path / "scratch"))
+    assert "random_scratch_note" in captured["args"]["path"]
+    assert "Scratch Note" in captured["args"]["content"]
+
+
 def test_tool_list_reflex_returns_inventory_text_directly():
     core = MK1Core.__new__(MK1Core)
     core.memory = FakeMemory()
     core.tools = SimpleNamespace(
-        tools={"alpha": object(), "beta": object()},
+        tools={"alpha": object(), "beta": object(), "gamma": object()},
+        get_tool_schemas=lambda: [
+            {"function": {"name": "alpha", "description": "Alpha tool does alpha work."}},
+            {"function": {"name": "beta", "description": "Beta tool does beta work."}},
+        ],
         get_status=lambda: {"alpha": "ok", "beta": "ok"},
     )
 
@@ -258,6 +309,33 @@ def test_tool_list_reflex_returns_inventory_text_directly():
     assert text.startswith("Available tools:")
     assert "- alpha" in text
     assert "- beta" in text
+    assert "gamma" not in text
+
+
+def test_seed_tool_inventory_memory_records_available_tools():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    core.tools = SimpleNamespace(
+        tools={
+            "alpha": SimpleNamespace(schema={"description": "Alpha tool does alpha work."}),
+            "beta": SimpleNamespace(schema={"description": "Beta tool does beta work."}),
+        },
+        get_tool_schemas=lambda: [
+            {"function": {"name": "alpha", "description": "Alpha tool does alpha work."}},
+            {"function": {"name": "beta", "description": "Beta tool does beta work."}},
+        ],
+    )
+
+    MK1Core._seed_tool_inventory_memory(core)
+
+    assert len(core.memory.writes) == 1
+    record = core.memory.writes[0]
+    assert record["kind"] == "procedure"
+    assert "tool_inventory" in record["tags"]
+    assert "Mina tool inventory:" in record["text"]
+    assert "alpha" in record["text"]
+    assert "beta" in record["text"]
+    assert "Alpha tool does alpha work." in record["text"]
 
 
 def test_detect_code_execute_for_python_phrase():

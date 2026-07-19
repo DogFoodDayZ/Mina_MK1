@@ -25,3 +25,6 @@ sandbox/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Local secrets
+.env.local

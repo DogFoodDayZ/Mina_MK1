@@ -37,3 +37,19 @@ def file_read_impl(path: str) -> Dict[str, Any]:
 def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     path = args.get("path") or ""
     return file_read_impl(path)
+
+
+tool_entry.schema = {
+    "description": "Read the full text content of a file.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "File path to read.",
+            },
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+}

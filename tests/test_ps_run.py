@@ -3,6 +3,7 @@ sys.path.insert(0, 'e:/Mina_MK1')
 
 from agent.core import MK1Core
 from tools import ps_run
+from tools.powershell import tool_entry as powershell_tool_entry
 from tools.ps_run import tool_entry
 
 
@@ -22,6 +23,25 @@ def test_ps_run_understands_hardware_info_prompt():
     result = tool_entry({'script': 'hardware info'})
     assert result['ok'] is True
     assert result['result']['stdout']
+
+
+def test_ps_run_rewrites_invalid_physical_memory_command():
+    result = tool_entry({'script': 'Get-PhysicalMemory | Select-Object TotalVisibleMemoryInMB'})
+    assert result['ok'] is True
+    assert result['result']['stdout']
+    assert 'TotalVisibleMemory' in result['result']['stdout'] or 'FreePhysicalMemory' in result['result']['stdout']
+
+
+def test_powershell_tool_runs_multiple_commands_in_one_call():
+    result = powershell_tool_entry({
+        'commands': [
+            'Write-Output "alpha"',
+            'Write-Output "beta"',
+        ],
+    })
+    assert result['ok'] is True
+    assert 'alpha' in result['result']['stdout']
+    assert 'beta' in result['result']['stdout']
 
 
 def test_core_detects_system_queries_for_ps_run():

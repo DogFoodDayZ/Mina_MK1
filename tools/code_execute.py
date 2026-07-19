@@ -242,3 +242,37 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
         timeout=timeout,
         check_dangerous=check_dangerous,
     )
+
+
+tool_entry.schema = {
+    "description": "Execute Python or PowerShell code in a sandboxed subprocess.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Source code to execute.",
+            },
+            "language": {
+                "type": "string",
+                "description": "Code language to execute.",
+                "enum": ["python", "powershell", "ps"],
+                "default": "python",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds.",
+                "minimum": 1,
+                "maximum": 120,
+                "default": 30,
+            },
+            "check_dangerous": {
+                "type": "boolean",
+                "description": "Warn on obviously dangerous patterns.",
+                "default": True,
+            },
+        },
+        "required": ["code"],
+        "additionalProperties": False,
+    },
+}

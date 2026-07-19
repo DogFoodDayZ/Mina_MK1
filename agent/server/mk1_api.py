@@ -7,6 +7,7 @@ import ctypes
 import threading
 import json
 import hashlib
+import re
 import wave
 import sys
 import difflib
@@ -19,6 +20,11 @@ import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
+
+try:
+    import winsound  # type: ignore
+except Exception:
+    winsound = None
 
 try:
     import multipart  # type: ignore  # noqa: F401
@@ -96,6 +102,14 @@ def _resolve_tts_rate() -> float:
 # ------------------------------------------------------------
 core = MK1Core()
 app = FastAPI(title="MK1 Core API", version="1.0")
+
+
+@app.on_event("shutdown")
+def _shutdown_core() -> None:
+    try:
+        core.close()
+    except Exception:
+        pass
 
 
 PHONE_HTML = """<!doctype html>
@@ -1004,6 +1018,63 @@ def _play_audio_local_async(path: str) -> dict:
     return {"ok": True, "started": True, "mode": "async", "path": p}
 
 
+def _extract_repeat_seconds(tags: Any) -> Optional[int]:
+    if not isinstance(tags, list):
+        return None
+    for tag in tags:
+        m = re.match(r"^repeat_(\d+)s$", str(tag or "").strip().lower())
+        if not m:
+            continue
+        val = int(m.group(1))
+        if val > 0:
+            return val
+    return None
+
+
+def _task_is_alarm(item: dict) -> bool:
+    tags = item.get("tags")
+    if isinstance(tags, list):
+        lowered = {str(t or "").strip().lower() for t in tags}
+        if "alarm_task" in lowered:
+            return True
+    text = str(item.get("text") or "").strip().lower()
+    return text.startswith("alarm")
+
+
+def _play_alarm_beep_async(repeats: int = 2, frequency_hz: int = 880, duration_ms: int = 250) -> dict:
+    safe_repeats = max(1, min(8, int(repeats)))
+    safe_hz = max(250, min(2400, int(frequency_hz)))
+    safe_duration = max(60, min(1500, int(duration_ms)))
+
+    def _worker() -> None:
+        try:
+            if winsound is not None:
+                for _ in range(safe_repeats):
+                    winsound.Beep(safe_hz, safe_duration)
+                    time.sleep(0.08)
+                return
+        except Exception:
+            pass
+
+        try:
+            for _ in range(safe_repeats):
+                print("\a", end="", flush=True)
+                time.sleep(max(0.08, safe_duration / 1000.0))
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return {
+        "ok": True,
+        "started": True,
+        "mode": "async",
+        "repeats": safe_repeats,
+        "frequency_hz": safe_hz,
+        "duration_ms": safe_duration,
+    }
+
+
 def _transcribe_audio_file(path: str) -> dict:
     """
     Local STT strategy:
@@ -1551,6 +1622,156 @@ def db_status(force_refresh: bool = False):
         core.get_db_status,
         force_refresh=force_refresh,
     )
+
+
+@app.get("/tasks/list")
+def tasks_list(limit: int = 12):
+    safe_limit = max(1, min(50, int(limit)))
+    now_ts = time.time()
+
+    try:
+        if not hasattr(core, "memory"):
+            return {"ok": True, "tasks": [], "due_count": 0, "upcoming_count": 0, "now": now_ts}
+
+        mem = core.memory
+        if not hasattr(mem, "get_task_memories"):
+            return {"ok": True, "tasks": [], "due_count": 0, "upcoming_count": 0, "now": now_ts}
+
+        rows = mem.get_task_memories(top_k=safe_limit, include_done=False)
+        tasks = []
+        due_count = 0
+        upcoming_count = 0
+
+        for item in rows:
+            due_at = item.get("due_at")
+            due = False
+            if due_at is not None:
+                try:
+                    due = float(due_at) <= now_ts
+                except Exception:
+                    due = False
+
+            tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+            repeat_seconds = _extract_repeat_seconds(tags)
+            is_alarm = _task_is_alarm(item)
+
+            if due:
+                due_count += 1
+            else:
+                upcoming_count += 1
+
+            tasks.append(
+                {
+                    "id": item.get("id"),
+                    "text": item.get("text"),
+                    "status": item.get("task_status", "pending"),
+                    "due_at": due_at,
+                    "due": due,
+                    "alarm": is_alarm,
+                    "repeat_seconds": repeat_seconds,
+                    "repeat_minutes": (int(round(float(repeat_seconds) / 60.0)) if repeat_seconds else None),
+                    "beep": bool(is_alarm and due),
+                }
+            )
+
+        tasks.sort(
+            key=lambda t: (
+                0 if t.get("due") else 1,
+                float(t.get("due_at")) if t.get("due_at") is not None else 9e18,
+                int(t.get("id") or 0),
+            )
+        )
+
+        return {
+            "ok": True,
+            "now": now_ts,
+            "due_count": due_count,
+            "upcoming_count": upcoming_count,
+            "tasks": tasks[:safe_limit],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "now": now_ts,
+            "due_count": 0,
+            "upcoming_count": 0,
+            "tasks": [],
+        }
+
+
+@app.post("/tasks/ring_due_alarm")
+def tasks_ring_due_alarm(repeats: int = 2):
+    now_ts = time.time()
+    try:
+        mem = getattr(core, "memory", None)
+        if mem is None or not hasattr(mem, "get_due_tasks"):
+            return {"ok": False, "error": "task_memory_not_available"}
+
+        due_rows = mem.get_due_tasks(top_k=25, include_tags=["scheduled_task"])
+        alarm_row = None
+        for row in due_rows:
+            if _task_is_alarm(row):
+                alarm_row = row
+                break
+
+        if alarm_row is None:
+            return {
+                "ok": True,
+                "played": False,
+                "reason": "no_due_alarm",
+                "now": now_ts,
+            }
+
+        beep_result = _play_alarm_beep_async(repeats=repeats)
+        return {
+            "ok": bool(beep_result.get("ok")),
+            "played": bool(beep_result.get("ok")),
+            "task_id": alarm_row.get("id"),
+            "text": alarm_row.get("text"),
+            "due_at": alarm_row.get("due_at"),
+            "now": now_ts,
+            "beep": beep_result,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "played": False,
+            "error": str(e),
+            "now": now_ts,
+        }
+
+
+@app.post("/tasks/mark_done")
+def tasks_mark_done(task_id: int):
+    try:
+        mem = getattr(core, "memory", None)
+        if mem is None or not hasattr(mem, "set_task_status"):
+            return {"ok": False, "error": "task_status_update_not_supported"}
+
+        ok = bool(mem.set_task_status(int(task_id), "done"))
+        return {"ok": ok, "task_id": int(task_id)}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "task_id": int(task_id)}
+
+
+@app.post("/tasks/snooze")
+def tasks_snooze(task_id: int, minutes: int = 10):
+    try:
+        mem = getattr(core, "memory", None)
+        if mem is None or not hasattr(mem, "snooze_task"):
+            return {"ok": False, "error": "task_snooze_not_supported"}
+
+        safe_minutes = max(1, min(24 * 60, int(minutes)))
+        ok = bool(mem.snooze_task(int(task_id), safe_minutes * 60))
+        return {"ok": ok, "task_id": int(task_id), "minutes": safe_minutes}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "task_id": int(task_id),
+            "minutes": int(minutes),
+        }
 
 
 @app.get("/model/status")

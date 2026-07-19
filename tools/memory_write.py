@@ -97,3 +97,31 @@ def tool_entry(args):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
+tool_entry.schema = {
+    "description": "Write a memory fact, preference, or procedure into Mina's memory store.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "Memory text to store.",
+            },
+            "kind": {
+                "type": "string",
+                "description": "Memory kind such as fact, preference, procedure, or note.",
+                "default": "fact",
+            },
+            "tags": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                },
+                "description": "Optional memory tags.",
+            },
+        },
+        "required": ["text"],
+        "additionalProperties": False,
+    },
+}
+

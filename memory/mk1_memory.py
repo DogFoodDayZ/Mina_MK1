@@ -251,12 +251,22 @@ class MK1Memory:
             kind TEXT NOT NULL,
             tags TEXT,
             timestamp REAL NOT NULL,
+            due_at REAL,
+            task_status TEXT NOT NULL DEFAULT 'stored',
             emb_small BLOB NOT NULL,
             dim_small INTEGER NOT NULL,
             emb_base BLOB NOT NULL,
             dim_base INTEGER NOT NULL
         );
         """)
+
+        # Lightweight migration for older DBs.
+        cur.execute("PRAGMA table_info(memories)")
+        columns = {str(row[1]) for row in cur.fetchall()}
+        if "due_at" not in columns:
+            cur.execute("ALTER TABLE memories ADD COLUMN due_at REAL")
+        if "task_status" not in columns:
+            cur.execute("ALTER TABLE memories ADD COLUMN task_status TEXT NOT NULL DEFAULT 'stored'")
 
         conn.commit()
         conn.close()
@@ -780,13 +790,15 @@ class MK1Memory:
         cur = conn.cursor()
 
         cur.execute("""
-            INSERT INTO memories (text, kind, tags, timestamp, emb_small, dim_small, emb_base, dim_base)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memories (text, kind, tags, timestamp, due_at, task_status, emb_small, dim_small, emb_base, dim_base)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             text,
             kind,
             json.dumps(tags),
             time.time(),
+            kwargs.get("due_at"),
+            str(kwargs.get("task_status") or "stored"),
             vs.tobytes(),
             len(vs),
             vb.tobytes(),
@@ -813,6 +825,167 @@ class MK1Memory:
             self._write_counter = 0
 
         return mem_id
+
+    def add_time_passage_note(self, text: str, tags: Optional[List[str]] = None) -> Optional[int]:
+        base_tags = ["system_seed", "time_tick"]
+        if tags:
+            for tag in tags:
+                if tag and tag not in base_tags:
+                    base_tags.append(tag)
+        return self.add_memory(
+            text,
+            kind="procedure",
+            tags=base_tags,
+            task_status="stored",
+        )
+
+    def add_task_memory(
+        self,
+        text: str,
+        due_at: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+        status: str = "pending",
+    ) -> Optional[int]:
+        task_tags = ["scheduled_task"]
+        if tags:
+            for tag in tags:
+                if tag and tag not in task_tags:
+                    task_tags.append(tag)
+        return self.add_memory(
+            text,
+            kind="task",
+            tags=task_tags,
+            due_at=due_at,
+            task_status=status,
+        )
+
+    def get_due_tasks(
+        self,
+        now_ts: Optional[float] = None,
+        top_k: int = 10,
+        include_tags: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        now_val = float(now_ts if now_ts is not None else time.time())
+        safe_limit = max(1, int(top_k))
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, text, kind, tags, timestamp, due_at, task_status FROM memories WHERE kind = 'task' AND due_at IS NOT NULL AND due_at <= ? ORDER BY due_at ASC LIMIT ?",
+            (now_val, safe_limit * 4),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            row_tags = json.loads(row[3]) if row[3] else []
+            if include_tags and not any(tag in row_tags for tag in include_tags):
+                continue
+            if str(row[6] or "pending").lower() == "done":
+                continue
+            out.append({
+                "id": row[0],
+                "text": row[1],
+                "kind": row[2],
+                "tags": row_tags,
+                "timestamp": row[4],
+                "due_at": row[5],
+                "task_status": row[6],
+            })
+            if len(out) >= safe_limit:
+                break
+
+        return out
+
+    def get_task_memories(
+        self,
+        top_k: int = 20,
+        include_done: bool = False,
+    ) -> List[Dict[str, Any]]:
+        safe_limit = max(1, int(top_k))
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, text, kind, tags, timestamp, due_at, task_status FROM memories WHERE kind = 'task' ORDER BY CASE WHEN due_at IS NULL THEN 1 ELSE 0 END, due_at ASC, timestamp DESC LIMIT ?",
+            (safe_limit * 4,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            status = str(row[6] or "pending").lower()
+            if not include_done and status == "done":
+                continue
+
+            row_tags = json.loads(row[3]) if row[3] else []
+            out.append({
+                "id": row[0],
+                "text": row[1],
+                "kind": row[2],
+                "tags": row_tags,
+                "timestamp": row[4],
+                "due_at": row[5],
+                "task_status": status,
+            })
+
+            if len(out) >= safe_limit:
+                break
+
+        return out
+
+    def set_task_status(self, task_id: int, status: str) -> bool:
+        try:
+            safe_status = str(status or "pending").strip().lower()
+            if safe_status not in {"pending", "done", "cancelled"}:
+                safe_status = "pending"
+
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE memories SET task_status = ?, timestamp = ? WHERE id = ? AND kind = 'task'",
+                (safe_status, time.time(), int(task_id)),
+            )
+            conn.commit()
+            updated = int(cur.rowcount or 0) > 0
+            conn.close()
+            return updated
+        except Exception as e:
+            self._set_error(f"set_task_status_error: {e}")
+            return False
+
+    def snooze_task(self, task_id: int, seconds: int) -> bool:
+        try:
+            delta = max(1, int(seconds))
+
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT due_at FROM memories WHERE id = ? AND kind = 'task'",
+                (int(task_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.close()
+                return False
+
+            current_due = row[0]
+            base_due = float(current_due) if current_due is not None else time.time()
+            new_due = max(base_due, time.time()) + float(delta)
+
+            cur.execute(
+                "UPDATE memories SET due_at = ?, task_status = 'pending', timestamp = ? WHERE id = ? AND kind = 'task'",
+                (new_due, time.time(), int(task_id)),
+            )
+            conn.commit()
+            updated = int(cur.rowcount or 0) > 0
+            conn.close()
+            return updated
+        except Exception as e:
+            self._set_error(f"snooze_task_error: {e}")
+            return False
 
     # ================= SEARCH / CONTEXT =================
 

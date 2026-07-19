@@ -39,6 +39,33 @@ class LMStudioClient:
             "local-model",
         )
 
+        self.load_endpoint = str(
+            model_cfg.get(
+                "load_endpoint",
+                "",
+            )
+            or ""
+        ).strip()
+
+        fallback_raw = model_cfg.get("fallback_models", [])
+        if isinstance(fallback_raw, list):
+            self.fallback_models = [
+                str(x).strip()
+                for x in fallback_raw
+                if str(x).strip()
+            ]
+        elif isinstance(fallback_raw, str) and fallback_raw.strip():
+            self.fallback_models = [x.strip() for x in fallback_raw.split(",") if x.strip()]
+        else:
+            self.fallback_models = []
+
+        self.auto_fallback_on_error = bool(
+            model_cfg.get(
+                "auto_fallback_on_error",
+                str(os.getenv("MK1_AUTO_MODEL_FALLBACK", "1")).strip().lower() in {"1", "true", "yes", "on"},
+            )
+        )
+
         self._vision_support_cache_value: Optional[bool] = None
         self._vision_support_cache_until: float = 0.0
         self._vision_support_cache_ttl: float = float(os.getenv("MK1_VISION_CHECK_TTL", "30"))
@@ -57,6 +84,9 @@ class LMStudioClient:
 
     def _has_system_messages(self, messages: List[Dict[str, Any]]) -> bool:
         return any(str(m.get("role", "")).strip().lower() == "system" for m in (messages or []))
+
+    def _system_message_count(self, messages: List[Dict[str, Any]]) -> int:
+        return sum(1 for m in (messages or []) if str(m.get("role", "")).strip().lower() == "system")
 
     def _extract_text_content(self, content: Any) -> str:
         if isinstance(content, str):
@@ -138,6 +168,39 @@ class LMStudioClient:
 
         return non_system
 
+    def _coalesce_system_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Merge all system messages into one leading system message.
+
+        Some chat templates support a single optional system message and then
+        require strict role alternation. This preserves system semantics while
+        avoiding invalid multi-system sequences.
+        """
+        if not messages:
+            return []
+
+        system_parts: List[str] = []
+        non_system: List[Dict[str, Any]] = []
+
+        for m in messages:
+            role = str(m.get("role", "")).strip().lower()
+            if role == "system":
+                txt = self._extract_text_content(m.get("content"))
+                if txt.strip():
+                    system_parts.append(txt.strip())
+                continue
+            non_system.append(dict(m))
+
+        if not system_parts:
+            return [dict(m) for m in messages]
+
+        merged_system = {
+            "role": "system",
+            "content": "\n\n".join(system_parts).strip(),
+        }
+
+        return [merged_system] + non_system
+
     def _is_system_role_unsupported_error(self, body_text: str) -> bool:
         low = str(body_text or "").lower()
         markers = [
@@ -148,6 +211,69 @@ class LMStudioClient:
             "automatic parser generation failed",
         ]
         return any(m in low for m in markers)
+
+    def _is_retryable_model_error(self, error_text: str) -> bool:
+        low = str(error_text or "").lower()
+        markers = [
+            "channel error",
+            "failed to create completion",
+            "model not loaded",
+            "no model loaded",
+            "context canceled",
+            "broken pipe",
+            "connection reset",
+            "read timed out",
+            "502 bad gateway",
+            "503 service unavailable",
+            "504 gateway timeout",
+            "backend error",
+        ]
+        return any(m in low for m in markers)
+
+    def _candidate_models(self, requested_model: str) -> List[str]:
+        out: List[str] = []
+        seen = set()
+
+        def _add(name: str) -> None:
+            n = str(name or "").strip()
+            if not n:
+                return
+            key = n.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(n)
+
+        _add(requested_model)
+        for m in self.fallback_models:
+            _add(m)
+
+        env_fallbacks = str(os.getenv("MK1_MODEL_FALLBACKS", "") or "").strip()
+        if env_fallbacks:
+            for m in env_fallbacks.split(","):
+                _add(m)
+
+        return out
+
+    def _try_load_model(self, model_name: str) -> bool:
+        endpoint = str(self.load_endpoint or "").strip()
+        if not endpoint:
+            return False
+
+        payload_candidates = [
+            {"model": model_name},
+            {"identifier": model_name},
+            {"id": model_name},
+        ]
+        for payload in payload_candidates:
+            try:
+                resp = requests.post(endpoint, json=payload, timeout=30)
+                if resp.status_code < 400:
+                    return True
+            except Exception:
+                continue
+
+        return False
 
     def _supports_vision_by_name(self) -> bool:
         model_name = str(self.default_model or "").lower()
@@ -305,6 +431,11 @@ class LMStudioClient:
             "stream": False,
         }
 
+        # Normalize role layout for templates that allow only one optional
+        # system message before user/assistant alternation.
+        if self._system_message_count(payload.get("messages", [])) > 1:
+            payload["messages"] = self._coalesce_system_messages(payload.get("messages", []))
+
         # Add tools if provided
         if tools:
             payload["tools"] = tools
@@ -322,100 +453,138 @@ class LMStudioClient:
         print("URL:")
         print(self.chat_url)
 
-        try:
+        attempted_models = self._candidate_models(str(payload.get("model") or self.default_model))
+        if not attempted_models:
+            attempted_models = [str(self.default_model or "local-model")]
 
-            resp = requests.post(
-                self.chat_url,
-                json=payload,
-                timeout=120,
-            )
+        last_error: Optional[Exception] = None
+        last_error_text = ""
 
-            # Some OpenAI-compatible backends may not accept reasoning_effort.
-            if resp.status_code >= 400 and "reasoning_effort" in payload:
-                lowered = ""
-                try:
-                    lowered = (resp.text or "").lower()
-                except Exception:
-                    lowered = ""
-
-                unsupported_markers = [
-                    "reasoning_effort",
-                    "unknown field",
-                    "unrecognized",
-                    "unexpected",
-                    "invalid request",
-                ]
-                if any(m in lowered for m in unsupported_markers):
-                    retry_payload = dict(payload)
-                    retry_payload.pop("reasoning_effort", None)
-                    resp = requests.post(
-                        self.chat_url,
-                        json=retry_payload,
-                        timeout=120,
-                    )
-
-            # Some templates reject system role entirely (e.g. specific GGUF chat templates).
-            if resp.status_code >= 400 and self._has_system_messages(payload.get("messages", [])):
-                body = ""
-                try:
-                    body = resp.text or ""
-                except Exception:
-                    body = ""
-
-                if self._is_system_role_unsupported_error(body):
-                    retry_payload = dict(payload)
-                    retry_payload["messages"] = self._flatten_system_messages(payload.get("messages", []))
-                    resp = requests.post(
-                        self.chat_url,
-                        json=retry_payload,
-                        timeout=120,
-                    )
-
-            print("\n========================================")
-            print("LM STUDIO STATUS")
-            print("========================================")
-            print(resp.status_code)
-
-            resp.raise_for_status()
-
-            data = resp.json()
-
-            # Strip reasoning traces from all choices and nested payloads.
-            def _scrub_reasoning(obj: Any) -> Any:
-                if isinstance(obj, dict):
-                    obj = dict(obj)
-                    obj.pop("reasoning_content", None)
-                    for k, v in list(obj.items()):
-                        obj[k] = _scrub_reasoning(v)
-                    return obj
-                if isinstance(obj, list):
-                    return [_scrub_reasoning(x) for x in obj]
-                return obj
+        for model_idx, model_name in enumerate(attempted_models):
+            attempt_payload = dict(payload)
+            attempt_payload["model"] = model_name
 
             try:
-                data = _scrub_reasoning(data)
-            except Exception:
-                pass
+                resp = requests.post(
+                    self.chat_url,
+                    json=attempt_payload,
+                    timeout=120,
+                )
 
-            return data
+                # Some OpenAI-compatible backends may not accept reasoning_effort.
+                if resp.status_code >= 400 and "reasoning_effort" in attempt_payload:
+                    lowered = ""
+                    try:
+                        lowered = (resp.text or "").lower()
+                    except Exception:
+                        lowered = ""
 
-        except Exception as e:
+                    unsupported_markers = [
+                        "reasoning_effort",
+                        "unknown field",
+                        "unrecognized",
+                        "unexpected",
+                        "invalid request",
+                    ]
+                    if any(m in lowered for m in unsupported_markers):
+                        retry_payload = dict(attempt_payload)
+                        retry_payload.pop("reasoning_effort", None)
+                        resp = requests.post(
+                            self.chat_url,
+                            json=retry_payload,
+                            timeout=120,
+                        )
 
-            print("\n========================================")
-            print("LM STUDIO ERROR")
-            print("========================================")
+                # Some templates reject system role entirely (e.g. specific GGUF chat templates).
+                if resp.status_code >= 400 and self._has_system_messages(attempt_payload.get("messages", [])):
+                    body = ""
+                    try:
+                        body = resp.text or ""
+                    except Exception:
+                        body = ""
 
-            traceback.print_exc()
+                    if self._is_system_role_unsupported_error(body):
+                        retry_payload = dict(attempt_payload)
+                        retry_payload["messages"] = self._flatten_system_messages(attempt_payload.get("messages", []))
+                        resp = requests.post(
+                            self.chat_url,
+                            json=retry_payload,
+                            timeout=120,
+                        )
 
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": f"(LM Studio error: {str(e)})"
-                        }
+                # If backend channel/model state is broken, try a model load once and retry.
+                if resp.status_code >= 400 and self._is_retryable_model_error(resp.text or ""):
+                    if self._try_load_model(model_name):
+                        resp = requests.post(
+                            self.chat_url,
+                            json=attempt_payload,
+                            timeout=120,
+                        )
+
+                print("\n========================================")
+                print("LM STUDIO STATUS")
+                print("========================================")
+                print(resp.status_code)
+
+                resp.raise_for_status()
+
+                data = resp.json()
+
+                # Strip reasoning traces from all choices and nested payloads.
+                def _scrub_reasoning(obj: Any) -> Any:
+                    if isinstance(obj, dict):
+                        obj = dict(obj)
+                        obj.pop("reasoning_content", None)
+                        for k, v in list(obj.items()):
+                            obj[k] = _scrub_reasoning(v)
+                        return obj
+                    if isinstance(obj, list):
+                        return [_scrub_reasoning(x) for x in obj]
+                    return obj
+
+                try:
+                    data = _scrub_reasoning(data)
+                except Exception:
+                    pass
+
+                if model_idx > 0 and model_name != self.default_model:
+                    print(f"LM STUDIO MODEL FALLBACK: switched from '{self.default_model}' to '{model_name}'")
+                    self.default_model = model_name
+
+                return data
+
+            except Exception as e:
+                last_error = e
+                err_text = str(e)
+                try:
+                    resp_obj = getattr(e, "response", None)
+                    if isinstance(e, requests.HTTPError) and resp_obj is not None:
+                        err_text = f"{err_text} | {str(getattr(resp_obj, 'text', '') or '')}"
+                except Exception:
+                    pass
+                last_error_text = err_text
+
+                if (not self.auto_fallback_on_error) or (not self._is_retryable_model_error(err_text)):
+                    break
+
+                # Continue to next fallback model on retryable backend/model failures.
+                continue
+
+        print("\n========================================")
+        print("LM STUDIO ERROR")
+        print("========================================")
+        traceback.print_exc()
+
+        final_msg = last_error_text or (str(last_error) if last_error is not None else "unknown error")
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": f"(LM Studio error: {final_msg})"
                     }
-                ]
-            }
+                }
+            ]
+        }
 
     def chat_stream(
         self,
@@ -431,93 +600,124 @@ class LMStudioClient:
             "stream": True,
         }
 
+        # Normalize role layout for templates that allow only one optional
+        # system message before user/assistant alternation.
+        if self._system_message_count(payload.get("messages", [])) > 1:
+            payload["messages"] = self._coalesce_system_messages(payload.get("messages", []))
+
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
-        attempts = [dict(payload)]
-        if self._has_system_messages(payload.get("messages", [])):
-            fallback_payload = dict(payload)
-            fallback_payload["messages"] = self._flatten_system_messages(payload.get("messages", []))
-            attempts.append(fallback_payload)
+        attempted_models = self._candidate_models(str(payload.get("model") or self.default_model))
+        if not attempted_models:
+            attempted_models = [str(self.default_model or "local-model")]
 
         last_http_error: Optional[Exception] = None
 
-        for idx, attempt in enumerate(attempts):
-            resp = requests.post(
-                self.chat_url,
-                json=attempt,
-                stream=True,
-                timeout=180,
-            )
-            try:
-                if resp.status_code >= 400:
-                    body = ""
-                    try:
-                        body = resp.text or ""
-                    except Exception:
+        for model_idx, model_name in enumerate(attempted_models):
+            attempt_base = dict(payload)
+            attempt_base["model"] = model_name
+
+            attempts = [dict(attempt_base)]
+            if self._has_system_messages(attempt_base.get("messages", [])):
+                fallback_payload = dict(attempt_base)
+                fallback_payload["messages"] = self._flatten_system_messages(attempt_base.get("messages", []))
+                attempts.append(fallback_payload)
+
+            for idx, attempt in enumerate(attempts):
+                resp = requests.post(
+                    self.chat_url,
+                    json=attempt,
+                    stream=True,
+                    timeout=180,
+                )
+                try:
+                    if resp.status_code >= 400:
                         body = ""
+                        try:
+                            body = resp.text or ""
+                        except Exception:
+                            body = ""
 
-                    if (
-                        idx == 0
-                        and len(attempts) > 1
-                        and self._is_system_role_unsupported_error(body)
-                    ):
-                        continue
+                        if (
+                            idx == 0
+                            and len(attempts) > 1
+                            and self._is_system_role_unsupported_error(body)
+                        ):
+                            continue
 
-                    resp.raise_for_status()
+                        if self._is_retryable_model_error(body) and self._try_load_model(model_name):
+                            resp.close()
+                            resp = requests.post(
+                                self.chat_url,
+                                json=attempt,
+                                stream=True,
+                                timeout=180,
+                            )
 
-                for raw_line in resp.iter_lines(decode_unicode=True):
-                    if not raw_line:
-                        continue
+                        resp.raise_for_status()
 
-                    line = str(raw_line).strip()
-                    if not line:
-                        continue
+                    for raw_line in resp.iter_lines(decode_unicode=True):
+                        if not raw_line:
+                            continue
 
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
+                        line = str(raw_line).strip()
+                        if not line:
+                            continue
 
-                    if line == "[DONE]":
-                        break
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
 
-                    try:
-                        item = json.loads(line)
-                    except Exception:
-                        continue
+                        if line == "[DONE]":
+                            break
 
-                    choices = item.get("choices") or []
-                    if not choices:
-                        continue
+                        try:
+                            item = json.loads(line)
+                        except Exception:
+                            continue
 
-                    choice0 = choices[0] if isinstance(choices[0], dict) else {}
-                    delta = choice0.get("delta") if isinstance(choice0, dict) else {}
+                        choices = item.get("choices") or []
+                        if not choices:
+                            continue
 
-                    piece = ""
-                    if isinstance(delta, dict):
-                        content = delta.get("content")
-                        if isinstance(content, str):
-                            piece = content
-                        elif isinstance(content, list):
-                            out_parts: List[str] = []
-                            for part in content:
-                                if isinstance(part, dict):
-                                    txt = part.get("text")
-                                    if isinstance(txt, str) and txt:
-                                        out_parts.append(txt)
-                            piece = "".join(out_parts)
+                        choice0 = choices[0] if isinstance(choices[0], dict) else {}
+                        delta = choice0.get("delta") if isinstance(choice0, dict) else {}
 
-                    if not piece and isinstance(choice0.get("text"), str):
-                        piece = str(choice0.get("text"))
+                        piece = ""
+                        if isinstance(delta, dict):
+                            content = delta.get("content")
+                            if isinstance(content, str):
+                                piece = content
+                            elif isinstance(content, list):
+                                out_parts: List[str] = []
+                                for part in content:
+                                    if isinstance(part, dict):
+                                        txt = part.get("text")
+                                        if isinstance(txt, str) and txt:
+                                            out_parts.append(txt)
+                                piece = "".join(out_parts)
 
-                    if piece:
-                        yield piece
+                        if not piece and isinstance(choice0.get("text"), str):
+                            piece = str(choice0.get("text"))
 
-                return
-            except Exception as e:
-                last_http_error = e
-            finally:
-                resp.close()
+                        if piece:
+                            yield piece
+
+                    if model_idx > 0 and model_name != self.default_model:
+                        print(f"LM STUDIO MODEL FALLBACK: switched from '{self.default_model}' to '{model_name}'")
+                        self.default_model = model_name
+                    return
+                except Exception as e:
+                    last_http_error = e
+                finally:
+                    resp.close()
+
+            if not self.auto_fallback_on_error:
+                break
+
+            if last_http_error is None or not self._is_retryable_model_error(str(last_http_error)):
+                break
 
         if last_http_error is not None:
             raise last_http_error
@@ -660,10 +860,28 @@ class MK1Core:
                 "http://127.0.0.1:1234/v1/chat/",
             ),
 
+            "load_endpoint": self.config.get(
+                "model",
+                "load_endpoint",
+                "",
+            ),
+
             "default_model": self.config.get(
                 "model",
                 "default_model",
                 "local-model",
+            ),
+
+            "fallback_models": self.config.get(
+                "model",
+                "fallback_models",
+                self.config.get("model", "switch_allowed", []),
+            ),
+
+            "auto_fallback_on_error": self.config.get(
+                "model",
+                "auto_fallback_on_error",
+                True,
             ),
 
             # Pass through vision tuning from config so image replies are not
@@ -970,15 +1188,110 @@ class MK1Core:
 
     def _tool_call_pattern(self) -> re.Pattern:
         return re.compile(
-            r'(?:<\|tool_call\>|<\|[\w.-]+\|)\s*call:(\w+)\{([\s\S]*?)\}(?:<tool_call\|>|\|>|>)',
+            r'(?:<\|tool_call\>|<\|[\w.-]+\||\|?<spotify_link>)\s*call:(\w+)\{([\s\S]*?)\}(?:<tool_call\|>|\|>|>|</spotify_link>\|?)',
             flags=re.IGNORECASE,
         )
+
+    def _extract_tool_calls_from_text(self, text: str) -> List[Tuple[str, str]]:
+        content = str(text or "")
+        if not content.strip():
+            return []
+
+        out: List[Tuple[str, str]] = []
+        seen = set()
+
+        def _add(name: str, args: str) -> None:
+            n = str(name or "").strip()
+            a = str(args or "").strip()
+            if not n:
+                return
+            key = (n.lower(), a)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append((n, a))
+
+        for name, args in re.findall(self._tool_call_pattern(), content):
+            _add(name, args)
+
+        # Fallback for malformed wrappers seen in the wild, e.g.
+        # |：<spotify_link{library:"true", track_selection:"random"}>|
+        for args in re.findall(
+            r"[|｜]?\s*[：:]?\s*<\s*spotify_link\s*\{([\s\S]*?)\}\s*>\s*[|｜]?",
+            content,
+            flags=re.IGNORECASE,
+        ):
+            _add("spotify_link", args)
+
+        # Fallback for plain call:name{...} emitted without wrappers.
+        for name, args in re.findall(
+            r"\bcall\s*:\s*([A-Za-z_][\w.-]*)\s*\{([\s\S]*?)\}",
+            content,
+            flags=re.IGNORECASE,
+        ):
+            _add(name, args)
+
+        # Fallback for bare spotify_link{...}.
+        for args in re.findall(r"spotify_link\s*\{([\s\S]*?)\}", content, flags=re.IGNORECASE):
+            _add("spotify_link", args)
+
+        return out
+
+    def _parse_tool_args(self, args_str: str) -> Dict[str, Any]:
+        text = str(args_str or "").strip()
+        if not text:
+            return {}
+
+        out: Dict[str, Any] = {}
+        for m in re.finditer(
+            r"([A-Za-z_][\w.-]*)\s*:\s*(\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|[^,{}]+)",
+            text,
+        ):
+            key = m.group(1).strip()
+            raw = m.group(2).strip()
+            val: Any = raw
+
+            if len(raw) >= 2 and ((raw[0] == '"' and raw[-1] == '"') or (raw[0] == "'" and raw[-1] == "'")):
+                inner = raw[1:-1]
+                val = bytes(inner, "utf-8").decode("unicode_escape")
+            else:
+                low = raw.lower()
+                if low in {"true", "false"}:
+                    val = low == "true"
+                elif re.fullmatch(r"-?\d+", raw):
+                    try:
+                        val = int(raw)
+                    except Exception:
+                        val = raw
+                elif re.fullmatch(r"-?\d+\.\d+", raw):
+                    try:
+                        val = float(raw)
+                    except Exception:
+                        val = raw
+
+            out[key] = val
+
+        return out
 
     def _strip_tool_call_markup(self, text: str) -> str:
         cleaned = (text or "").strip()
         if not cleaned:
             return ""
-        return self._tool_call_pattern().sub("", cleaned).strip()
+        cleaned = self._tool_call_pattern().sub("", cleaned)
+        cleaned = re.sub(
+            r"[|｜]?\s*[：:]?\s*<\s*spotify_link\s*\{[\s\S]*?\}\s*>\s*[|｜]?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\bcall\s*:\s*[A-Za-z_][\w.-]*\s*\{[\s\S]*?\}",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
 
     def _with_mina_flair(self, text: str, tool_name: str = "") -> str:
         out = (text or "").strip()
@@ -1079,6 +1392,9 @@ class MK1Core:
         tool_ok: bool,
     ) -> str:
         if tool_name == "__tool_list__":
+            return formatted
+
+        if tool_name == "spotify_link":
             return formatted
 
         if tool_name == "file_read" and not self._wants_grounded_tool_analysis(user_input):
@@ -4257,13 +4573,14 @@ class MK1Core:
                 message = choice.get("message", {})
                 text_content = message.get("content", "") or choice.get("text", "")
                 
-                # Parse Gemma custom tool format
-                matches = re.findall(tool_pattern, text_content)
+                # Parse tool format. Some models emit malformed variants like
+                # <spotify_link{library:"true", track_selection:"random"}>.
+                matches = self._extract_tool_calls_from_text(text_content)
                 
                 if matches and text_content != last_assistant_content:
                     # Found new tool calls - prevent infinite loops on same content
                     last_assistant_content = text_content
-                    cleaned_content = tool_pattern.sub("", text_content).strip()
+                    cleaned_content = self._strip_tool_call_markup(text_content)
                     
                     messages.append({
                         "role": "assistant",
@@ -4272,15 +4589,32 @@ class MK1Core:
                     
                     # Execute each tool
                     for tool_name, args_str in matches:
-                        tool_args = {}
-                        try:
-                            for pair in args_str.split(", "):
-                                if ":" in pair:
-                                    k, v = pair.split(":", 1)
-                                    v = v.strip().strip('"\'')
-                                    tool_args[k.strip()] = v
-                        except:
-                            pass
+                        tool_args = self._parse_tool_args(args_str)
+
+                        # Support shorthand spotify action calls such as
+                        # call:play_track{library:'favorites'} emitted by some models.
+                        if tool_name in {
+                            "play_track",
+                            "play_playlist",
+                            "pause",
+                            "stop",
+                            "shuffle_on",
+                            "shuffle_off",
+                            "set_shuffle",
+                            "favorites_list",
+                            "liked_songs",
+                            "play_favorite",
+                            "search_track",
+                            "list_playlists",
+                            "playlist_tracks",
+                            "current_playback",
+                            "create_playlist",
+                            "add_track_to_playlist",
+                            "add_tracks_to_playlist",
+                            "connect_status",
+                        } and "spotify_link" in getattr(self.tools, "tools", {}):
+                            tool_args.setdefault("action", tool_name)
+                            tool_name = "spotify_link"
                         
                         print(f"\n>>> TOOL CALL: {tool_name} {tool_args}")
                         tool_result = self.tools.run(tool_name, tool_args)
@@ -4478,18 +4812,7 @@ class MK1Core:
                 yield piece
 
             final_text = self._clean_response_text("".join(parts)).strip()
-            final_text = re.sub(
-                r'<\|tool_call\>call:[^\n]*?<tool_call\|>\.?',
-                '',
-                final_text,
-                flags=re.IGNORECASE,
-            ).strip()
-            final_text = re.sub(
-                r'(?:<\|[^|>\n]+\|)\s*call:[^\n]*?\|>\.?',
-                '',
-                final_text,
-                flags=re.IGNORECASE,
-            ).strip()
+            final_text = self._strip_tool_call_markup(final_text)
 
             if not final_text:
                 # Fallback in case backend didn't emit stream chunks.
@@ -5290,6 +5613,57 @@ class MK1Core:
 
             return "\n".join(lines)
 
+        if tool_name == "spotify_link":
+            if not result.get("ok"):
+                err = str(result.get("error") or "spotify_error")
+                payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+                hint = str(payload.get("self_heal_hint") or "").strip()
+                if hint:
+                    return f"Spotify request failed: {err}. {hint}"
+                return f"Spotify request failed: {err}"
+
+            payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+            status = str(payload.get("status") or "").strip().lower()
+
+            # Most common happy-path payload for favorites/search play.
+            played = payload.get("played") if isinstance(payload.get("played"), dict) else None
+            if isinstance(played, dict):
+                name = str(played.get("name") or "").strip()
+                artists = played.get("artists") if isinstance(played.get("artists"), list) else []
+                artist_text = ", ".join([str(a).strip() for a in artists if str(a).strip()])
+                if status == "already_playing":
+                    if name and artist_text:
+                        return f"Already playing {name} by {artist_text}."
+                    if name:
+                        return f"Already playing {name}."
+                if name and artist_text:
+                    return f"Playing {name} by {artist_text}."
+                if name:
+                    return f"Playing {name}."
+
+            track = payload.get("track") if isinstance(payload.get("track"), dict) else None
+            if isinstance(track, dict):
+                name = str(track.get("name") or "").strip()
+                artists = track.get("artists") if isinstance(track.get("artists"), list) else []
+                artist_text = ", ".join([str(a).strip() for a in artists if str(a).strip()])
+                if name and artist_text:
+                    return f"Now playing {name} by {artist_text}."
+                if name:
+                    return f"Now playing {name}."
+
+            if payload.get("connected") is True:
+                return "Spotify is connected."
+
+            if "devices" in payload and isinstance(payload.get("devices"), list):
+                return f"Found {len(payload.get('devices') or [])} Spotify device(s)."
+
+            if status in {"play_started", "playing"}:
+                return "Spotify playback started."
+            if status in {"paused"}:
+                return "Spotify playback paused."
+
+            return "Spotify command completed."
+
         if tool_name == "ps_run":
             if not result.get("ok"):
                 return f"PowerShell execution failed: {result.get('error')}"
@@ -5686,6 +6060,7 @@ class MK1Core:
             "github_repo",
             "ps_run",
             "code_execute",
+            "spotify_link",
         ):
             content = self._render_tool_response_as_mina(
                 messages=messages,
@@ -5777,6 +6152,58 @@ IMPORTANT RULES:
 
         if t.startswith("please "):
             t = t[7:].strip()
+
+        # ====================================================
+        # SPOTIFY INTENT (DIRECT ROUTING)
+        # ====================================================
+        spotify_mentioned = re.search(r"\b(?:spotify|sportify|spotfiy|spotfy|spotifi)\b", t) is not None
+        if spotify_mentioned and "spotify_link" in getattr(self.tools, "tools", {}):
+            quoted_parts = re.findall(r'["\']([^"\']+)["\']', raw_text)
+            quoted_track = quoted_parts[0].strip() if quoted_parts else ""
+
+            def _extract_track_query(src: str) -> str:
+                s = str(src or "").strip()
+                if not s:
+                    return ""
+                # play <track> on spotify
+                m = re.search(r"\bplay\s+(.+?)\s+on\s+(?:spotify|sportify|spotfiy|spotfy|spotifi)\b", s, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip().strip('"\'')
+                # place <track> on spotify (ASR typo)
+                m = re.search(r"\bplace\s+(.+?)\s+on\s+(?:spotify|sportify|spotfiy|spotfy|spotifi)\b", s, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip().strip('"\'')
+                # play <track>
+                m = re.search(r"\bplay\s+(.+)$", s, re.IGNORECASE)
+                if m:
+                    tail = m.group(1)
+                    tail = re.sub(r"\bon\s+(?:spotify|sportify|spotfiy|spotfy|spotifi)\b", "", tail, flags=re.IGNORECASE).strip()
+                    return tail.strip('"\'')
+                return ""
+
+            if re.search(r"\b(what\s+song|what\s+is\s+playing|what\'?s\s+playing|now\s+playing|current\s+song)\b", t):
+                return "spotify_link", {"action": "current_playback"}
+
+            if re.search(r"\b(pause|stop)\b", t):
+                return "spotify_link", {"action": "pause"}
+
+            if re.search(r"\b(resume|continue|unpause)\b", t):
+                return "spotify_link", {"action": "resume"}
+
+            if re.search(r"\b(play|place)\b", t):
+                track_query = quoted_track or _extract_track_query(raw_text)
+                if re.search(r"\b(favorites?|favourites?|liked|library)\b", t):
+                    return "spotify_link", {
+                        "action": "play_favorite",
+                        "track_query": track_query,
+                        "track_selection": "exact" if track_query else "random",
+                    }
+                if track_query:
+                    return "spotify_link", {
+                        "action": "play_track",
+                        "track_query": track_query,
+                    }
+                return "spotify_link", {"action": "play"}
 
         # ====================================================
         # IDENTITY REFLEX

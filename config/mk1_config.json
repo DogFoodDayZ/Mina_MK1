@@ -3,9 +3,13 @@
     "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
     "load_endpoint": "http://127.0.0.1:1234/api/v1/models/load",
     "default_model": "qwen2.5-7b-instruct",
+    "auto_fallback_on_error": true,
+    "fallback_models": [
+      "qwen2.5-7b-instruct",
+      "mistral-nemo-2407-12b-thinking-claude-gemini-gpt5.2-uncensored-heretic"
+    ],
     "switch_allowed": [
       "qwen2.5-7b-instruct",
-      "google/gemma-4-12b-qat",
       "mistral-nemo-2407-12b-thinking-claude-gemini-gpt5.2-uncensored-heretic",
       "dirty-muse-writer-v01-uncensored-erotica-nsfw-i1"
     ],
@@ -51,6 +55,9 @@
   },
   "voice": {
     "tts_rate": 1.2
+  },
+  "spotify": {
+    "default_public": false
   },
   "gui": {
     "fancy_dir": "C:\\dev\\mina-gui",

@@ -13,12 +13,13 @@ import sys
 import difflib
 from collections import deque
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Optional
 
 import uvicorn
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 try:
@@ -118,6 +119,10 @@ PHONE_HTML = """<!doctype html>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Mina Phone Link</title>
+    <meta name="theme-color" content="#06090a" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/phone/manifest.json" />
     <style>
         :root {
             --bg: #06090a;
@@ -525,6 +530,11 @@ PHONE_HTML = """<!doctype html>
 
         setAvatarFrame('idle');
         setVoiceBadge();
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/phone/sw.js').catch(() => {});
+            });
+        }
         checkApi();
         setInterval(checkApi, 5000);
         addRow('mina', 'MINA: Phone link online.');
@@ -537,6 +547,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RESTORE_SCRIPT = PROJECT_ROOT / "restore" / "restore.py"
 VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 START_API_SCRIPT = PROJECT_ROOT / "start_mk1_api.ps1"
+VOICE_MONITOR_PID_FILE = PROJECT_ROOT / ".mk1_voice_monitor.pid"
+VOICE_MONITOR_LOG_FILE = PROJECT_ROOT / "logs" / "voice_monitor.log"
 CONFIG_GUI_DIR = str(getattr(core, "config", None).get("gui", "fancy_dir", "") if getattr(core, "config", None) else "").strip()
 FANCY_GUI_DIR = Path(os.getenv("MK1_FANCY_GUI_DIR", CONFIG_GUI_DIR or "C:/dev/mina-gui"))
 FANCY_AVATAR_FILES = {
@@ -574,6 +586,88 @@ _process_dedupe_cache = {
 }
 
 
+def _read_pid_file(path: Path) -> Optional[int]:
+    try:
+        if not path.exists():
+            return None
+        raw = path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not raw:
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid is None or int(pid) <= 0:
+        return False
+    try:
+        # os.kill(pid, 0) is a non-destructive existence check.
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _voice_monitor_status() -> dict:
+    pid = _read_pid_file(VOICE_MONITOR_PID_FILE)
+    running = _pid_is_running(pid) if pid is not None else False
+
+    log_exists = VOICE_MONITOR_LOG_FILE.exists()
+    log_mtime = None
+    if log_exists:
+        try:
+            log_mtime = datetime.fromtimestamp(VOICE_MONITOR_LOG_FILE.stat().st_mtime).isoformat(timespec="seconds")
+        except Exception:
+            log_mtime = None
+
+    return {
+        "running": bool(running),
+        "pid": int(pid) if pid is not None else None,
+        "pid_file": str(VOICE_MONITOR_PID_FILE),
+        "log_file": str(VOICE_MONITOR_LOG_FILE),
+        "log_exists": bool(log_exists),
+        "last_log_at": log_mtime,
+    }
+
+
+def _task_queue_status(limit: int = 5) -> dict:
+    out = {
+        "available": False,
+        "due_count": 0,
+        "preview": [],
+        "error": None,
+    }
+
+    try:
+        mem = getattr(core, "memory", None)
+        if mem is None or not hasattr(mem, "get_due_tasks"):
+            return out
+
+        rows = mem.get_due_tasks(top_k=max(1, int(limit)), include_tags=["scheduled_task"])
+        due_items = rows if isinstance(rows, list) else []
+
+        preview = []
+        for item in due_items[:max(1, int(limit))]:
+            preview.append(
+                {
+                    "id": item.get("id"),
+                    "text": item.get("text"),
+                    "due_at": item.get("due_at"),
+                    "alarm": _task_is_alarm(item),
+                }
+            )
+
+        out["available"] = True
+        out["due_count"] = len(due_items)
+        out["preview"] = preview
+        return out
+    except Exception as e:
+        out["available"] = bool(hasattr(getattr(core, "memory", None), "get_due_tasks"))
+        out["error"] = str(e)
+        return out
+
+
 def _resolve_phone_avatar_path(state: str) -> Optional[Path]:
     key = str(state or "").strip().lower()
     if key not in FANCY_AVATAR_FILES:
@@ -609,6 +703,8 @@ def _build_process_fingerprint(req: ProcessRequest) -> str:
             "type": media_type,
             "size": size,
             "data_hash": data_hash,
+            "active_model": str(getattr(core.model, "default_model", "") or ""),
+            "source": str(req.input_source or "").strip().lower(),
         },
         sort_keys=True,
         ensure_ascii=True,
@@ -640,6 +736,19 @@ def _norm_echo_text(text: str) -> str:
     t = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in t)
     t = " ".join(t.split())
     return t
+
+
+def _looks_like_tool_markup_leak(text: str) -> bool:
+    s = str(text or "")
+    if not s.strip():
+        return False
+    patterns = [
+        r"<\|tool_call\>",
+        r"\bcall\s*:[A-Za-z_][\w.-]*\s*\{",
+        r"spotify_link\s*\{",
+        r"[|｜]\s*[：:]\s*<\s*spotify_link\s*\{",
+    ]
+    return any(re.search(p, s, flags=re.IGNORECASE) is not None for p in patterns)
 
 
 def _is_probable_self_echo(transcript: str) -> bool:
@@ -1326,6 +1435,79 @@ def phone_ui():
     return HTMLResponse(content=PHONE_HTML)
 
 
+@app.get("/phone/manifest.json")
+def phone_manifest():
+        return JSONResponse(
+                {
+                        "name": "Mina Phone Link",
+                        "short_name": "Mina",
+                        "start_url": "/phone",
+                        "scope": "/phone",
+                        "display": "standalone",
+                        "background_color": "#06090a",
+                        "theme_color": "#06090a",
+                        "description": "Voice and text link to Mina over your API endpoint.",
+                        "icons": [
+                                {
+                                        "src": "/phone/avatar/idle",
+                                        "sizes": "192x192",
+                                        "type": "image/png",
+                                        "purpose": "any"
+                                },
+                                {
+                                        "src": "/phone/avatar/talk",
+                                        "sizes": "512x512",
+                                        "type": "image/png",
+                                        "purpose": "any"
+                                }
+                        ]
+                }
+        )
+
+
+@app.get("/phone/sw.js")
+def phone_service_worker():
+        sw = """
+const CACHE_NAME = 'mina-phone-link-v1';
+const URLS = [
+    '/phone',
+    '/phone/manifest.json',
+    '/phone/avatar/idle',
+    '/phone/avatar/talk',
+    '/phone/avatar/alt',
+    '/phone/avatar/smirk'
+];
+
+self.addEventListener('install', (event) => {
+    event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(URLS)).catch(() => {}));
+    self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+    event.waitUntil(
+        caches.keys().then((keys) => Promise.all(keys.map((k) => (k !== CACHE_NAME ? caches.delete(k) : null))))
+    );
+    self.clients.claim();
+});
+
+self.addEventListener('fetch', (event) => {
+    const req = event.request;
+    if (req.method !== 'GET') return;
+
+    event.respondWith(
+        fetch(req)
+            .then((res) => {
+                const copy = res.clone();
+                caches.open(CACHE_NAME).then((cache) => cache.put(req, copy)).catch(() => {});
+                return res;
+            })
+            .catch(() => caches.match(req).then((hit) => hit || caches.match('/phone')))
+    );
+});
+"""
+        return Response(content=sw, media_type="application/javascript")
+
+
 @app.get("/phone/avatar/{state}")
 def phone_avatar(state: str):
     path = _resolve_phone_avatar_path(state)
@@ -1385,10 +1567,17 @@ def process(req: ProcessRequest):
         else:
             raise
 
-    with _process_dedupe_lock:
-        _process_dedupe_cache["fingerprint"] = fp
-        _process_dedupe_cache["response"] = dict(out) if isinstance(out, dict) else {"reply": str(out)}
-        _process_dedupe_cache["ts"] = time.time()
+    reply_text_for_cache = str((out or {}).get("reply") or "") if isinstance(out, dict) else str(out)
+    skip_cache = (
+        reply_text_for_cache.strip().startswith("(LM Studio error:")
+        or _looks_like_tool_markup_leak(reply_text_for_cache)
+    )
+
+    if not skip_cache:
+        with _process_dedupe_lock:
+            _process_dedupe_cache["fingerprint"] = fp
+            _process_dedupe_cache["response"] = dict(out) if isinstance(out, dict) else {"reply": str(out)}
+            _process_dedupe_cache["ts"] = time.time()
 
     env_auto = os.getenv("MK1_PROCESS_AUTO_SPEAK", "0").strip().lower() in {
         "1",
@@ -1433,16 +1622,25 @@ def process_stream(req: ProcessRequest):
       data: {"type":"done"}
     """
 
+    def _iter_reply_chunks(text: str, chunk_size: int = 120):
+        s = str(text or "")
+        if not s:
+            return
+        for i in range(0, len(s), max(1, int(chunk_size))):
+            yield s[i:i + max(1, int(chunk_size))]
+
     def event_stream():
         full_parts: list[str] = []
         try:
-            for chunk in core.process_stream(
+            # Route streaming through core.process so tool-calling behavior is
+            # consistent with /process and raw tool markup is not leaked.
+            out = core.process(
                 req.input,
                 image_attachment=req.image_attachment,
-            ):
-                part = str(chunk or "")
-                if not part:
-                    continue
+            )
+            reply_text = str((out or {}).get("reply") or "") if isinstance(out, dict) else str(out)
+
+            for part in _iter_reply_chunks(reply_text):
                 full_parts.append(part)
                 payload = json.dumps(
                     {"type": "chunk", "content": part},
@@ -1599,12 +1797,18 @@ def status(force_refresh: bool = False):
     Returns CORE health block.
     All fields must be strings.
     """
-    return _get_cached(
+    core_status = _get_cached(
         _status_cache,
         STATUS_CACHE_TTL,
         core.get_core_status,
         force_refresh=force_refresh,
     )
+
+    payload = dict(core_status) if isinstance(core_status, dict) else {"core_status": core_status}
+    payload["voice_monitor"] = _voice_monitor_status()
+    payload["task_queue"] = _task_queue_status(limit=5)
+    payload["task_queue_prompt_enabled"] = True
+    return payload
 
 
 # ------------------------------------------------------------
@@ -1622,6 +1826,24 @@ def db_status(force_refresh: bool = False):
         core.get_db_status,
         force_refresh=force_refresh,
     )
+
+
+@app.get("/voice/status")
+def voice_status():
+    return {
+        "ok": True,
+        "voice_monitor": _voice_monitor_status(),
+    }
+
+
+@app.get("/tasks/queue_status")
+def tasks_queue_status(limit: int = 5):
+    safe_limit = max(1, min(25, int(limit)))
+    snap = _task_queue_status(limit=safe_limit)
+    return {
+        "ok": bool(snap.get("available")),
+        "queue": snap,
+    }
 
 
 @app.get("/tasks/list")

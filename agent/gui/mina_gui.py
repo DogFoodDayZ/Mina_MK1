@@ -30,6 +30,8 @@ APP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CONFIG_PATH = os.path.join(APP_DIR, "config", "mk1_config.json")
 DEFAULT_START_SCRIPT = os.path.join(APP_DIR, "start_mk1_api.ps1")
 DEFAULT_STOP_SCRIPT = os.path.join(APP_DIR, "stop_mk1_api.ps1")
+DEFAULT_VOICE_MONITOR_SCRIPT = os.path.join(APP_DIR, "start_mina_voice_monitor.ps1")
+VOICE_MONITOR_PID_FILE = os.path.join(APP_DIR, ".mk1_voice_monitor.pid")
 
 
 class MinaGUI(tk.Tk):
@@ -47,6 +49,11 @@ class MinaGUI(tk.Tk):
         self.user_input_var = tk.StringVar(value="")
         self.server_start_script_var = tk.StringVar(value=DEFAULT_START_SCRIPT)
         self.server_stop_script_var = tk.StringVar(value=DEFAULT_STOP_SCRIPT)
+        self.voice_input_state_var = tk.StringVar(value="Voice input: unknown")
+        self.voice_output_state_var = tk.StringVar(value="Voice output: OFF")
+        self.voice_hint_var = tk.StringVar(value="en-US-AnaNeural")
+        self.voice_device_var = tk.StringVar(value="-1")
+        self.voice_output_enabled = tk.BooleanVar(value=False)
 
         self._load_server_settings()
 
@@ -97,6 +104,27 @@ class MinaGUI(tk.Tk):
         ttk.Button(controls, text="Save Paths", style="Action.TButton", command=self.save_server_settings).pack(side="left")
         ttk.Button(controls, text="Start Server", style="Action.TButton", command=self.start_server).pack(side="left", padx=(8, 0))
         ttk.Button(controls, text="Stop Server", style="Action.TButton", command=self.stop_server).pack(side="left", padx=(8, 0))
+
+        voice_frame = ttk.LabelFrame(root, text="Voice Control", padding=10)
+        voice_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(voice_frame, text="Voice hint", style="Small.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(voice_frame, textvariable=self.voice_hint_var).grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        ttk.Label(voice_frame, text="Input device (-1 default)", style="Small.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Entry(voice_frame, textvariable=self.voice_device_var, width=8).grid(row=0, column=3, sticky="ew", padx=(8, 0))
+
+        voice_btns = ttk.Frame(voice_frame)
+        voice_btns.grid(row=1, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Button(voice_btns, text="Start Voice Input", style="Action.TButton", command=self.start_voice_input).pack(side="left")
+        ttk.Button(voice_btns, text="Stop Voice Input", style="Action.TButton", command=self.stop_voice_input).pack(side="left", padx=(8, 0))
+        ttk.Button(voice_btns, text="Start Voice Output", style="Action.TButton", command=self.start_voice_output).pack(side="left", padx=(8, 0))
+        ttk.Button(voice_btns, text="Stop Voice Output", style="Action.TButton", command=self.stop_voice_output).pack(side="left", padx=(8, 0))
+
+        ttk.Label(voice_frame, textvariable=self.voice_input_state_var, style="Small.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(voice_frame, textvariable=self.voice_output_state_var, style="Small.TLabel").grid(row=2, column=2, columnspan=2, sticky="w", pady=(8, 0))
+
+        voice_frame.columnconfigure(1, weight=1)
+        voice_frame.columnconfigure(3, weight=1)
 
         server_frame.columnconfigure(1, weight=1)
 
@@ -271,6 +299,96 @@ class MinaGUI(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _voice_monitor_script_path(self) -> str:
+        return DEFAULT_VOICE_MONITOR_SCRIPT
+
+    def _voice_device_index(self) -> int:
+        raw = self.voice_device_var.get().strip()
+        try:
+            return int(raw)
+        except Exception:
+            return -1
+
+    def start_voice_input(self) -> None:
+        script = self._voice_monitor_script_path()
+        if not os.path.isfile(script):
+            messagebox.showerror("Script not found", f"Voice monitor script not found:\n{script}")
+            return
+
+        api_url = self.api_base_var.get().strip() or API_BASE
+        voice_hint = self.voice_hint_var.get().strip() or "en-US-AnaNeural"
+        device_idx = self._voice_device_index()
+
+        cmd = [
+            "powershell",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script,
+            "-ApiUrl",
+            api_url,
+            "-VoiceDevice",
+            str(device_idx),
+            "-VoiceHint",
+            voice_hint,
+        ]
+
+        try:
+            kwargs: Dict[str, Any] = {
+                "cwd": APP_DIR,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "stdin": subprocess.DEVNULL,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+
+            subprocess.Popen(cmd, **kwargs)
+            self._append_chat("Voice", "Voice input monitor launch requested.", "meta")
+            self.after(500, self.refresh_all)
+        except Exception as e:
+            messagebox.showerror("Voice start failed", str(e))
+
+    def stop_voice_input(self) -> None:
+        pid = None
+        try:
+            if os.path.isfile(VOICE_MONITOR_PID_FILE):
+                with open(VOICE_MONITOR_PID_FILE, "r", encoding="utf-8") as f:
+                    raw = (f.read() or "").strip()
+                    pid = int(raw) if raw else None
+        except Exception:
+            pid = None
+
+        try:
+            if pid:
+                subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            if os.path.isfile(VOICE_MONITOR_PID_FILE):
+                os.remove(VOICE_MONITOR_PID_FILE)
+            self._append_chat("Voice", "Voice input monitor stop requested.", "meta")
+            self.after(500, self.refresh_all)
+        except Exception as e:
+            messagebox.showerror("Voice stop failed", str(e))
+
+    def start_voice_output(self) -> None:
+        self.voice_output_enabled.set(True)
+        self.voice_output_state_var.set("Voice output: ON")
+        self._append_chat("Voice", "Voice output enabled for /process replies.", "meta")
+
+    def stop_voice_output(self) -> None:
+        self.voice_output_enabled.set(False)
+        self.voice_output_state_var.set("Voice output: OFF")
+        self._append_chat("Voice", "Voice output disabled for /process replies.", "meta")
+
     def start_server(self) -> None:
         self.save_server_settings()
         self._run_server_script(self.server_start_script_var.get(), "Start server")
@@ -303,16 +421,26 @@ class MinaGUI(tk.Tk):
     def refresh_all(self) -> None:
         status = self._get_json("/status", timeout=5)
         if isinstance(status, dict):
+            vm = status.get("voice_monitor") if isinstance(status.get("voice_monitor"), dict) else {}
+            vm_running = bool(vm.get("running"))
+            vm_pid = vm.get("pid")
+            if vm_running:
+                self.voice_input_state_var.set(f"Voice input: ON (pid {vm_pid})")
+            else:
+                self.voice_input_state_var.set("Voice input: OFF")
+
             self.status_var.set(
                 "CORE STATUS\n"
                 f"temp: {status.get('core_temp', 'UNKNOWN')}\n"
                 f"memory bus: {status.get('memory_bus', 'UNKNOWN')}\n"
                 f"neural cache: {status.get('neural_cache', 'UNKNOWN')}\n"
                 f"io: {status.get('io_channels', 'UNKNOWN')}\n"
+                f"voice input: {'ON' if vm_running else 'OFF'}\n"
                 f"level: {status.get('level', 'WARN')}"
             )
         else:
             self.status_var.set("WAITING FOR CORE…")
+            self.voice_input_state_var.set("Voice input: unknown")
 
         db = self._get_json("/db/status", timeout=5)
         if isinstance(db, dict):
@@ -346,7 +474,13 @@ class MinaGUI(tk.Tk):
         self.user_input_var.set("")
 
         def worker() -> None:
-            result = self._post_json("/process", {"input": text}, timeout=180)
+            payload = {
+                "input": text,
+                "speak_response": bool(self.voice_output_enabled.get()),
+                "voice_hint": self.voice_hint_var.get().strip() or "en-US-AnaNeural",
+                "input_source": "text",
+            }
+            result = self._post_json("/process", payload, timeout=180)
             if not result:
                 self._append_chat("Mina", "(error contacting core)", "mina")
                 return

@@ -13,6 +13,8 @@ param(
     [switch]$PersistModel,
     [switch]$ForceReload,
     [switch]$GuiSpeak,
+    [switch]$NoGuiDev,
+    [string]$GuiDir = '',
     [switch]$AutoVoice,
     [switch]$Foreground,
     [switch]$RunTests
@@ -218,8 +220,99 @@ function Invoke-ApiStart {
     }
 }
 
+function Resolve-FancyGuiDir {
+    param(
+        [string]$CliGuiDir
+    )
+
+    $override = ($CliGuiDir -as [string]).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($override)) {
+        return $override
+    }
+
+    $envGui = ($env:MK1_FANCY_GUI_DIR -as [string]).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($envGui)) {
+        return $envGui
+    }
+
+    $configPath = Join-Path $PSScriptRoot 'config\mk1_config.json'
+    if (Test-Path $configPath) {
+        try {
+            $cfg = Get-Content -Path $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $cfgGui = ($cfg.gui.fancy_dir -as [string]).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($cfgGui)) {
+                return $cfgGui
+            }
+        }
+        catch {
+            Write-Warning "Could not read gui.fancy_dir from config: $($_.Exception.Message)"
+        }
+    }
+
+    return 'C:\dev\mina-gui'
+}
+
+function Test-FancyGuiDevRunning {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ResolvedGuiDir
+    )
+
+    try {
+        $needle = $ResolvedGuiDir.ToLowerInvariant()
+        $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($_.Name -match 'node|pnpm|powershell|cmd|tauri') -and
+            $_.CommandLine -and
+            $_.CommandLine.ToLowerInvariant().Contains($needle) -and
+            ($_.CommandLine.ToLowerInvariant().Contains('tauri dev') -or $_.CommandLine.ToLowerInvariant().Contains('pnpm dev'))
+        }
+
+        return @($procs).Count -gt 0
+    }
+    catch {
+        return $false
+    }
+}
+
+function Start-FancyGuiDevDetached {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ResolvedGuiDir
+    )
+
+    if (-not (Test-Path $ResolvedGuiDir)) {
+        Write-Warning "GUI dev folder not found: $ResolvedGuiDir"
+        return $false
+    }
+
+    if (Test-FancyGuiDevRunning -ResolvedGuiDir $ResolvedGuiDir) {
+        Write-Host "Fancy GUI dev already running for: $ResolvedGuiDir"
+        return $true
+    }
+
+    $pnpmCmd = Get-Command pnpm -ErrorAction SilentlyContinue
+    if ($null -eq $pnpmCmd) {
+        Write-Warning "pnpm not found. Skipping GUI dev launch."
+        return $false
+    }
+
+    $escapedDir = $ResolvedGuiDir.Replace("'", "''")
+    $cmd = "Set-Location '$escapedDir'; if (Test-Path '.\\src-tauri') { pnpm tauri dev } else { pnpm dev }"
+
+    Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $cmd) | Out-Null
+    Write-Host "Fancy GUI dev launched from: $ResolvedGuiDir"
+    return $true
+}
+
 switch ($Action) {
     'start' {
+        $shouldStartGuiDev = -not $NoGuiDev
+        if ($shouldStartGuiDev) {
+            $resolvedGuiDir = Resolve-FancyGuiDir -CliGuiDir $GuiDir
+            Start-FancyGuiDevDetached -ResolvedGuiDir $resolvedGuiDir | Out-Null
+        }
+
         if ($Foreground) {
             Invoke-ApiStart -StartScriptPath $startScript -ApiPort $Port -RunForeground -EnableGuiSpeak:$GuiSpeak -GuiVoiceHint $VoiceHint
         }
@@ -251,6 +344,12 @@ switch ($Action) {
         # stop can return non-zero if nothing is listening; continue with start in that case.
         if ($stopCode -ne 0) {
             Write-Host "Restart notice: stop returned code $stopCode, continuing with start..."
+        }
+
+        $shouldStartGuiDev = -not $NoGuiDev
+        if ($shouldStartGuiDev) {
+            $resolvedGuiDir = Resolve-FancyGuiDir -CliGuiDir $GuiDir
+            Start-FancyGuiDevDetached -ResolvedGuiDir $resolvedGuiDir | Out-Null
         }
 
         if ($Foreground) {

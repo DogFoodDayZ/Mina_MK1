@@ -20,6 +20,7 @@ memory/memory.db*
 # Local scratch and archives
 cleanup_archive/
 sandbox/
+.tmp_publish_android_repo/
 
 # OS/editor noise
 .DS_Store

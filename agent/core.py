@@ -19,11 +19,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from agent.file_intents import detect_file_directory_intent
+from agent.pending_actions import (
+    PendingActionStore,
+    is_directory_scan_cancel,
+    is_directory_scan_confirmation,
+    is_write_authorization_cancel,
+    is_write_authorization_confirmation,
+)
+from agent.reflex_helpers import (
+    handle_direct_response_reflex,
+    handle_directory_scan_reflex,
+    handle_external_write_reflex,
+    handle_identity_reflex,
+    message_choice,
+)
 from config.config_loader import load_config
 from tools.tool_loader import ToolLoader
 from tools.file_access_policy import full_access_root, normalize_tool_path
 from tools.file_inspector import inspect_file, inspect_sqlite_table, is_probably_text_path
 from memory.mk1_memory import MK1Memory
+
 
 
 # ============================================================
@@ -174,13 +190,6 @@ class LMStudioClient:
         return non_system
 
     def _coalesce_system_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Merge all system messages into one leading system message.
-
-        Some chat templates support a single optional system message and then
-        require strict role alternation. This preserves system semantics while
-        avoiding invalid multi-system sequences.
-        """
         if not messages:
             return []
 
@@ -250,6 +259,7 @@ class LMStudioClient:
             out.append(n)
 
         _add(requested_model)
+
         for m in self.fallback_models:
             _add(m)
 
@@ -299,8 +309,6 @@ class LMStudioClient:
         return any(h in model_name for h in vision_hints)
 
     def _probe_vision_support(self) -> bool:
-        # Build a valid 1x1 RGB PNG in-memory so the probe does not depend on
-        # external files or potentially invalid hardcoded image bytes.
         try:
             import base64
             import binascii
@@ -310,7 +318,7 @@ class LMStudioClient:
             width = 1
             height = 1
             bit_depth = 8
-            color_type = 2  # Truecolor RGB
+            color_type = 2
 
             ihdr = struct.pack(
                 "!IIBBBBB",
@@ -323,7 +331,6 @@ class LMStudioClient:
                 0,
             )
 
-            # One scanline: filter byte (0) + one red pixel (255, 0, 0)
             raw_scanline = b"\x00\xff\x00\x00"
             idat = zlib.compress(raw_scanline, level=9)
 
@@ -340,7 +347,6 @@ class LMStudioClient:
 
             tiny_png_data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
         except Exception:
-            # Fallback if local generation fails for any reason.
             tiny_png_data_url = (
                 "data:image/png;base64,"
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7fNwAAAABJRU5ErkJggg=="
@@ -1081,7 +1087,7 @@ class MK1Core:
 
         self._intent_alias_cache: Dict[str, Dict[str, Any]] = {}
         self._intent_alias_cache_loaded = False
-        self._pending_write_auth: Optional[Dict[str, Any]] = None
+        self._pending_actions = PendingActionStore()
         self._voice_passphrase_hash: str = ""
         self._voice_passphrase_hint: str = ""
         self._verified_clients: Dict[str, float] = {}
@@ -2050,6 +2056,15 @@ class MK1Core:
     def _write_auth_tool_names(self) -> set:
         return {"dir_create", "file_write", "file_append", "file_delete", "file_move", "safe_copy"}
 
+    def _set_pending_action(self, action_key: str, payload: Dict[str, Any]) -> None:
+        self._pending_actions.set(action_key, payload)
+
+    def _get_pending_action(self, action_key: str) -> Optional[Dict[str, Any]]:
+        return self._pending_actions.get(action_key)
+
+    def _clear_pending_action(self, action_key: str) -> None:
+        self._pending_actions.clear(action_key)
+
     def _pending_write_target(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         if tool_name == "file_move":
             src = str(tool_args.get("src") or "").strip()
@@ -2070,33 +2085,84 @@ class MK1Core:
     ) -> None:
         args_copy = dict(tool_args or {})
         args_copy.pop("auth_token", None)
-        self._pending_write_auth = {
+        self._set_pending_action("external_write", {
             "tool_name": str(tool_name or "").strip(),
             "tool_args": args_copy,
             "user_input": str(user_input or "").strip(),
             "target": self._pending_write_target(tool_name, args_copy),
             "error": str(error or "").strip(),
             "created_at": time.time(),
-        }
+        })
+
+    def _get_pending_write_authorization(self) -> Optional[Dict[str, Any]]:
+        return self._get_pending_action("external_write")
 
     def _clear_pending_write_authorization(self) -> None:
-        self._pending_write_auth = None
+        self._clear_pending_action("external_write")
+
+    def _set_pending_directory_scan(
+        self,
+        path: str,
+        mode: str,
+        user_input: str,
+    ) -> None:
+        self._set_pending_action("directory_scan", {
+            "path": str(path or "").strip(),
+            "mode": str(mode or "all").strip().lower() or "all",
+            "user_input": str(user_input or "").strip(),
+            "created_at": time.time(),
+        })
+
+    def _get_pending_directory_scan(self) -> Optional[Dict[str, Any]]:
+        return self._get_pending_action("directory_scan")
+
+    def _clear_pending_directory_scan(self) -> None:
+        self._clear_pending_action("directory_scan")
+
+    def _is_directory_scan_confirmation(self, text: str) -> bool:
+        return is_directory_scan_confirmation(text)
+
+    def _is_directory_scan_cancel(self, text: str) -> bool:
+        return is_directory_scan_cancel(text)
 
     def _is_write_authorization_confirmation(self, text: str) -> bool:
-        low = str(text or "").strip().lower()
-        if not low:
-            return False
-        if low in {"yes", "y", "yep", "yeah", "ok", "okay", "do it", "proceed", "continue", "allow", "authorize", "authorise"}:
-            return True
-        return re.search(r"\b(authorize|authorise|approve|approved|allow|proceed|continue|go\s+ahead)\b", low) is not None
+        return is_write_authorization_confirmation(text)
 
     def _is_write_authorization_cancel(self, text: str) -> bool:
-        low = str(text or "").strip().lower()
-        if not low:
-            return False
-        if low in {"no", "n", "cancel", "deny", "stop", "never mind", "nevermind"}:
-            return True
-        return re.search(r"\b(cancel|deny|stop|don't|do\s+not|abort)\b", low) is not None
+        return is_write_authorization_cancel(text)
+
+    def _message_choice(self, content: str) -> Dict[str, Any]:
+        return message_choice(content)
+
+    def _handle_directory_scan_reflex(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        user_input: str,
+    ) -> Optional[Dict[str, Any]]:
+        return handle_directory_scan_reflex(self, tool_name, tool_args, user_input)
+
+    def _handle_external_write_reflex(
+        self,
+        tool_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        return handle_external_write_reflex(self, tool_name)
+
+    def _handle_identity_reflex(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        request_context: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        return handle_identity_reflex(self, tool_name, tool_args, request_context)
+
+    def _handle_direct_response_reflex(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        user_input: str,
+    ) -> Optional[Dict[str, Any]]:
+        return handle_direct_response_reflex(self, tool_name, tool_args, user_input)
 
     def _stop_driving_checkins(self) -> Dict[str, Any]:
         try:
@@ -7906,231 +7972,33 @@ class MK1Core:
         print("========================================")
         print(tool_args)
 
-        if tool_name == "__mina_identity__":
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "I am Mina, your chaotic gremlin-fox assistant.",
-                        }
-                    }
-                ]
-            }
+        identity_reply = self._handle_identity_reflex(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            request_context=request_context,
+        )
+        if identity_reply is not None:
+            return identity_reply
 
-        if tool_name == "__spotify_dj_capability__":
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                "Yes. I can do that. I can read track duration and auto-switch songs from your liked list when each song ends. "
-                                "Say: 'start dj mode from my favorite list'. "
-                                "You can stop it with: 'stop dj mode'."
-                            ),
-                        }
-                    }
-                ]
-            }
+        direct_reply = self._handle_direct_response_reflex(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            user_input=user_input,
+        )
+        if direct_reply is not None:
+            return direct_reply
 
-        if tool_name == "__tool_self_test__":
-            result = self._run_tool_self_test(str(tool_args.get("request") or user_input))
-            formatted = self._format_tool_result(tool_name, result)
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": formatted,
-                        }
-                    }
-                ]
-            }
+        directory_scan_reply = self._handle_directory_scan_reflex(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            user_input=user_input,
+        )
+        if directory_scan_reply is not None:
+            return directory_scan_reply
 
-        if tool_name == "__inspect_directory_tree__":
-            inspect_path = str(tool_args.get("path") or "").strip()
-            inspect_mode = str(tool_args.get("mode") or "all").strip().lower()
-            result = self._inspect_directory_tree(inspect_path, mode=inspect_mode)
-            if not result.get("ok"):
-                content = f"Directory inspection failed: {result.get('error')}"
-            else:
-                content = str((result.get("result") or {}).get("report") or "No inspection report generated.")
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": content,
-                        }
-                    }
-                ]
-            }
-
-        if tool_name == "__inspect_sqlite_table__":
-            inspect_path = str(tool_args.get("path") or "").strip()
-            table_name = str(tool_args.get("table") or "").strip()
-            row_limit = int(tool_args.get("row_limit") or 8)
-            result = inspect_sqlite_table(inspect_path, table_name=table_name, row_limit=row_limit)
-            if not result.get("ok"):
-                content = f"SQLite table preview failed: {result.get('error')}"
-            else:
-                content = str((result.get("result") or {}).get("content") or "No SQLite preview generated.")
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": content,
-                        }
-                    }
-                ]
-            }
-
-        if tool_name == "__clarify_intent__":
-            question = str(tool_args.get("question") or "Please clarify your intent.").strip()
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": question,
-                        }
-                    }
-                ]
-            }
-
-        if tool_name == "__capability_limit__":
-            limitation = str(tool_args.get("message") or "I cannot perform that external action directly.").strip()
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": limitation,
-                        }
-                    }
-                ]
-            }
-
-        if tool_name == "__voice_auth_status__":
-            enrolled = bool(self._voice_passphrase_hash)
-            trusted_cfg = bool(self.trusted_client_tokens)
-            trusted_client = self._is_trusted_client(request_context)
-            recently_verified = self._is_client_recently_verified(request_context)
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                f"Voice passphrase enrolled={enrolled}. "
-                                f"Trusted-client tokens configured={trusted_cfg}. "
-                                f"This client trusted={trusted_client}. "
-                                f"This client recently voice-verified={recently_verified}."
-                            ),
-                        }
-                    }
-                ]
-            }
-
-        if tool_name == "__voice_passphrase_enroll__":
-            enroll = self._enroll_voice_passphrase(str(tool_args.get("phrase") or ""))
-            if not enroll.get("ok"):
-                msg = "Voice passphrase enroll failed. Use a longer phrase."
-            else:
-                hint = str((enroll.get("result") or {}).get("hint") or "")
-                msg = f"Voice passphrase enrolled. Hint: {hint}."
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": msg,
-                        }
-                    }
-                ]
-            }
-
-        if tool_name == "__voice_identity_verify__":
-            phrase = str(tool_args.get("phrase") or "").strip()
-            if self._is_voice_phrase_match(phrase):
-                self._mark_client_verified(request_context)
-                return {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "Voice verified for this client. Sensitive actions are unlocked for a short window.",
-                            }
-                        }
-                    ]
-                }
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "Voice verification failed. Please try the exact enrolled phrase.",
-                        }
-                    }
-                ]
-            }
-
-        if tool_name == "__cancel_external_write__":
-            pending = self._pending_write_auth if isinstance(self._pending_write_auth, dict) else None
-            self._clear_pending_write_authorization()
-            if pending:
-                target = str(pending.get("target") or "the pending path")
-                return {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": f"Canceled. I will not write outside E:\\workspace for {target}.",
-                            }
-                        }
-                    ]
-                }
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "No pending external write request to cancel.",
-                        }
-                    }
-                ]
-            }
-
-        if tool_name == "__confirm_external_write__":
-            pending = self._pending_write_auth if isinstance(self._pending_write_auth, dict) else None
-            if not pending:
-                return {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "No pending external write request to authorize.",
-                            }
-                        }
-                    ]
-                }
-
-            pending_tool = str(pending.get("tool_name") or "").strip()
-            pending_args = dict(pending.get("tool_args") or {})
-            pending_args["authorized_write"] = True
-
-            result = self.tools.run(pending_tool, pending_args)
-            formatted = self._format_tool_result(pending_tool, result)
-
-            if bool(result.get("ok", False)):
-                self._clear_pending_write_authorization()
-            else:
-                err = str(result.get("error") or "")
-                if "write_auth_token_invalid" in err:
-                    formatted = (
-                        "Authorization acknowledged, but a write token is required and did not match. "
-                        "Set MK1_WRITE_AUTH_TOKEN in the environment and retry."
-                    )
-                else:
-                    self._clear_pending_write_authorization()
-
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": formatted,
-                        }
-                    }
-                ]
-            }
+        external_write_reply = self._handle_external_write_reflex(tool_name=tool_name)
+        if external_write_reply is not None:
+            return external_write_reply
 
         if tool_name in ("file_write", "file_append"):
             existing = str(tool_args.get("content", "") or "").strip()
@@ -8447,6 +8315,309 @@ IMPORTANT RULES:
     # TOOL DETECTION
     # ========================================================
 
+    def _detect_file_directory_intent(
+        self,
+        text: str,
+        raw_text: str,
+        t: str,
+    ) -> Optional[Tuple[Optional[str], Dict[str, Any]]]:
+        def extract_directory_path(raw: str) -> str:
+            quoted = re.findall(r'["\']([^"\']+)["\']', raw)
+            for q in quoted:
+                candidate = q.strip()
+                if candidate and not re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
+                    return candidate
+
+            patterns = [
+                r'\b(?:in|at|to)\s+([A-Za-z]:\\[^\s,;]+)',
+                r'\b(?:in|at|to)\s+([.]{1,2}[\\/][^\s,;]+)',
+                r'\b(?:in|at|to)\s+([^\s,;]+[\\/][^\s,;]+)',
+                r'\b(?:named|called)\s+([^\s,;]+)',
+                r'\b(?:folder|directory|dir)\s+([^\s,;]+)',
+            ]
+
+            for pattern in patterns:
+                m = re.search(pattern, raw, re.IGNORECASE)
+                if m:
+                    candidate = m.group(1).strip().strip('"\'')
+                    if candidate and not re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
+                        return candidate
+
+            return ""
+
+        def extract_file_write_path(raw: str) -> str:
+            quoted = re.findall(r'["\']([^"\']+)["\']', raw)
+            for q in quoted:
+                candidate = q.strip()
+                if re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
+                    return candidate.rstrip('.,;:')
+
+            patterns = [
+                r'\bfile\s+([^\s,;:]+\.[A-Za-z0-9]{1,8})',
+                r'\b(?:at|to|in)\s+([A-Za-z]:\\[^\s,;]+)',
+                r'\b(?:at|to|in)\s+([.]{1,2}[\\/][^\s,;]+)',
+                r'\b(?:at|to|in)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
+                r'\b(?:named|called)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
+            ]
+
+            for pattern in patterns:
+                m = re.search(pattern, raw, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip().strip('"\'').rstrip('.,;:')
+
+            return ""
+
+        def extract_file_write_content(raw: str, lowered: str) -> str:
+            fence = re.search(r'```(?:[A-Za-z0-9_+-]+)?\n([\s\S]*?)```', raw)
+            if fence:
+                return fence.group(1).strip("\n")
+
+            quoted = re.findall(r'["\']([^"\']+)["\']', raw)
+            if quoted:
+                for q in reversed(quoted):
+                    if not re.search(r'\.[A-Za-z0-9]{1,8}$', q.strip()):
+                        return q.strip()
+
+            content_patterns = [
+                r'\bwith\s+content\s*:\s*([\s\S]+)$',
+                r'\bwith\s+content\s+([\s\S]+)$',
+                r'\bthat\s+(?:says|prints|contains)\s+([\s\S]+)$',
+                r'\bprint(?:s)?\s+(["\'][^"\']+["\'])',
+            ]
+
+            for pattern in content_patterns:
+                m = re.search(pattern, raw, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip().strip('"\'')
+
+            if "hello world" in lowered:
+                return 'print("hello world")'
+
+            return ""
+
+        scaffold_intent = (
+            re.search(r'\b(create|make|build|scaffold|setup)\b', t) is not None
+            and (
+                re.search(r'\b(folder|folders|directory|directories|dir)\b', t) is not None
+                and (
+                    re.search(r'\b(file|files|script|scripts|module|modules)\b', t) is not None
+                    or " with " in t
+                    or " inside " in t
+                )
+            )
+        )
+
+        if not scaffold_intent:
+            scaffold_intent = (
+                "project scaffold" in t
+                or (
+                    "create project" in t
+                    and re.search(r'\b(src|tests?)\b', t) is not None
+                    and re.search(r'\b(file|files|directory|directories|folder|folders)\b', t) is not None
+                )
+            )
+
+        if scaffold_intent:
+            return "__scaffold__", {"request": raw_text}
+
+        directory_create_intent = (
+            re.search(r'\b(create|make|add|new)\b', t) is not None
+            and re.search(r'\b(folder|directory|dir)\b', t) is not None
+        ) or any(x in t for x in [
+            "mkdir ",
+            "make folder",
+            "create folder",
+            "create directory",
+            "new folder",
+            "new directory",
+        ])
+
+        if directory_create_intent:
+            path = extract_directory_path(raw_text)
+            if path:
+                return "dir_create", {"path": path}
+
+        if self._is_recursive_directory_read_request(raw_text, t):
+            path = self._extract_explicit_windows_path(raw_text)
+            if path:
+                return "__inspect_directory_tree__", {"path": path, "mode": self._extract_directory_inspection_filter(raw_text)}
+
+        sqlite_table_match = re.search(
+            r'\b(?:read|show|preview|inspect|describe)\s+(?:the\s+)?table\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:from|in|inside)\s+(.+)$',
+            raw_text,
+            re.IGNORECASE,
+        )
+        if sqlite_table_match:
+            table_name = str(sqlite_table_match.group(1) or "").strip()
+            db_path = self._extract_explicit_windows_path(str(sqlite_table_match.group(2) or ""))
+            if table_name and db_path:
+                return "__inspect_sqlite_table__", {
+                    "path": db_path,
+                    "table": table_name,
+                    "row_limit": 8,
+                }
+
+        if any(x in t for x in ["read file", "open file", "show file"]):
+            m = re.search(r'["\']([^"\']+)["\']', text)
+            if not m:
+                m = re.search(r'[“‘]([^”’]+)[”’]', text)
+            if not m:
+                m = re.search(r'file\s+([^\s]+)', text, re.IGNORECASE)
+
+            path = m.group(1).strip() if m else ""
+            return "file_read", {"path": path}
+
+        if any(x in t for x in [
+            "delete file", "remove file", "delete script", "remove script",
+            "delete the file", "remove the file", "delete this file", "remove this file",
+        ]):
+            path = ""
+            quoted = re.findall(r'["\']([^"\']+)["\']', text)
+            for q in quoted:
+                if re.match(r'^[A-Za-z]:\\', q):
+                    path = q.strip()
+                    break
+
+            if not path:
+                m = re.search(r'\bat\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\bfrom\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'([A-Za-z]:\\[^\s,]+\.(?:py|txt|md|json|csv))', text, re.IGNORECASE)
+                if m:
+                    path = m.group(1).strip()
+
+            return "file_delete", {"path": path}
+
+        if any(x in t for x in [
+            "move file", "move script", "move this file", "move the file",
+            "rename file", "rename script", "rename this file", "rename the file",
+            "rename to", "move to",
+        ]) or (("move" in t or "rename" in t) and re.search(r'[A-Za-z]:\\', text) and " to " in t):
+            src = ""
+            dst = ""
+            quoted = re.findall(r'["\']([^"\']+)["\']', text)
+            quoted_paths = [q.strip() for q in quoted if re.match(r'^[A-Za-z]:\\', q)]
+            if len(quoted_paths) >= 2:
+                src, dst = quoted_paths[0], quoted_paths[1]
+            elif len(quoted_paths) == 1:
+                src = quoted_paths[0]
+
+            if not src:
+                m = re.search(r'\b(?:move|rename)\s+(?:the\s+)?file\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\bfrom\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if m:
+                    src = m.group(1).strip()
+
+            if not dst:
+                m = re.search(r'\bto\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\brename\s+[A-Za-z]:\\[^\s,]+\s+to\s+([^\s,]+)', text, re.IGNORECASE)
+                if m:
+                    dst = m.group(1).strip()
+
+            if src and dst and not os.path.isabs(dst):
+                dst = os.path.join(os.path.dirname(src), dst)
+
+            return "file_move", {"src": src, "dst": dst}
+
+        if any(x in t for x in [
+            "append file", "append to file", "add to file", "add content to file",
+            "append text to", "append this", "append the following",
+        ]) or ("append" in t and re.search(r'[A-Za-z]:\\', text) and any(x in t for x in ["to", "with", "content", "text", "line"])):
+            path = ""
+            content = ""
+
+            quoted = re.findall(r'["\']([^"\']+)["\']', text)
+            for q in quoted:
+                if re.match(r'^[A-Za-z]:\\', q):
+                    path = q.strip()
+
+            if not path:
+                m = re.search(r'\bfile\s+([^\s,;:]+\.[A-Za-z0-9]{1,8})', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\bat\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\bto\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'([A-Za-z]:\\[^\s,]+\.[A-Za-z0-9]+)', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'\b(?:at|to)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'([^\s,;]+\.[A-Za-z0-9]{1,8})', text, re.IGNORECASE)
+                if m:
+                    path = m.group(1).strip().rstrip('.,;:')
+
+            if not content:
+                m = re.search(r'\bwith\s+content\s*:\s*([\s\S]+)$', text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'(?:append|add).*?\bto\s+[^\s]+\s+(.+)', text, re.IGNORECASE)
+                if m:
+                    content = m.group(1).strip()
+                elif quoted:
+                    content = quoted[-1].strip()
+
+            return "file_append", {"path": path, "content": content}
+
+        file_write_intent = any(x in t for x in [
+            "create file", "write file", "write to file", "write this to file", "save file", "make file",
+            "create a python script", "create a script", "write a python script", "save a python script",
+            "make a python script", "create script", "make script", "write script", "save script",
+        ]) or (("at " in t or "to " in t) and any(x in t for x in ["print", "prints", "code", "content", "with content"])) or (
+            re.search(r'\b(create|write|save|make|generate|build)\b', t) is not None
+            and (re.search(r'\b(file|script|module)\b', t) is not None or re.search(r'\.[A-Za-z0-9]{1,8}\b', raw_text) is not None)
+        )
+
+        if file_write_intent:
+            path = extract_file_write_path(raw_text)
+            if not path:
+                return None, {}
+
+            if not re.search(r'\.[A-Za-z0-9]{1,8}$', path) and (
+                "project scaffold" in t
+                or re.search(r'\b(make|create)\b.*\b(project|structure)\b', t) is not None
+                or re.search(r'\b(src|tests?)\b', t) is not None
+            ):
+                return "__scaffold__", {"request": raw_text}
+
+            content = extract_file_write_content(raw_text, t)
+
+            if path.lower().endswith('.py') and content:
+                if not content.strip().startswith('print') and ('print' in t or 'prints' in t or 'python script' in t):
+                    content = f'print({json.dumps(content)})'
+
+            return "file_write", {"path": path, "content": content}
+
+        dir_list_triggers = [
+            "list directory", "list files", "show files", "show directory", "directory contents",
+            "folder contents", "what files", "what's in this folder", "contents of",
+            "list the contents", "list contents", "show contents", "what is in", "toy box", "toybox",
+        ]
+
+        if any(x in t for x in dir_list_triggers) or re.search(r'\blist\b\s+[a-zA-Z]:\\', t) or re.search(r'\bcontents\b.*[a-zA-Z]:\\', t):
+            workspace_root = self.workspace_root
+            path = workspace_root
+
+            m = re.search(r'in\s+([a-zA-Z]:\\?[^\n\r]*)', text, re.IGNORECASE)
+            if not m:
+                m = re.search(r'on\s+([a-zA-Z]:\\?[^\n\r]*)', text, re.IGNORECASE)
+            if not m:
+                m = re.search(r'of\s+([a-zA-Z]:\\?[^\n\r]*)', text, re.IGNORECASE)
+            if not m:
+                m = re.search(r'(?:list\s+files\s+)?([a-zA-Z]:\\[^\n\r]*)', text, re.IGNORECASE)
+            if not m:
+                m = re.search(r'(?:list\s+)?([a-zA-Z]:\\?)(?:\s|$)', text, re.IGNORECASE)
+
+            if m:
+                path = m.group(1).strip()
+            elif any(x in t for x in ["toy box", "toybox"]):
+                path = os.path.join(workspace_root, "toys")
+
+            return "dir_list", {"path": path}
+
+        return None
+
     def detect_tool_intent(
         self,
         text: str,
@@ -8459,7 +8630,18 @@ IMPORTANT RULES:
         raw_text = self._normalize_user_intent_text(original_text)
         t = raw_text.lower().strip()
 
-        if isinstance(getattr(self, "_pending_write_auth", None), dict):
+        if self._get_pending_directory_scan() is not None:
+            if self._is_directory_scan_confirmation(raw_text):
+                return "__confirm_directory_scan__", {}
+            if self._is_directory_scan_cancel(raw_text):
+                return "__cancel_directory_scan__", {}
+
+        if self._is_directory_scan_confirmation(raw_text):
+            return "__confirm_directory_scan__", {}
+        if self._is_directory_scan_cancel(raw_text):
+            return "__cancel_directory_scan__", {}
+
+        if self._get_pending_write_authorization() is not None:
             if self._is_write_authorization_confirmation(raw_text):
                 return "__confirm_external_write__", {}
             if self._is_write_authorization_cancel(raw_text):
@@ -8507,16 +8689,14 @@ IMPORTANT RULES:
                     )
                 }
 
-        bulk_read_match = re.search(r"\bread\s+all\s+files\s+in\s+([A-Za-z]:\\[^\n\r]*)", raw_text, re.IGNORECASE)
+        bulk_read_match = re.search(r"\bread\s+all\s+files\s+in\b", raw_text, re.IGNORECASE)
         if bulk_read_match:
-            folder = bulk_read_match.group(1).strip().rstrip(".,;:")
-            return "__clarify_intent__", {
-                "question": (
-                    f"I can do this reliably, but not as one giant blind read. "
-                    f"I will first list files in {folder}, then read them in chunks and report verified findings. "
-                    f"Say: 'yes scan now' to proceed."
-                )
-            }
+            folder = self._extract_explicit_windows_path(raw_text)
+            if folder and os.path.isdir(folder):
+                return "__queue_directory_scan__", {
+                    "path": folder,
+                    "mode": self._extract_directory_inspection_filter(raw_text),
+                }
 
         # ====================================================
         # DIRECT TOOL MARKUP (USER-PASTED)
@@ -9905,355 +10085,13 @@ IMPORTANT RULES:
                     "script": raw_text
                 }
 
-        # ====================================================
-        # DIRECTORY CREATE
-        # ====================================================
-
-        def extract_directory_path(raw: str) -> str:
-            quoted = re.findall(r'["\']([^"\']+)["\']', raw)
-            for q in quoted:
-                candidate = q.strip()
-                if candidate and not re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
-                    return candidate
-
-            patterns = [
-                r'\b(?:in|at|to)\s+([A-Za-z]:\\[^\s,;]+)',
-                r'\b(?:in|at|to)\s+([.]{1,2}[\\/][^\s,;]+)',
-                r'\b(?:in|at|to)\s+([^\s,;]+[\\/][^\s,;]+)',
-                r'\b(?:named|called)\s+([^\s,;]+)',
-                r'\b(?:folder|directory|dir)\s+([^\s,;]+)',
-            ]
-
-            for pattern in patterns:
-                m = re.search(pattern, raw, re.IGNORECASE)
-                if m:
-                    candidate = m.group(1).strip().strip('"\'')
-                    if candidate and not re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
-                        return candidate
-
-            return ""
-
-        scaffold_intent = (
-            re.search(r'\b(create|make|build|scaffold|setup)\b', t) is not None
-            and (
-                re.search(r'\b(folder|folders|directory|directories|dir)\b', t) is not None
-                and (
-                    re.search(r'\b(file|files|script|scripts|module|modules)\b', t) is not None
-                    or " with " in t
-                    or " inside " in t
-                )
-            )
+        file_dir_intent = self._detect_file_directory_intent(
+            text=original_text,
+            raw_text=raw_text,
+            t=t,
         )
-
-        if not scaffold_intent:
-            scaffold_intent = (
-                "project scaffold" in t
-                or (
-                    "create project" in t
-                    and re.search(r'\b(src|tests?)\b', t) is not None
-                    and re.search(r'\b(file|files|directory|directories|folder|folders)\b', t) is not None
-                )
-            )
-
-        if scaffold_intent:
-            return "__scaffold__", {"request": raw_text}
-
-        directory_create_intent = (
-            re.search(r'\b(create|make|add|new)\b', t) is not None
-            and re.search(r'\b(folder|directory|dir)\b', t) is not None
-        ) or any(x in t for x in [
-            "mkdir ",
-            "make folder",
-            "create folder",
-            "create directory",
-            "new folder",
-            "new directory",
-        ])
-
-        if directory_create_intent:
-            path = extract_directory_path(raw_text)
-            if path:
-                return "dir_create", {"path": path}
-
-        # ====================================================
-        # RECURSIVE DIRECTORY INSPECTION
-        # ====================================================
-
-        if self._is_recursive_directory_read_request(raw_text, t):
-            path = self._extract_explicit_windows_path(raw_text)
-            if path:
-                return "__inspect_directory_tree__", {"path": path, "mode": self._extract_directory_inspection_filter(raw_text)}
-
-        sqlite_table_match = re.search(
-            r'\b(?:read|show|preview|inspect|describe)\s+(?:the\s+)?table\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:from|in|inside)\s+(.+)$',
-            raw_text,
-            re.IGNORECASE,
-        )
-        if sqlite_table_match:
-            table_name = str(sqlite_table_match.group(1) or "").strip()
-            db_path = self._extract_explicit_windows_path(str(sqlite_table_match.group(2) or ""))
-            if table_name and db_path:
-                return "__inspect_sqlite_table__", {
-                    "path": db_path,
-                    "table": table_name,
-                    "row_limit": 8,
-                }
-
-        
-        # ====================================================
-        # FILE READ
-        # ====================================================
-
-        if any(x in t for x in [
-            "read file",
-            "open file",
-            "show file",
-        ]):
-            m = re.search(r'["\']([^"\']+)["\']', text)
-            if not m:
-                m = re.search(r'[“‘]([^”’]+)[”’]', text)
-            if not m:
-                m = re.search(r'file\s+([^\s]+)', text, re.IGNORECASE)
-
-            path = m.group(1).strip() if m else ""
-            return "file_read", {"path": path}
-
-        # ====================================================
-        # FILE DELETE
-        # ====================================================
-
-        if any(x in t for x in [
-            "delete file",
-            "remove file",
-            "delete script",
-            "remove script",
-            "delete the file",
-            "remove the file",
-            "delete this file",
-            "remove this file",
-        ]):
-            path = ""
-            quoted = re.findall(r'["\']([^"\']+)["\']', text)
-            for q in quoted:
-                if re.match(r'^[A-Za-z]:\\', q):
-                    path = q.strip()
-                    break
-
-            if not path:
-                m = re.search(r'\bat\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'\bfrom\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'([A-Za-z]:\\[^\s,]+\.(?:py|txt|md|json|csv))', text, re.IGNORECASE)
-                if m:
-                    path = m.group(1).strip()
-
-            return "file_delete", {"path": path}
-
-        # ====================================================
-        # FILE MOVE / RENAME
-        # ====================================================
-
-        if any(x in t for x in [
-            "move file",
-            "move script",
-            "move this file",
-            "move the file",
-            "rename file",
-            "rename script",
-            "rename this file",
-            "rename the file",
-            "rename to",
-            "move to",
-        ]) or (
-            ("move" in t or "rename" in t)
-            and re.search(r'[A-Za-z]:\\', text)
-            and " to " in t
-        ):
-            src = ""
-            dst = ""
-            quoted = re.findall(r'["\']([^"\']+)["\']', text)
-            quoted_paths = [q.strip() for q in quoted if re.match(r'^[A-Za-z]:\\', q)]
-            if len(quoted_paths) >= 2:
-                src, dst = quoted_paths[0], quoted_paths[1]
-            elif len(quoted_paths) == 1:
-                src = quoted_paths[0]
-
-            if not src:
-                m = re.search(r'\b(?:move|rename)\s+(?:the\s+)?file\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'\bfrom\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
-                if m:
-                    src = m.group(1).strip()
-
-            if not dst:
-                m = re.search(r'\bto\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'\brename\s+[A-Za-z]:\\[^\s,]+\s+to\s+([^\s,]+)', text, re.IGNORECASE)
-                if m:
-                    dst = m.group(1).strip()
-
-            if src and dst and not os.path.isabs(dst):
-                dst = os.path.join(os.path.dirname(src), dst)
-
-            return "file_move", {"src": src, "dst": dst}
-
-        # ====================================================
-        # FILE APPEND
-        # ====================================================
-
-        if any(x in t for x in [
-            "append file",
-            "append to file",
-            "add to file",
-            "add content to file",
-            "append text to",
-            "append this",
-            "append the following",
-        ]) or (
-            "append" in t
-            and re.search(r'[A-Za-z]:\\', text)
-            and any(x in t for x in ["to", "with", "content", "text", "line"])
-        ):
-            path = ""
-            content = ""
-
-            quoted = re.findall(r'["\']([^"\']+)["\']', text)
-            for q in quoted:
-                if re.match(r'^[A-Za-z]:\\', q):
-                    path = q.strip()
-
-            if not path:
-                m = re.search(r'\bfile\s+([^\s,;:]+\.[A-Za-z0-9]{1,8})', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'\bat\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'\bto\s+([A-Za-z]:\\[^\s,]+)', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'([A-Za-z]:\\[^\s,]+\.[A-Za-z0-9]+)', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'\b(?:at|to)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'([^\s,;]+\.[A-Za-z0-9]{1,8})', text, re.IGNORECASE)
-                if m:
-                    path = m.group(1).strip().rstrip('.,;:')
-
-            if not content:
-                m = re.search(r'\bwith\s+content\s*:\s*([\s\S]+)$', text, re.IGNORECASE)
-                if not m:
-                    m = re.search(r'(?:append|add).*?\bto\s+[^\s]+\s+(.+)', text, re.IGNORECASE)
-                if m:
-                    content = m.group(1).strip()
-                elif quoted:
-                    content = quoted[-1].strip()
-
-            return "file_append", {"path": path, "content": content}
-
-        # ====================================================
-        # FILE WRITE
-        # ====================================================
-
-        def extract_file_write_path(raw: str) -> str:
-            quoted = re.findall(r'["\']([^"\']+)["\']', raw)
-            for q in quoted:
-                candidate = q.strip()
-                if re.search(r'\.[A-Za-z0-9]{1,8}$', candidate):
-                    return candidate.rstrip('.,;:')
-
-            patterns = [
-                r'\bfile\s+([^\s,;:]+\.[A-Za-z0-9]{1,8})',
-                r'\b(?:at|to|in)\s+([A-Za-z]:\\[^\s,;]+)',
-                r'\b(?:at|to|in)\s+([.]{1,2}[\\/][^\s,;]+)',
-                r'\b(?:at|to|in)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
-                r'\b(?:named|called)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
-            ]
-
-            for pattern in patterns:
-                m = re.search(pattern, raw, re.IGNORECASE)
-                if m:
-                    return m.group(1).strip().strip('"\'').rstrip('.,;:')
-
-            return ""
-
-        def extract_file_write_content(raw: str, lowered: str) -> str:
-            fence = re.search(r'```(?:[A-Za-z0-9_+-]+)?\n([\s\S]*?)```', raw)
-            if fence:
-                return fence.group(1).strip("\n")
-
-            quoted = re.findall(r'["\']([^"\']+)["\']', raw)
-            if quoted:
-                for q in reversed(quoted):
-                    if not re.search(r'\.[A-Za-z0-9]{1,8}$', q.strip()):
-                        return q.strip()
-
-            content_patterns = [
-                r'\bwith\s+content\s*:\s*([\s\S]+)$',
-                r'\bwith\s+content\s+([\s\S]+)$',
-                r'\bthat\s+(?:says|prints|contains)\s+([\s\S]+)$',
-                r'\bprint(?:s)?\s+(["\'][^"\']+["\'])',
-            ]
-
-            for pattern in content_patterns:
-                m = re.search(pattern, raw, re.IGNORECASE)
-                if m:
-                    return m.group(1).strip().strip('"\'')
-
-            if "hello world" in lowered:
-                return 'print("hello world")'
-
-            return ""
-
-        file_write_intent = any(x in t for x in [
-            "create file",
-            "write file",
-            "write to file",
-            "write this to file",
-            "save file",
-            "make file",
-            "create a python script",
-            "create a script",
-            "write a python script",
-            "save a python script",
-            "make a python script",
-            "create script",
-            "make script",
-            "write script",
-            "save script",
-        ]) or (
-            ("at " in t or "to " in t)
-            and any(x in t for x in ["print", "prints", "code", "content", "with content"])
-        ) or (
-            re.search(r'\b(create|write|save|make|generate|build)\b', t) is not None
-            and (
-                re.search(r'\b(file|script|module)\b', t) is not None
-                or re.search(r'\.[A-Za-z0-9]{1,8}\b', raw_text) is not None
-            )
-        )
-
-        if file_write_intent:
-            path = extract_file_write_path(raw_text)
-            if not path:
-                return None, {}
-
-            # Guardrail: if target looks like a directory path in a scaffold-style request,
-            # route to scaffold logic instead of creating an extensionless file.
-            if (
-                not re.search(r'\.[A-Za-z0-9]{1,8}$', path)
-                and (
-                    "project scaffold" in t
-                    or re.search(r'\b(make|create)\b.*\b(project|structure)\b', t) is not None
-                    or re.search(r'\b(src|tests?)\b', t) is not None
-                )
-            ):
-                return "__scaffold__", {"request": raw_text}
-
-            content = extract_file_write_content(raw_text, t)
-
-            if path.lower().endswith('.py') and content:
-                if not content.strip().startswith('print') and ('print' in t or 'prints' in t or 'python script' in t):
-                    content = f'print({json.dumps(content)})'
-
-            return "file_write", {"path": path, "content": content}
+        if file_dir_intent is not None:
+            return file_dir_intent
 
         # ====================================================
         # GITHUB REPO TOOL
@@ -10315,62 +10153,6 @@ IMPORTANT RULES:
                 "branch": branch_value,
                 "per_page": 20,
             }
-
-        # ====================================================
-        # DIRECTORY LIST
-        # ====================================================
-
-        dir_list_triggers = [
-            "list directory",
-            "list files",
-            "show files",
-            "show directory",
-            "directory contents",
-            "folder contents",
-            "what files",
-            "what's in this folder",
-            "contents of",
-            "list the contents",
-            "list contents",
-            "show contents",
-            "what is in",
-            "toy box",
-            "toybox",
-        ]
-
-        if (
-            any(x in t for x in dir_list_triggers)
-            or re.search(r'\blist\b\s+[a-zA-Z]:\\', t)
-            or re.search(r'\bcontents\b.*[a-zA-Z]:\\', t)
-        ):
-            workspace_root = self.workspace_root
-            path = workspace_root
-            
-            # Try to extract path after "in " (e.g., "list files in c:\")
-            m = re.search(r'in\s+([a-zA-Z]:\\?[^\n\r]*)', text, re.IGNORECASE)
-            
-            # If not found, try "on " (e.g., "list files on c:\")
-            if not m:
-                m = re.search(r'on\s+([a-zA-Z]:\\?[^\n\r]*)', text, re.IGNORECASE)
-            
-            # If not found, try "of " (e.g., "list the contents of c:\")
-            if not m:
-                m = re.search(r'of\s+([a-zA-Z]:\\?[^\n\r]*)', text, re.IGNORECASE)
-            
-            # If still not found, try bare path pattern (e.g., "list c:\" or "list files c:\")
-            if not m:
-                m = re.search(r'(?:list\s+files\s+)?([a-zA-Z]:\\[^\n\r]*)', text, re.IGNORECASE)
-            
-            # If still not found, try just a drive letter (e.g., "list e:\" or "list files e:\")
-            if not m:
-                m = re.search(r'(?:list\s+)?([a-zA-Z]:\\?)(?:\s|$)', text, re.IGNORECASE)
-            
-            if m:
-                path = m.group(1).strip()
-            elif any(x in t for x in ["toy box", "toybox"]):
-                path = os.path.join(workspace_root, "toys")
-
-            return "dir_list", {"path": path}
 
         # ====================================================
         # TOOL LIST

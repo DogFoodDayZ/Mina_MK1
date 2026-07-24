@@ -717,6 +717,28 @@ def _build_process_fingerprint(req: ProcessRequest) -> str:
     return hashlib.sha1(fp_src.encode("utf-8")).hexdigest()
 
 
+def _should_bypass_process_dedupe(req: ProcessRequest) -> bool:
+    text = str(req.input or "").strip().lower()
+    if not text:
+        return False
+
+    stateful_phrases = {
+        "yes scan now",
+        "scan now",
+        "yes scan",
+        "scan it",
+        "yes scan it",
+        "cancel scan",
+        "stop scan",
+        "no scan",
+        "never mind scan",
+    }
+    if text in stateful_phrases:
+        return True
+
+    return re.search(r"\b(?:yes\s+scan\s+now|scan\s+now|start\s+scan|run\s+scan|begin\s+scan|cancel\s+scan|stop\s+scan|abort\s+scan)\b", text) is not None
+
+
 def _extract_tool_output(reply_text: str) -> str:
     text = str(reply_text or "")
     marker = "VERIFIED OUTPUT:"
@@ -1533,31 +1555,33 @@ def process(req: ProcessRequest):
     """
     fp = _build_process_fingerprint(req)
     now = time.time()
+    bypass_dedupe = _should_bypass_process_dedupe(req)
     source_hint = str(req.input_source or "").strip().lower()
     event_source = "voice" if source_hint == "voice" else "process"
     channel = "voice" if event_source == "voice" else "text"
 
-    with _process_dedupe_lock:
-        cached_fp = _process_dedupe_cache.get("fingerprint")
-        cached_out = _process_dedupe_cache.get("response")
-        cached_ts = float(_process_dedupe_cache.get("ts") or 0.0)
+    if not bypass_dedupe:
+        with _process_dedupe_lock:
+            cached_fp = _process_dedupe_cache.get("fingerprint")
+            cached_out = _process_dedupe_cache.get("response")
+            cached_ts = float(_process_dedupe_cache.get("ts") or 0.0)
 
-        if (
-            cached_fp
-            and cached_fp == fp
-            and isinstance(cached_out, dict)
-            and now - cached_ts <= max(0.0, PROCESS_DEDUPE_WINDOW_SECONDS)
-        ):
-            out = dict(cached_out)
-            out["deduped"] = True
-            _push_gui_event(
-                source=event_source,
-                input_text=req.input,
-                reply_text=str(out.get("reply") or ""),
-                extra={"deduped": True},
-            )
-            # Skip optional TTS/playback on deduped requests to avoid repetitive loops.
-            return out
+            if (
+                cached_fp
+                and cached_fp == fp
+                and isinstance(cached_out, dict)
+                and now - cached_ts <= max(0.0, PROCESS_DEDUPE_WINDOW_SECONDS)
+            ):
+                out = dict(cached_out)
+                out["deduped"] = True
+                _push_gui_event(
+                    source=event_source,
+                    input_text=req.input,
+                    reply_text=str(out.get("reply") or ""),
+                    extra={"deduped": True},
+                )
+                # Skip optional TTS/playback on deduped requests to avoid repetitive loops.
+                return out
 
     try:
         out = core.process(
@@ -1586,7 +1610,7 @@ def process(req: ProcessRequest):
         or _looks_like_tool_markup_leak(reply_text_for_cache)
     )
 
-    if not skip_cache:
+    if not skip_cache and not bypass_dedupe:
         with _process_dedupe_lock:
             _process_dedupe_cache["fingerprint"] = fp
             _process_dedupe_cache["response"] = dict(out) if isinstance(out, dict) else {"reply": str(out)}

@@ -22,3 +22,7 @@ Last updated: 2026-07-24
 - [ ] Add guardrails and regression coverage for file inspector:
   - Add automated tests for UTF-16, CP1252, SQLite, ZIP, PDF, PNG, WAV, MP3, MP4, and directory filter flows.
   - Add clearer size/depth limits and partial-read messaging for huge files, huge archives, and large directory trees.
+- [ ] Clean up E:\workspace and define retention rules:
+  - Archive or delete stray root-level test files (`policy_test.txt`, `test*.txt`, `tmp_codegen_*`, `quick_prog.py`) after review.
+  - Prune `E:\workspace\tmp` tool self-test artifacts and define what Mina is allowed to leave behind there.
+  - Keep persistent Mina state files and project tracker in place, but stop mixing them with scratch/test junk at workspace root.

@@ -44,6 +44,7 @@ class MinaGUI(tk.Tk):
         self.api_base_var = tk.StringVar(value=API_BASE)
         self.status_var = tk.StringVar(value="Connecting to core...")
         self.db_var = tk.StringVar(value="Connecting to DB...")
+        self.buffer_var = tk.StringVar(value="Memory buffer: loading...")
         self.name_var = tk.StringVar(value="")
         self.memory_query_var = tk.StringVar(value="what is my name")
         self.user_input_var = tk.StringVar(value="")
@@ -168,10 +169,12 @@ class MinaGUI(tk.Tk):
 
         ttk.Label(status_box, textvariable=self.status_var, style="Status.TLabel", justify="left", wraplength=260).pack(anchor="w", fill="x")
         ttk.Label(status_box, textvariable=self.db_var, style="Status.TLabel", justify="left", wraplength=260).pack(anchor="w", fill="x", pady=(8, 0))
+        ttk.Label(status_box, textvariable=self.buffer_var, style="Status.TLabel", justify="left", wraplength=260).pack(anchor="w", fill="x", pady=(8, 0))
         ttk.Separator(status_box).pack(fill="x", pady=10)
         ttk.Label(status_box, text="Memory facts", style="Header.TLabel").pack(anchor="w")
         ttk.Label(status_box, textvariable=self.name_var, style="Status.TLabel", justify="left", wraplength=260).pack(anchor="w", fill="x", pady=(6, 0))
         ttk.Button(status_box, text="What is my name?", style="Action.TButton", command=self.ask_name).pack(anchor="w", pady=(10, 0))
+        ttk.Button(status_box, text="Flush Memory Buffer", style="Action.TButton", command=self.flush_memory_buffer).pack(anchor="w", pady=(8, 0))
         ttk.Button(status_box, text="Poll Now", style="Action.TButton", command=self.refresh_all).pack(anchor="w", pady=(8, 0))
 
     def _append_chat(self, who: str, text: str, tag: str) -> None:
@@ -455,6 +458,25 @@ class MinaGUI(tk.Tk):
         else:
             self.db_var.set("WAITING FOR DB…")
 
+        buffer_status = self._get_json("/memory/buffer_status", timeout=5)
+        if isinstance(buffer_status, dict) and bool(buffer_status.get("ok")):
+            payload = buffer_status.get("result") if isinstance(buffer_status.get("result"), dict) else {}
+            pending = int(payload.get("pending") or 0)
+            warning = bool(payload.get("warning", False))
+            threshold = int(payload.get("warn_threshold") or 0)
+            last_flush_result = payload.get("last_flush_result") if isinstance(payload.get("last_flush_result"), dict) else {}
+            flushed = int(last_flush_result.get("flushed") or 0)
+            failed = int(last_flush_result.get("failed") or 0)
+            warn_line = "YES" if warning else "NO"
+            self.buffer_var.set(
+                "MEMORY BUFFER\n"
+                f"pending: {pending}\n"
+                f"warning: {warn_line} (threshold {threshold})\n"
+                f"last flush: +{flushed} / fail {failed}"
+            )
+        else:
+            self.buffer_var.set("MEMORY BUFFER\nstatus unavailable")
+
         promoted = self._get_json("/memory/promoted?limit=1", timeout=5)
         if isinstance(promoted, list) and promoted:
             first = promoted[0]
@@ -547,6 +569,24 @@ class MinaGUI(tk.Tk):
             self._append_chat("Promoted", "\n".join(lines) if lines else "No promoted memories.", "meta")
         else:
             self._append_chat("Promoted", json.dumps(result, indent=2), "meta")
+
+    def flush_memory_buffer(self) -> None:
+        result = self._post_json("/memory/flush_buffer?max_items=500", {}, timeout=60)
+        if result and result.get("ok"):
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            self._append_chat(
+                "Memory",
+                (
+                    "Buffer flush complete: "
+                    f"flushed={payload.get('flushed', 0)} "
+                    f"failed={payload.get('failed', 0)} "
+                    f"pending={payload.get('pending', 0)}"
+                ),
+                "meta",
+            )
+        else:
+            self._append_chat("Memory", f"Buffer flush failed: {result}", "meta")
+        self.refresh_all()
 
     def ask_name(self) -> None:
         self.memory_query_var.set("what is my name")

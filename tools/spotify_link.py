@@ -2,8 +2,9 @@ import base64
 import json
 import os
 import random
+import re
 import time
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Any, Dict, Optional
 
 import requests
@@ -16,6 +17,19 @@ _TOKEN_CACHE: Dict[str, Any] = {
 
 _ENV_LOADED = False
 _ENV_LOCK = Lock()
+
+_DJ_LOCK = Lock()
+_DJ_STOP_EVENT: Optional[Event] = None
+_DJ_THREAD: Optional[Thread] = None
+_DJ_STATE: Dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "last_track": None,
+    "last_switch_at": None,
+    "tracks_played": 0,
+    "last_error": None,
+    "switch_offset_seconds": 2,
+}
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -895,14 +909,28 @@ def _current_playback() -> Dict[str, Any]:
 
 
 def _favorite_tracks(limit: int = 20) -> Dict[str, Any]:
-    safe_limit = max(1, min(50, int(limit)))
-    r = _api_request("GET", "/v1/me/tracks", params={"limit": safe_limit})
-    if not r.get("ok"):
-        return r
-
-    items = (r.get("result") or {}).get("items") if isinstance(r.get("result"), dict) else []
+    safe_limit = max(1, min(500, int(limit)))
     out = []
-    if isinstance(items, list):
+    total_available: Optional[int] = None
+    offset = 0
+
+    while len(out) < safe_limit:
+        batch_size = min(50, safe_limit - len(out))
+        r = _api_request("GET", "/v1/me/tracks", params={"limit": batch_size, "offset": offset})
+        if not r.get("ok"):
+            return r
+
+        body = r.get("result") if isinstance(r.get("result"), dict) else {}
+        items = body.get("items") if isinstance(body, dict) else []
+        if total_available is None:
+            try:
+                total_available = int(body.get("total")) if isinstance(body, dict) and body.get("total") is not None else None
+            except Exception:
+                total_available = None
+
+        if not isinstance(items, list) or not items:
+            break
+
         for row in items:
             if not isinstance(row, dict):
                 continue
@@ -916,22 +944,65 @@ def _favorite_tracks(limit: int = 20) -> Dict[str, Any]:
                     "id": track.get("id"),
                     "artists": artist_names,
                     "album": ((track.get("album") or {}).get("name") if isinstance(track.get("album"), dict) else None),
+                    "duration_ms": track.get("duration_ms"),
                     "saved_at": row.get("added_at"),
                 }
             )
+
+        offset += len(items)
+        if total_available is not None and offset >= total_available:
+            break
 
     return {
         "ok": True,
         "result": {
             "count": len(out),
+            "total_available": total_available if isinstance(total_available, int) and total_available >= 0 else len(out),
             "tracks": out,
         },
         "error": None,
     }
 
 
-def _play_favorite(track_query: str = "", device_id: str = "", pick_random: bool = False) -> Dict[str, Any]:
-    fav = _favorite_tracks(limit=50)
+def _is_generic_random_request(query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+
+    generic_patterns = [
+        r"\brandom\b",
+        r"\brandome\b",
+        r"\bshuffle\b",
+        r"\banything\b",
+        r"\bwhatever\b",
+        r"\bsurprise\s+me\b",
+        r"\bany\s+(?:song|track)\b",
+        r"\ba\s+(?:song|track)\b",
+        r"\bsome\s+music\b",
+    ]
+    return any(re.search(p, q, re.IGNORECASE) is not None for p in generic_patterns)
+
+
+def _coerce_track_index(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    m = re.search(r"(?:#|number\s*)?(\d{1,3})", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        idx = int(m.group(1))
+    except Exception:
+        return None
+    return idx if idx > 0 else None
+
+
+def _play_favorite(track_query: str = "", device_id: str = "", pick_random: bool = False, track_index: Optional[int] = None) -> Dict[str, Any]:
+    fav = _favorite_tracks(limit=500)
     if not fav.get("ok"):
         return fav
 
@@ -944,8 +1015,25 @@ def _play_favorite(track_query: str = "", device_id: str = "", pick_random: bool
         }
 
     selected = None
+
+    idx = track_index if isinstance(track_index, int) and track_index > 0 else None
+    if idx is not None:
+        if idx > len(tracks):
+            return {
+                "ok": False,
+                "result": {
+                    "track_index": idx,
+                    "count": len(tracks),
+                },
+                "error": "favorite_track_index_out_of_range",
+            }
+        selected = tracks[idx - 1] if tracks else None
+
     q = str(track_query or "").strip().lower()
-    if q:
+    if selected is None and q and _is_generic_random_request(q):
+        pick_random = True
+
+    if selected is None and q:
         for t in tracks:
             if not isinstance(t, dict):
                 continue
@@ -960,8 +1048,29 @@ def _play_favorite(track_query: str = "", device_id: str = "", pick_random: bool
         selected = random.choice(tracks)
 
     # If user asked for a specific favorite and we could not match it,
-    # do not silently fall back to another track.
+    # avoid random fallback, but do try a normal Spotify track search so
+    # natural phrasing still works when the liked-song match is noisy.
     if selected is None and q:
+        if not _is_generic_random_request(q):
+            found = _search_track(query=track_query, limit=1)
+            if found.get("ok"):
+                alt_tracks = (found.get("result") or {}).get("tracks") or []
+                if alt_tracks:
+                    played = _play_searched_track(
+                        track_row=(alt_tracks[0] or {}),
+                        device_id=device_id,
+                        requested_query=track_query,
+                    )
+                    if played.get("ok"):
+                        payload = played.get("result") if isinstance(played.get("result"), dict) else {}
+                        out = dict(played)
+                        out["result"] = {
+                            **payload,
+                            "source": "search_fallback_after_favorites_miss",
+                            "favorites_match": False,
+                        }
+                        return out
+
         return {
             "ok": False,
             "result": {
@@ -1001,8 +1110,165 @@ def _play_favorite(track_query: str = "", device_id: str = "", pick_random: bool
                 "uri": selected.get("uri"),
                 "artists": selected.get("artists"),
                 "album": selected.get("album"),
+                "duration_ms": selected.get("duration_ms"),
             },
             "source": "favorites_library",
+        },
+        "error": None,
+    }
+
+
+def _dj_snapshot() -> Dict[str, Any]:
+    with _DJ_LOCK:
+        out = dict(_DJ_STATE)
+        out["running"] = bool(_DJ_STATE.get("running", False))
+        return out
+
+
+def _stop_favorites_dj() -> Dict[str, Any]:
+    global _DJ_STOP_EVENT
+    with _DJ_LOCK:
+        if not _DJ_STATE.get("running"):
+            status = "dj_not_running"
+            snapshot = dict(_DJ_STATE)
+        if _DJ_STOP_EVENT is not None:
+            _DJ_STOP_EVENT.set()
+        _DJ_STATE["running"] = False
+        if "status" not in locals():
+            status = "dj_stopping"
+            snapshot = dict(_DJ_STATE)
+
+    return {
+        "ok": True,
+        "result": {
+            "status": status,
+            "dj": snapshot,
+        },
+        "error": None,
+    }
+
+
+def _favorites_dj_status() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "result": {
+            "status": "dj_running" if _dj_snapshot().get("running") else "dj_stopped",
+            "dj": _dj_snapshot(),
+        },
+        "error": None,
+    }
+
+
+def _dj_wait_with_stop(total_seconds: int, stop_event: Event) -> bool:
+    remaining = max(1, int(total_seconds))
+    for _ in range(remaining):
+        if stop_event.is_set():
+            return True
+        time.sleep(1)
+    return stop_event.is_set()
+
+
+def _favorites_dj_loop(device_id: str, stop_event: Event, switch_offset_seconds: int) -> None:
+    global _DJ_THREAD
+    try:
+        while not stop_event.is_set():
+            fav = _favorite_tracks(limit=500)
+            if not fav.get("ok"):
+                with _DJ_LOCK:
+                    _DJ_STATE["last_error"] = str(fav.get("error") or "favorites_library_error")
+                if _dj_wait_with_stop(4, stop_event):
+                    break
+                continue
+
+            tracks = (fav.get("result") or {}).get("tracks") or []
+            if not tracks:
+                with _DJ_LOCK:
+                    _DJ_STATE["last_error"] = "favorites_library_empty_or_unavailable"
+                if _dj_wait_with_stop(6, stop_event):
+                    break
+                continue
+
+            selected = random.choice(tracks)
+            uri = str((selected or {}).get("uri") or "").strip()
+            if not uri:
+                if _dj_wait_with_stop(2, stop_event):
+                    break
+                continue
+
+            played = _play_track(track_uri=uri, device_id=device_id)
+            if not played.get("ok"):
+                with _DJ_LOCK:
+                    _DJ_STATE["last_error"] = str(played.get("error") or "dj_play_failed")
+                if _dj_wait_with_stop(4, stop_event):
+                    break
+                continue
+
+            duration_ms = (selected or {}).get("duration_ms")
+            try:
+                duration_sec = int(duration_ms) // 1000 if duration_ms is not None else 180
+            except Exception:
+                duration_sec = 180
+            wait_sec = max(8, duration_sec - max(0, int(switch_offset_seconds)))
+
+            with _DJ_LOCK:
+                _DJ_STATE["last_track"] = {
+                    "name": (selected or {}).get("name"),
+                    "artists": (selected or {}).get("artists"),
+                    "duration_ms": duration_ms,
+                    "wait_seconds": wait_sec,
+                }
+                _DJ_STATE["last_switch_at"] = time.time()
+                _DJ_STATE["tracks_played"] = int(_DJ_STATE.get("tracks_played") or 0) + 1
+                _DJ_STATE["last_error"] = None
+
+            if _dj_wait_with_stop(wait_sec, stop_event):
+                break
+    except Exception as e:
+        with _DJ_LOCK:
+            _DJ_STATE["last_error"] = f"dj_loop_exception: {e}"
+    finally:
+        with _DJ_LOCK:
+            _DJ_STATE["running"] = False
+        _DJ_THREAD = None
+
+
+def _start_favorites_dj(device_id: str = "", switch_offset_seconds: int = 2) -> Dict[str, Any]:
+    global _DJ_STOP_EVENT, _DJ_THREAD
+
+    safe_offset = max(0, min(12, int(switch_offset_seconds)))
+
+    with _DJ_LOCK:
+        if _DJ_STATE.get("running"):
+            snapshot = dict(_DJ_STATE)
+            return {
+                "ok": True,
+                "result": {
+                    "status": "dj_already_running",
+                    "dj": snapshot,
+                },
+                "error": None,
+            }
+
+        _DJ_STOP_EVENT = Event()
+        _DJ_STATE["running"] = True
+        _DJ_STATE["started_at"] = time.time()
+        _DJ_STATE["last_error"] = None
+        _DJ_STATE["switch_offset_seconds"] = safe_offset
+
+        _DJ_THREAD = Thread(
+            target=_favorites_dj_loop,
+            args=(str(device_id or "").strip(), _DJ_STOP_EVENT, safe_offset),
+            daemon=True,
+            name="mk1_spotify_favorites_dj",
+        )
+        _DJ_THREAD.start()
+        snapshot = dict(_DJ_STATE)
+
+    return {
+        "ok": True,
+        "result": {
+            "status": "dj_started",
+            "dj": snapshot,
         },
         "error": None,
     }
@@ -1051,6 +1317,9 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
 
     if action in {"play", "play_spotify", "resume"}:
         query = str(in_args.get("track_query") or in_args.get("query") or "").strip()
+        track_index = _coerce_track_index(in_args.get("track_index") or in_args.get("track_selection"))
+        if track_index is not None:
+            return _play_favorite(track_query=query, device_id=device_id, pick_random=False, track_index=track_index)
         if query:
             found = _search_track(query=query, limit=1)
             if not found.get("ok"):
@@ -1133,6 +1402,13 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
 
     if action == "add_track_to_playlist":
         playlist_id = str(in_args.get("playlist_id") or "").strip()
+        playlist_name = str(in_args.get("playlist_name") or in_args.get("name") or "").strip()
+        if not playlist_id and playlist_name:
+            found = _find_playlist_by_name(playlist_name)
+            if not found.get("ok"):
+                return found
+            playlist_id = str((found.get("result") or {}).get("id") or "").strip()
+
         direct_uri = str(in_args.get("track_uri") or "").strip()
         if direct_uri:
             uris = [direct_uri]
@@ -1236,7 +1512,22 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
         query = str(in_args.get("track_query") or in_args.get("query") or "").strip()
         selection_hint = str(in_args.get("track_selection") or "").strip().lower()
         pick_random = selection_hint in {"random", "shuffle"}
-        return _play_favorite(track_query=query, device_id=device_id, pick_random=pick_random)
+        track_index = _coerce_track_index(in_args.get("track_index") or in_args.get("track_selection"))
+        return _play_favorite(track_query=query, device_id=device_id, pick_random=pick_random, track_index=track_index)
+
+    if action in {"start_favorites_dj", "favorites_dj_start", "dj_start"}:
+        offset_raw = in_args.get("switch_offset_seconds")
+        try:
+            offset_sec = int(offset_raw) if offset_raw is not None else 2
+        except Exception:
+            offset_sec = 2
+        return _start_favorites_dj(device_id=device_id, switch_offset_seconds=offset_sec)
+
+    if action in {"stop_favorites_dj", "favorites_dj_stop", "dj_stop"}:
+        return _stop_favorites_dj()
+
+    if action in {"favorites_dj_status", "dj_status"}:
+        return _favorites_dj_status()
 
     if action == "add_tracks_to_playlist":
         playlist_id = str(in_args.get("playlist_id") or "").strip()
@@ -1268,7 +1559,7 @@ tool_entry.schema = {
         "properties": {
             "action": {
                 "type": "string",
-                "description": "Action: connect_status, search_track, create_playlist, add_track_to_playlist, add_tracks_to_playlist, play, play_spotify, resume, play_track, play_playlist, pause, stop, shuffle_on, shuffle_off, set_shuffle, list_playlists, playlist_tracks, current_playback, favorites_list, liked_songs, play_favorite",
+                "description": "Action: connect_status, search_track, create_playlist, add_track_to_playlist, add_tracks_to_playlist, play, play_spotify, resume, play_track, play_playlist, pause, stop, shuffle_on, shuffle_off, set_shuffle, list_playlists, playlist_tracks, current_playback, favorites_list, liked_songs, play_favorite, start_favorites_dj, stop_favorites_dj, favorites_dj_status",
             },
             "playlist_name": {
                 "type": "string",
@@ -1289,6 +1580,11 @@ tool_entry.schema = {
             "track_queries": {
                 "type": "string",
                 "description": "Pipe-separated track queries for seeding new playlist. Example: song one | song two",
+            },
+            "track_index": {
+                "type": "integer",
+                "description": "1-based index into liked songs/favorites list for play_favorite actions.",
+                "minimum": 1,
             },
             "track_uri": {
                 "type": "string",
@@ -1319,6 +1615,12 @@ tool_entry.schema = {
                 "description": "Result limit for list/search actions.",
                 "minimum": 1,
                 "maximum": 50,
+            },
+            "switch_offset_seconds": {
+                "type": "integer",
+                "description": "How many seconds before track end DJ should switch to next favorite (start_favorites_dj).",
+                "minimum": 0,
+                "maximum": 12,
             },
         },
         "required": ["action"],

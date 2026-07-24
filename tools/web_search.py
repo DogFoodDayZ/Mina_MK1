@@ -17,6 +17,197 @@ MAX_PAGE_BYTES = 300_000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
+SEARCH_MODES = {"balanced", "strict", "wide"}
+
+# Broad low-signal domains that commonly dominate generic queries.
+LOW_SIGNAL_DOMAIN_PATTERNS = [
+    r"(^|\.)bestbuy\.com$",
+    r"(^|\.)merriam-webster\.com$",
+    r"(^|\.)dictionary\.cambridge\.org$",
+    r"(^|\.)usdictionary\.com$",
+]
+
+TOPIC_PREFERRED_DOMAINS = {
+    "travel": [
+        "google.com/travel",
+        "skyscanner.com",
+        "expedia.com",
+        "kayak.com",
+        "flights.google.com",
+        "tripadvisor.com",
+        "booking.com",
+        "airlines",
+    ],
+    "coding": [
+        "docs.",
+        "developer.",
+        "github.com",
+        "stackoverflow.com",
+        "pypi.org",
+        "npmjs.com",
+        "readthedocs",
+        "mozilla.org",
+    ],
+    "news": [
+        "reuters.com",
+        "apnews.com",
+        "bbc.com",
+        "nytimes.com",
+        "wsj.com",
+        "theguardian.com",
+    ],
+    "health": [
+        "cdc.gov",
+        "nih.gov",
+        "who.int",
+        "mayoclinic.org",
+        "nhs.uk",
+        "webmd.com",
+    ],
+}
+
+
+def _extract_host(url: str) -> str:
+    try:
+        host = (urllib.parse.urlparse(url).netloc or "").lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
+
+
+def _query_tokens(query: str) -> List[str]:
+    words = re.findall(r"[a-z0-9]{3,}", (query or "").lower())
+    stop = {
+        "the", "and", "for", "from", "with", "that", "this", "into", "onto", "about",
+        "best", "top", "find", "search", "show", "list", "what", "where", "when",
+    }
+    return [w for w in words if w not in stop]
+
+
+def _detect_topic(query: str) -> str:
+    q = (query or "").lower()
+    if re.search(r"\b(flight|airline|airport|layover|itinerary|fare|hotel|travel|trip|route|visa)\b", q):
+        return "travel"
+    if re.search(r"\b(python|javascript|typescript|java|c\+\+|rust|api|sdk|library|framework|bug|error|stack trace|docs?)\b", q):
+        return "coding"
+    if re.search(r"\b(breaking|headline|news|update|election|war|economy)\b", q):
+        return "news"
+    if re.search(r"\b(symptom|disease|medicine|dose|treatment|clinic|health|diagnosis|vaccine)\b", q):
+        return "health"
+    return "general"
+
+
+def _is_low_signal(url: str, title: str) -> bool:
+    host = _extract_host(url)
+    url_low = (url or "").lower()
+
+    # Filter common ad/click-tracker redirect endpoints.
+    if "duckduckgo.com/y.js" in url_low:
+        return True
+    if "bing.com/aclick" in url_low:
+        return True
+    if "ad_domain=" in url_low:
+        return True
+
+    for p in LOW_SIGNAL_DOMAIN_PATTERNS:
+        if re.search(p, host, flags=re.IGNORECASE):
+            return True
+
+    t = (title or "").lower()
+    if re.search(r"\bdefinition\b|\bmeaning\b|\bdictionary\b", t):
+        return True
+    return False
+
+
+def _score_result(result: Dict[str, str], query: str, topic: str) -> int:
+    title = str(result.get("title") or "")
+    snippet = str(result.get("snippet") or "")
+    url = str(result.get("url") or "")
+    host = _extract_host(url)
+    text = (title + " " + snippet).lower()
+    tokens = _query_tokens(query)
+
+    score = 0
+    for token in tokens:
+        if token in text:
+            score += 3
+        if token in host:
+            score += 2
+
+    prefs = TOPIC_PREFERRED_DOMAINS.get(topic, [])
+    for marker in prefs:
+        if marker in (host + url.lower()):
+            score += 8
+            break
+
+    if _is_low_signal(url, title):
+        score -= 10
+
+    return score
+
+
+def _rerank_results(results: List[Dict[str, str]], query: str, topic: str, mode: str, max_results: int) -> List[Dict[str, str]]:
+    if not results:
+        return []
+
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "").strip()
+        url = str(row.get("url") or "").strip()
+        if not title or not url:
+            continue
+        key = (title.lower(), url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append({
+            "title": title,
+            "url": url,
+            "snippet": str(row.get("snippet") or "").strip(),
+        })
+
+    if mode == "wide":
+        return deduped[:max_results]
+
+    scored = [
+        (idx, _score_result(row, query=query, topic=topic), row)
+        for idx, row in enumerate(deduped)
+    ]
+    scored.sort(key=lambda x: (-x[1], x[0]))
+
+    if mode == "strict":
+        filtered = [row for _, score, row in scored if score >= 2 and not _is_low_signal(row.get("url", ""), row.get("title", ""))]
+        return filtered[:max_results]
+
+    # balanced: keep strong results first; if too few survive, include weaker scored rows.
+    preferred = [row for _, score, row in scored if score >= 0 and not _is_low_signal(row.get("url", ""), row.get("title", ""))]
+    if len(preferred) >= max_results:
+        return preferred[:max_results]
+
+    out = list(preferred)
+    # Prefer remaining non-low-signal rows before allowing low-signal backfill.
+    for _, _, row in scored:
+        if row in out:
+            continue
+        if _is_low_signal(row.get("url", ""), row.get("title", "")):
+            continue
+        out.append(row)
+        if len(out) >= max_results:
+            return out[:max_results]
+
+    # In balanced mode, prefer fewer clean results over padded low-signal links.
+    if out:
+        return out[:max_results]
+
+    # If everything scored as low-signal, still return something rather than empty.
+    return [row for _, _, row in scored][:max_results]
+
+
 def _decode_duckduckgo_redirect(url: str) -> str:
     try:
         parsed = urllib.parse.urlparse(url)
@@ -392,6 +583,180 @@ def _duckduckgo_html_search(query: str, timeout: int, max_results: int) -> List[
     return _parse_search_results(text, max_results)
 
 
+def _duckduckgo_lite_search(query: str, timeout: int, max_results: int) -> List[Dict[str, str]]:
+    """Secondary fallback source: DuckDuckGo lite endpoint."""
+    url = "https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote_plus(query)
+
+    page = _fetch_text_url_requests(url, timeout=timeout, max_bytes=MAX_SEARCH_BYTES)
+    if not page.get("ok"):
+        page = _fetch_text_url(url, timeout=timeout, max_bytes=MAX_SEARCH_BYTES)
+
+    if not page.get("ok"):
+        return []
+
+    text = page.get("text") or ""
+    if not text.strip():
+        return []
+
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', text, flags=re.IGNORECASE | re.DOTALL):
+        raw_url = str(m.group(1) or "").strip()
+        title = _strip_tags(str(m.group(2) or "")).strip()
+        if not raw_url or not title:
+            continue
+
+        final_url = _decode_duckduckgo_redirect(raw_url)
+        if final_url.startswith("/"):
+            final_url = "https://lite.duckduckgo.com" + final_url
+        if not re.match(r"https?://", final_url, flags=re.IGNORECASE):
+            continue
+        if "duckduckgo.com" in final_url.lower():
+            continue
+
+        key = (title.lower(), final_url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append({
+            "title": title,
+            "url": final_url,
+            "snippet": "",
+        })
+        if len(out) >= max_results:
+            break
+
+    return out
+
+
+def _bing_html_search(query: str, timeout: int, max_results: int) -> List[Dict[str, str]]:
+    """Last-resort source: parse Bing HTML result rows."""
+    url = "https://www.bing.com/search?q=" + urllib.parse.quote_plus(query)
+
+    page = _fetch_text_url_requests(url, timeout=timeout, max_bytes=MAX_SEARCH_BYTES)
+    if not page.get("ok"):
+        page = _fetch_text_url(url, timeout=timeout, max_bytes=MAX_SEARCH_BYTES)
+
+    if not page.get("ok"):
+        return []
+
+    text = page.get("text") or ""
+    if not text.strip():
+        return []
+
+    out: List[Dict[str, str]] = []
+    seen = set()
+
+    blocks = re.findall(
+        r'<li[^>]*class=["\'][^"\']*b_algo[^"\']*["\'][^>]*>([\s\S]*?)</li>',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    for block in blocks:
+        m = re.search(r'<h2>\s*<a[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>\s*</h2>', block, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        url_val = str(m.group(1) or "").strip()
+        title = _strip_tags(str(m.group(2) or "")).strip()
+        if not url_val or not title:
+            continue
+        if not re.match(r"https?://", url_val, flags=re.IGNORECASE):
+            continue
+
+        snippet_match = re.search(r'<p>([\s\S]*?)</p>', block, flags=re.IGNORECASE)
+        snippet = _strip_tags(snippet_match.group(1)) if snippet_match else ""
+
+        key = (title.lower(), url_val.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append({
+            "title": title,
+            "url": url_val,
+            "snippet": snippet,
+        })
+        if len(out) >= max_results:
+            break
+
+    # Ultra-light fallback for markup variants: collect <h2><a ...> pairs globally.
+    if not out:
+        for m in re.finditer(r'<h2>\s*<a[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>\s*</h2>', text, flags=re.IGNORECASE | re.DOTALL):
+            url_val = str(m.group(1) or "").strip()
+            title = _strip_tags(str(m.group(2) or "")).strip()
+            if not url_val or not title:
+                continue
+            if not re.match(r"https?://", url_val, flags=re.IGNORECASE):
+                continue
+            key = (title.lower(), url_val.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "title": title,
+                "url": url_val,
+                "snippet": "",
+            })
+            if len(out) >= max_results:
+                break
+
+    return out
+
+
+def _bing_rss_search(query: str, timeout: int, max_results: int) -> List[Dict[str, str]]:
+    """Robust fallback: Bing RSS feed results (simple XML payload)."""
+    url = "https://www.bing.com/search?format=rss&q=" + urllib.parse.quote_plus(query)
+
+    page = _fetch_text_url_requests(url, timeout=timeout, max_bytes=MAX_SEARCH_BYTES)
+    if not page.get("ok"):
+        page = _fetch_text_url(url, timeout=timeout, max_bytes=MAX_SEARCH_BYTES)
+
+    if not page.get("ok"):
+        return []
+
+    text = page.get("text") or ""
+    if not text.strip():
+        return []
+
+    out: List[Dict[str, str]] = []
+    seen = set()
+
+    for item in re.findall(r"<item>([\s\S]*?)</item>", text, flags=re.IGNORECASE):
+        title_m = re.search(r"<title>([\s\S]*?)</title>", item, flags=re.IGNORECASE)
+        link_m = re.search(r"<link>([\s\S]*?)</link>", item, flags=re.IGNORECASE)
+        desc_m = re.search(r"<description>([\s\S]*?)</description>", item, flags=re.IGNORECASE)
+
+        title = html.unescape(_strip_tags(title_m.group(1))) if title_m else ""
+        url_val = html.unescape((link_m.group(1) or "").strip()) if link_m else ""
+        snippet = html.unescape(_strip_tags(desc_m.group(1))) if desc_m else ""
+
+        title = title.strip()
+        url_val = url_val.strip()
+        snippet = snippet.strip()
+
+        if not title or not url_val:
+            continue
+        if not re.match(r"https?://", url_val, flags=re.IGNORECASE):
+            continue
+
+        key = (title.lower(), url_val.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append({
+            "title": title,
+            "url": url_val,
+            "snippet": snippet,
+        })
+        if len(out) >= max_results:
+            break
+
+    return out
+
+
 def _get_weather(location: str, timeout: int = 10) -> List[Dict[str, str]]:
     """Fetch weather data from wttr.in (bot-friendly)."""
     try:
@@ -463,6 +828,7 @@ def web_search_impl(
     timeout: int = 12,
     include_content: bool = False,
     content_chars: int = 800,
+    mode: str = "balanced",
 ) -> Dict[str, Any]:
     if not query or not isinstance(query, str):
         return {"ok": False, "result": None, "error": "no_query_provided"}
@@ -475,6 +841,10 @@ def web_search_impl(
 
     if content_chars < 200 or content_chars > 4000:
         return {"ok": False, "result": None, "error": "content_chars_out_of_range_200_to_4000"}
+
+    mode_value = str(mode or "balanced").strip().lower()
+    if mode_value not in SEARCH_MODES:
+        return {"ok": False, "result": None, "error": "mode_must_be_balanced_strict_or_wide"}
 
     # Route weather queries to wttr.in first so weather stays deterministic.
     q_low = query.strip().lower()
@@ -495,6 +865,8 @@ def web_search_impl(
             },
             "error": None,
         }
+
+    topic = _detect_topic(query)
 
     # Adaptive source/query planning:
     # 1) Try instant-answer API (fast structured source).
@@ -524,6 +896,27 @@ def web_search_impl(
                 used_source = "duckduckgo_html"
                 break
 
+            lite_results = _duckduckgo_lite_search(q_try, timeout=timeout, max_results=max_results)
+            if lite_results:
+                results = lite_results[:max_results]
+                used_query = q_try
+                used_source = "duckduckgo_lite"
+                break
+
+            rss_results = _bing_rss_search(q_try, timeout=timeout, max_results=max_results)
+            if rss_results:
+                results = rss_results[:max_results]
+                used_query = q_try
+                used_source = "bing_rss"
+                break
+
+            bing_results = _bing_html_search(q_try, timeout=timeout, max_results=max_results)
+            if bing_results:
+                results = bing_results[:max_results]
+                used_query = q_try
+                used_source = "bing_html"
+                break
+
         if not results:
             return {
                 "ok": True,
@@ -534,9 +927,18 @@ def web_search_impl(
                     "used_query": query,
                     "source": "none",
                     "tried_queries": planned_queries,
+                    "mode": mode_value,
+                    "topic": topic,
                 },
                 "error": None
             }
+
+        ranked = _rerank_results(results, query=query, topic=topic, mode=mode_value, max_results=max_results)
+        if ranked:
+            results = ranked
+        else:
+            # As a safety valve, avoid empty output due to strict filtering.
+            results = results[:max_results]
         
         # Optionally fetch content from URLs
         if include_content:
@@ -561,6 +963,8 @@ def web_search_impl(
                 "used_query": used_query,
                 "source": used_source,
                 "tried_queries": planned_queries,
+                "mode": mode_value,
+                "topic": topic,
             },
             "error": None
         }
@@ -594,12 +998,15 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {"ok": False, "result": None, "error": "invalid_content_chars_type"}
 
+    mode = str(args.get("mode", "balanced") or "balanced").strip().lower()
+
     return web_search_impl(
         query=query,
         max_results=max_results,
         timeout=timeout,
         include_content=include_content,
         content_chars=content_chars,
+        mode=mode,
     )
 
 
@@ -633,6 +1040,11 @@ tool_entry.schema = {
                 "description": "Max characters in each fetched content excerpt (200-4000).",
                 "minimum": 200,
                 "maximum": 4000,
+            },
+            "mode": {
+                "type": "string",
+                "description": "Search quality mode: balanced (default), strict (cleaner), wide (broader recall).",
+                "enum": ["balanced", "strict", "wide"],
             },
         },
         "required": ["query"],

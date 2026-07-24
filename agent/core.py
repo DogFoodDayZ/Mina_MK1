@@ -4,6 +4,8 @@ import os
 import time
 import json
 import hashlib
+import hmac
+import base64
 import html
 import atexit
 import traceback
@@ -11,6 +13,7 @@ import re
 import subprocess
 import sys
 import threading
+import mimetypes
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,6 +21,8 @@ import requests
 
 from config.config_loader import load_config
 from tools.tool_loader import ToolLoader
+from tools.file_access_policy import full_access_root, normalize_tool_path
+from tools.file_inspector import inspect_file, inspect_sqlite_table, is_probably_text_path
 from memory.mk1_memory import MK1Memory
 
 
@@ -952,6 +957,10 @@ class MK1Core:
             60,
             int(self.config.get("performance", "idle_checkin_interval_seconds", 1800)),
         )
+        self.away_nag_threshold_seconds = max(
+            300,
+            int(self.config.get("performance", "away_nag_threshold_seconds", 21600)),
+        )
         self._last_maintenance_tick_ts: float = 0.0
         self._turn_clock_lock = threading.Lock()
         self._turn_clock_stop_event = threading.Event()
@@ -964,6 +973,11 @@ class MK1Core:
         self._turn_clock_last_elapsed_seconds: float = 0.0
         self._last_user_activity_monotonic: float = self._turn_clock_started_monotonic
         self._last_user_activity_at: str = self._turn_clock_started_at
+        self._last_shutdown_at: Optional[str] = None
+        self._seconds_since_last_shutdown: Optional[float] = None
+        self._away_nag_prompt_pending: bool = False
+        self._away_nag_prompt_text: str = ""
+        self._runtime_state_last_written_at: Optional[str] = None
         self._last_time_passage_note_monotonic: float = self._turn_clock_started_monotonic
         self._idle_checkin_pending: bool = False
         self._idle_checkin_due_since_at: Optional[str] = None
@@ -981,6 +995,97 @@ class MK1Core:
             )
         )
 
+        configured_search_mode = str(
+            self.config.get(
+                "tools",
+                "web_search_mode",
+                os.getenv("MK1_WEB_SEARCH_MODE", "balanced"),
+            )
+            or "balanced"
+        ).strip().lower()
+        if configured_search_mode not in {"balanced", "strict", "wide"}:
+            configured_search_mode = "balanced"
+        self.web_search_mode = configured_search_mode
+        self._load_web_search_mode_state()
+
+        configured_action_mode = str(
+            self.config.get(
+                "tools",
+                "action_mode_strictness",
+                os.getenv("MK1_ACTION_MODE_STRICTNESS", "balanced"),
+            )
+            or "balanced"
+        ).strip().lower()
+        if configured_action_mode not in {"balanced", "strict", "relaxed"}:
+            configured_action_mode = "balanced"
+        self.action_mode_strictness = configured_action_mode
+
+        self.ambiguity_ask_on_medium_low = bool(
+            self.config.get(
+                "tools",
+                "ambiguity_ask_on_medium_low",
+                True,
+            )
+        )
+        self.action_mode_light_tone = bool(
+            self.config.get(
+                "tools",
+                "action_mode_light_tone",
+                True,
+            )
+        )
+        self.auto_learn_intent_aliases = bool(
+            self.config.get(
+                "tools",
+                "auto_learn_intent_aliases",
+                True,
+            )
+        )
+        self.identity_guard_enabled = bool(
+            self.config.get(
+                "tools",
+                "identity_guard_enabled",
+                True,
+            )
+        )
+        self.voice_auth_ttl_seconds = max(
+            60,
+            int(self.config.get("tools", "voice_auth_ttl_seconds", 1200)),
+        )
+        self.voice_passphrase_kdf_iterations = max(
+            120000,
+            int(self.config.get("tools", "voice_passphrase_kdf_iterations", 240000)),
+        )
+        self.voice_passphrase_pepper = str(
+            self.config.get(
+                "tools",
+                "voice_passphrase_pepper",
+                os.getenv("MK1_VOICE_PASSPHRASE_PEPPER", ""),
+            )
+            or ""
+        )
+
+        trusted_tokens_raw = str(
+            self.config.get(
+                "tools",
+                "trusted_client_tokens",
+                os.getenv("MK1_TRUSTED_CLIENT_TOKENS", ""),
+            )
+            or ""
+        ).strip()
+        self.trusted_client_tokens = {
+            tok.strip()
+            for tok in trusted_tokens_raw.split(",")
+            if tok.strip()
+        }
+
+        self._intent_alias_cache: Dict[str, Dict[str, Any]] = {}
+        self._intent_alias_cache_loaded = False
+        self._pending_write_auth: Optional[Dict[str, Any]] = None
+        self._voice_passphrase_hash: str = ""
+        self._voice_passphrase_hint: str = ""
+        self._verified_clients: Dict[str, float] = {}
+
         workspace_dirs_cfg = self.config.get(
             "workspace",
             "default_dirs",
@@ -994,15 +1099,1054 @@ class MK1Core:
             self.workspace_default_dirs = ["projects", "scratch", "templates", "archive"]
 
         self._ensure_workspace_structure()
+        self._load_runtime_state()
+        self._load_identity_state()
         self.startup_context = self._build_startup_context()
         self._seed_startup_memory_facts()
         self._seed_authoritative_identity_memory()
         self._seed_runtime_capability_snapshot()
+        self._intent_alias_cache = self._get_intent_alias_map()
+        self._intent_alias_cache_loaded = True
         self.last_active_project_path: Optional[str] = None
 
         self._validate_required_tool_routes()
         self._start_turn_clock_heartbeat()
         atexit.register(self.close)
+
+    def _search_mode_state_path(self) -> str:
+        return os.path.join(self.workspace_root, ".mina_search_mode.json")
+
+    def _runtime_state_path(self) -> str:
+        return os.path.join(self.workspace_root, ".mina_runtime_state.json")
+
+    def _save_runtime_state(self, reason: str = "tick") -> None:
+        try:
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            reason_text = str(reason or "tick")
+            if reason_text in {"shutdown", "shutdown_requested"}:
+                self._last_shutdown_at = now_iso
+
+            payload = {
+                "updated_at": now_iso,
+                "reason": reason_text,
+                "turn_clock_started_at": self._turn_clock_started_at,
+                "turn_clock_tick": int(self._turn_clock_tick),
+                "turn_clock_last_tick_at": self._turn_clock_last_tick_at,
+                "turn_clock_last_elapsed_seconds": float(self._turn_clock_last_elapsed_seconds),
+                "last_user_activity_at": self._last_user_activity_at,
+                "last_shutdown_at": self._last_shutdown_at,
+                "idle_checkin_pending": bool(self._idle_checkin_pending),
+                "idle_checkin_due_since_at": self._idle_checkin_due_since_at,
+            }
+            with open(self._runtime_state_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            self._runtime_state_last_written_at = now_iso
+        except Exception:
+            traceback.print_exc()
+
+    def _identity_state_path(self) -> str:
+        return os.path.join(self.workspace_root, ".mina_identity_state.json")
+
+    def _save_identity_state(self) -> None:
+        try:
+            payload = {
+                "voice_passphrase_hash": self._voice_passphrase_hash,
+                "voice_passphrase_hint": self._voice_passphrase_hint,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            with open(self._identity_state_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            traceback.print_exc()
+
+    def _load_identity_state(self) -> None:
+        path = self._identity_state_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return
+            self._voice_passphrase_hash = str(payload.get("voice_passphrase_hash") or "").strip()
+            self._voice_passphrase_hint = str(payload.get("voice_passphrase_hint") or "").strip()
+        except Exception:
+            traceback.print_exc()
+
+    def _hash_voice_phrase(self, phrase: str) -> str:
+        # Legacy unsalted SHA-256 fallback kept for compatibility/migration only.
+        return hashlib.sha256(str(phrase or "").strip().lower().encode("utf-8")).hexdigest()
+
+    def _normalize_voice_phrase(self, phrase: str) -> str:
+        clean = str(phrase or "").strip().lower()
+        if self.voice_passphrase_pepper:
+            return f"{clean}\n{self.voice_passphrase_pepper}"
+        return clean
+
+    def _kdf_voice_phrase(self, phrase: str) -> str:
+        normalized = self._normalize_voice_phrase(phrase).encode("utf-8")
+        salt = os.urandom(16)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            normalized,
+            salt,
+            int(self.voice_passphrase_kdf_iterations),
+            dklen=32,
+        )
+        salt_b64 = base64.b64encode(salt).decode("ascii")
+        digest_b64 = base64.b64encode(digest).decode("ascii")
+        return f"pbkdf2_sha256${int(self.voice_passphrase_kdf_iterations)}${salt_b64}${digest_b64}"
+
+    def _verify_voice_phrase_hardened(self, phrase: str, stored: str) -> bool:
+        if not str(stored or "").startswith("pbkdf2_sha256$"):
+            return False
+        parts = str(stored).split("$")
+        if len(parts) != 4:
+            return False
+        try:
+            rounds = int(parts[1])
+            salt = base64.b64decode(parts[2].encode("ascii"), validate=True)
+            expected = base64.b64decode(parts[3].encode("ascii"), validate=True)
+        except Exception:
+            return False
+
+        candidate = hashlib.pbkdf2_hmac(
+            "sha256",
+            self._normalize_voice_phrase(phrase).encode("utf-8"),
+            salt,
+            rounds,
+            dklen=len(expected) if expected else 32,
+        )
+        return hmac.compare_digest(candidate, expected)
+
+    def _voice_hint_from_phrase(self, phrase: str) -> str:
+        parts = [p for p in re.findall(r"[a-zA-Z0-9]+", str(phrase or "")) if p]
+        if not parts:
+            return ""
+        first = parts[0]
+        last = parts[-1] if len(parts) > 1 else ""
+        if last:
+            return f"{first[:2]}...{last[-2:]}"
+        return f"{first[:2]}..."
+
+    def _enroll_voice_passphrase(self, phrase: str) -> Dict[str, Any]:
+        clean = str(phrase or "").strip()
+        if len(clean) < 6:
+            return {"ok": False, "result": None, "error": "voice_passphrase_too_short"}
+        self._voice_passphrase_hash = self._kdf_voice_phrase(clean)
+        self._voice_passphrase_hint = self._voice_hint_from_phrase(clean)
+        self._save_identity_state()
+        return {
+            "ok": True,
+            "result": {
+                "voice_passphrase_enrolled": True,
+                "hint": self._voice_passphrase_hint,
+            },
+            "error": None,
+        }
+
+    def _is_trusted_client(self, request_context: Optional[Dict[str, Any]]) -> bool:
+        if not self.trusted_client_tokens:
+            return False
+        token = str((request_context or {}).get("client_token") or "").strip()
+        return bool(token and token in self.trusted_client_tokens)
+
+    def _client_identity_key(self, request_context: Optional[Dict[str, Any]]) -> str:
+        if isinstance(request_context, dict):
+            cid = str(request_context.get("client_id") or "").strip()
+            if cid:
+                return cid
+            src = str(request_context.get("input_source") or "").strip().lower()
+            if src:
+                return f"source:{src}"
+        return "source:unknown"
+
+    def _mark_client_verified(self, request_context: Optional[Dict[str, Any]]) -> None:
+        key = self._client_identity_key(request_context)
+        self._verified_clients[key] = time.time() + float(self.voice_auth_ttl_seconds)
+
+    def _is_client_recently_verified(self, request_context: Optional[Dict[str, Any]]) -> bool:
+        key = self._client_identity_key(request_context)
+        expires = float(self._verified_clients.get(key) or 0.0)
+        return expires > time.time()
+
+    def _is_voice_phrase_match(self, phrase: str) -> bool:
+        if not self._voice_passphrase_hash:
+            return False
+        stored = str(self._voice_passphrase_hash or "").strip()
+
+        # Preferred path: salted PBKDF2 record.
+        if stored.startswith("pbkdf2_sha256$"):
+            return self._verify_voice_phrase_hardened(phrase, stored)
+
+        # Legacy compatibility path: unsalted SHA-256.
+        is_legacy_match = self._hash_voice_phrase(phrase) == stored
+        if is_legacy_match:
+            # Opportunistic migration to hardened storage after a successful legacy verify.
+            try:
+                self._voice_passphrase_hash = self._kdf_voice_phrase(phrase)
+                self._save_identity_state()
+            except Exception:
+                traceback.print_exc()
+        return is_legacy_match
+
+    def _extract_explicit_windows_path(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+
+        quoted = re.findall(r'["\']([A-Za-z]:(?:\\|/)[^"\']+)["\']', raw)
+        candidates: List[str] = [q.strip() for q in quoted if q.strip()]
+
+        bare_matches = re.findall(r'([A-Za-z]:(?:\\|/)[^\r\n]+)', raw)
+        for match in bare_matches:
+            candidate = str(match or "").strip().rstrip('.,;:!?"\'')
+            if candidate:
+                candidates.append(candidate)
+
+        for candidate in candidates:
+            normalized = normalize_tool_path(candidate)
+            if os.path.exists(normalized):
+                return normalized
+
+            trimmed = normalized
+            while trimmed and not os.path.exists(trimmed):
+                parent = os.path.dirname(trimmed.rstrip("\\/"))
+                if not parent or parent == trimmed:
+                    break
+                trimmed = parent
+            if trimmed and os.path.exists(trimmed):
+                return trimmed
+
+        return ""
+
+    def _is_recursive_directory_read_request(self, raw_text: str, lowered: str) -> bool:
+        if not raw_text:
+            return False
+        if re.search(r'[A-Za-z]:(?:\\|/)', raw_text) is None:
+            return False
+
+        has_read_verb = re.search(r'\b(read|inspect|analy[sz]e|describe|summari[sz]e|explain)\b', lowered) is not None
+        file_scope = re.search(r'\b(file|files|directory|folder|contents)\b', lowered) is not None
+        recursive_scope = (
+            re.search(r'\b(all\s+files|each\s+file|every\s+file|entire\s+tree|directory\s+tree|folder\s+tree|recursive(?:ly)?|recurse|all\s+sub\s*directories|all\s+subfolders?)\b', lowered) is not None
+            or (
+                re.search(r'\bfiles?\b', lowered) is not None
+                and re.search(r'\b(?:in|under|inside|of|from)\b', lowered) is not None
+                and re.search(r'\b(tree|directory|folder|subdirector(?:y|ies)|subfolders?)\b', lowered) is not None
+            )
+        )
+        if has_read_verb and recursive_scope:
+            return True
+
+        explicit_path = self._extract_explicit_windows_path(raw_text)
+        return bool(has_read_verb and file_scope and explicit_path and os.path.isdir(explicit_path))
+
+    def _extract_directory_inspection_filter(self, raw_text: str) -> str:
+        lowered = str(raw_text or "").lower()
+        if re.search(r'\bonly\s+(?:the\s+)?(?:config|configs|configuration|configurations|settings)\b', lowered):
+            return "config"
+        if re.search(r'\bonly\s+(?:the\s+)?(?:logs|log files|crash logs|diagnostics?)\b', lowered):
+            return "logs"
+        if re.search(r'\bonly\s+(?:the\s+)?(?:mods|mod files|server files|server settings|server configs?)\b', lowered):
+            return "server_mod"
+        if re.search(r'\bonly\s+(?:the\s+)?(?:scripts|script files|batch files)\b', lowered):
+            return "scripts"
+        if re.search(r'\bonly\s+(?:the\s+)?(?:media|images|audio|video)\b', lowered):
+            return "media"
+        return "all"
+
+    def _is_text_like_file_for_inspection(self, path: str) -> bool:
+        return is_probably_text_path(path)
+
+    def _describe_inspected_file(self, path: str, sample: str = "") -> str:
+        base = os.path.basename(path)
+        ext = os.path.splitext(base)[1].lower()
+        lowered = sample.lower()
+
+        if base.lower() == "steam_appid.txt":
+            digits = re.findall(r'\d+', sample)
+            if digits:
+                return f"Steam application ID marker. The value {digits[0]} tells Steam which game the folder belongs to."
+            return "Steam application ID marker used by Steam/game launch flow."
+        if ext in {".ini", ".cfg", ".conf", ".json", ".xml", ".yaml", ".yml", ".properties"}:
+            return "Configuration or metadata file. Its contents can be used to inspect settings, flags, paths, or feature toggles."
+        if ext in {".log", ".txt"}:
+            if "error" in lowered or "warning" in lowered:
+                return "Log or plain-text file with diagnostic signals. Useful for troubleshooting errors, warnings, and runtime behavior."
+            return "Plain-text or log file. I can extract identifiers, settings, notes, or diagnostics from it."
+        if ext in {".ps1", ".bat", ".cmd", ".py", ".js", ".ts", ".lua"}:
+            return "Script or source file. I can explain behavior, entry points, configuration use, and potential modifications."
+        if ext in {".exe"}:
+            return "Windows executable binary. I can identify it by name/location, but not semantically read its compiled logic without separate reverse-engineering."
+        if ext in {".dll"}:
+            return "Windows library binary. It is a compiled dependency rather than directly readable text."
+        if ext in {".pak", ".sig", ".bin", ".dat", ".db", ".uasset", ".umap"}:
+            return "Game asset or packaged binary data. It is not meaningfully readable as plain text; analysis would require format-specific tooling."
+        return "File identified by path/type. If it is text-based I can read and explain it directly; if binary, I can classify but not semantically decode it as plain text."
+
+    def _directory_inspection_priority(self, root: str, path: str) -> int:
+        rel = os.path.relpath(path, root).replace("/", "\\").lower()
+        base = os.path.basename(rel)
+        ext = os.path.splitext(base)[1].lower()
+
+        score = 0
+
+        if ext in {".ini", ".cfg", ".conf", ".json", ".xml", ".yaml", ".yml", ".properties"}:
+            score += 120
+        elif ext in {".log", ".txt"}:
+            score += 80
+        elif ext in {".ps1", ".bat", ".cmd", ".py", ".js", ".ts", ".lua"}:
+            score += 70
+
+        if any(token in rel for token in ["server", "dedicated", "mod", "mods", "battleye", "saved", "config", "settings", "logs", "crash"]):
+            score += 90
+
+        if any(token in rel for token in ["eula\\", "licenses", "license", "privacy", "text\\", "localization", "translations"]):
+            score -= 140
+
+        if base in {"engine.ini", "game.ini", "gameusersettings.ini", "servermodlist.txt", "steam_appid.txt", "belauncher.ini", "belaunchersteam.ini", "beclient_x64.cfg", "beserver_x64.cfg"}:
+            score += 200
+
+        if ext in {".txt", ".ini"} and any(part in rel for part in ["eula\\", "text\\"]):
+            score -= 80
+
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            size = 0
+
+        if 0 < size <= 16 * 1024:
+            score += 20
+        elif size > 256 * 1024:
+            score -= 40
+
+        return score
+
+    def _directory_inspection_bucket(self, root: str, path: str) -> str:
+        rel = os.path.relpath(path, root).replace("/", "\\").lower()
+        base = os.path.basename(rel)
+        ext = os.path.splitext(base)[1].lower()
+
+        if ext in {".ini", ".cfg", ".conf", ".json", ".xml", ".yaml", ".yml", ".properties"}:
+            return "Config"
+        if any(token in rel for token in ["server", "dedicated", "mod", "mods"]):
+            return "Server/Mod"
+        if ext in {".log", ".txt"} or "crash" in rel or "logs" in rel:
+            return "Logs/Text"
+        if ext in {".ps1", ".bat", ".cmd", ".py", ".js", ".ts", ".lua"}:
+            return "Scripts"
+        if base == "steam_appid.txt":
+            return "Metadata"
+        return "Other"
+
+    def _matches_directory_inspection_filter(self, root: str, path: str, mode: str) -> bool:
+        eff = str(mode or "all").strip().lower()
+        if eff == "all":
+            return True
+
+        rel = os.path.relpath(path, root).replace("/", "\\").lower()
+        ext = os.path.splitext(path)[1].lower()
+
+        if eff == "config":
+            return ext in {".ini", ".cfg", ".conf", ".json", ".xml", ".yaml", ".yml", ".properties", ".toml"}
+        if eff == "logs":
+            return ext in {".log", ".txt", ".json"} and any(token in rel for token in ["log", "logs", "crash", "diagnostic", "report"])
+        if eff == "server_mod":
+            return any(token in rel for token in ["server", "mod", "mods", "dedicated"]) or os.path.basename(rel) in {"servermodlist.txt", "serversettings.ini", "modrestartdata.json", "modcontrollercache.json"}
+        if eff == "scripts":
+            return ext in {".ps1", ".bat", ".cmd", ".py", ".js", ".ts", ".lua", ".sh"}
+        if eff == "media":
+            return ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".mp3", ".wav", ".ogg", ".mp4", ".avi", ".mkv", ".mov", ".bk2"}
+        return True
+
+    def _inspect_directory_tree(self, path: str, mode: str = "all") -> Dict[str, Any]:
+        root = normalize_tool_path(path)
+        if not root:
+            return {"ok": False, "result": None, "error": "no_path_provided"}
+        if not os.path.isdir(root):
+            return {"ok": False, "result": None, "error": f"directory_not_found: {root}"}
+
+        max_files = 4000
+        max_text_files = 48
+        max_sample_chars = 2400
+        max_file_size = 256 * 1024
+
+        total_dirs = 0
+        total_files = 0
+        ext_counts: Dict[str, int] = {}
+        text_candidates: List[str] = []
+        inspected_text: List[Dict[str, Any]] = []
+        binary_samples: List[str] = []
+        truncated_walk = False
+
+        try:
+            for walk_root, dirs, files in os.walk(root):
+                total_dirs += len(dirs)
+                for name in files:
+                    total_files += 1
+                    if total_files > max_files:
+                        truncated_walk = True
+                        break
+
+                    fpath = os.path.join(walk_root, name)
+                    ext = os.path.splitext(name)[1].lower() or "[no extension]"
+                    ext_counts[ext] = ext_counts.get(ext, 0) + 1
+
+                    if self._matches_directory_inspection_filter(root, fpath, mode) and self._is_text_like_file_for_inspection(fpath):
+                        text_candidates.append(fpath)
+                    elif self._matches_directory_inspection_filter(root, fpath, mode) and len(binary_samples) < 12:
+                        binary_samples.append(fpath)
+
+                if truncated_walk:
+                    break
+        except Exception as exc:
+            return {"ok": False, "result": None, "error": str(exc)}
+
+        ranked_candidates = sorted(
+            text_candidates,
+            key=lambda candidate: (
+                -self._directory_inspection_priority(root, candidate),
+                os.path.relpath(candidate, root).lower(),
+            ),
+        )
+
+        basename_counts: Dict[str, int] = {}
+        family_counts: Dict[str, int] = {}
+
+        for fpath in ranked_candidates:
+            if len(inspected_text) >= max_text_files:
+                break
+
+            rel_low = os.path.relpath(fpath, root).replace("/", "\\").lower()
+            base_low = os.path.basename(rel_low)
+            family_key = ""
+            if "saved\\config\\crashreportclient\\" in rel_low:
+                family_key = "crashreportclient"
+            elif "\\battleye\\eula\\" in rel_low:
+                family_key = "battleye_eula"
+            elif "\\battleye\\text\\" in rel_low:
+                family_key = "battleye_text"
+
+            if basename_counts.get(base_low, 0) >= 3:
+                continue
+            if family_key and family_counts.get(family_key, 0) >= 2:
+                continue
+
+            try:
+                size = os.path.getsize(fpath)
+            except Exception:
+                size = 0
+            if size > max_file_size:
+                inspected_text.append({
+                    "path": fpath,
+                    "size": size,
+                    "description": "Text-like file skipped for full read because it exceeds the safe inspection size cap.",
+                    "sample": "",
+                    "bucket": self._directory_inspection_bucket(root, fpath),
+                })
+                basename_counts[base_low] = basename_counts.get(base_low, 0) + 1
+                if family_key:
+                    family_counts[family_key] = family_counts.get(family_key, 0) + 1
+                continue
+            try:
+                inspected = inspect_file(fpath, max_chars=max_sample_chars)
+            except Exception as exc:
+                inspected_text.append({
+                    "path": fpath,
+                    "size": size,
+                    "description": f"Readable-looking file, but open/read failed: {exc}",
+                    "sample": "",
+                    "bucket": self._directory_inspection_bucket(root, fpath),
+                })
+                basename_counts[base_low] = basename_counts.get(base_low, 0) + 1
+                if family_key:
+                    family_counts[family_key] = family_counts.get(family_key, 0) + 1
+                continue
+
+            if not inspected.get("ok"):
+                inspected_text.append({
+                    "path": fpath,
+                    "size": size,
+                    "description": f"Readable-looking file, but open/read failed: {inspected.get('error')}",
+                    "sample": "",
+                    "bucket": self._directory_inspection_bucket(root, fpath),
+                })
+                basename_counts[base_low] = basename_counts.get(base_low, 0) + 1
+                if family_key:
+                    family_counts[family_key] = family_counts.get(family_key, 0) + 1
+                continue
+
+            sample = str(((inspected.get("result") or {}).get("content")) or "")
+
+            inspected_text.append({
+                "path": fpath,
+                "size": size,
+                "description": self._describe_inspected_file(fpath, sample),
+                "sample": sample.strip(),
+                "bucket": self._directory_inspection_bucket(root, fpath),
+            })
+            basename_counts[base_low] = basename_counts.get(base_low, 0) + 1
+            if family_key:
+                family_counts[family_key] = family_counts.get(family_key, 0) + 1
+
+        top_exts = sorted(ext_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+        lines: List[str] = []
+        lines.append(f"Scanned: {root}")
+        if str(mode or "all") != "all":
+            lines.append(f"Filter: {mode}")
+        lines.append(f"Found {total_files} files across {total_dirs} subdirectories.")
+        if truncated_walk:
+            lines.append(f"Traversal capped at {max_files} files to keep the inspection grounded and responsive.")
+
+        if top_exts:
+            ext_text = ", ".join([f"{ext}={count}" for ext, count in top_exts])
+            lines.append(f"Most common file types: {ext_text}")
+
+        if inspected_text:
+            bucket_order = ["Config", "Server/Mod", "Logs/Text", "Scripts", "Metadata", "Other"]
+            bucketed: Dict[str, List[Dict[str, Any]]] = {name: [] for name in bucket_order}
+            for item in inspected_text:
+                bucket = str(item.get("bucket") or "Other")
+                bucketed.setdefault(bucket, []).append(item)
+
+            lines.append("")
+            lines.append("Readable files I actually inspected, prioritized by usefulness:")
+            for bucket_name in bucket_order:
+                bucket_items = bucketed.get(bucket_name, [])
+                if not bucket_items:
+                    continue
+                lines.append("")
+                lines.append(f"{bucket_name}:")
+                for item in bucket_items:
+                    rel = os.path.relpath(str(item.get("path") or root), root)
+                    size = int(item.get("size") or 0)
+                    desc = str(item.get("description") or "File inspected.")
+                    lines.append(f"- {rel} ({size} bytes): {desc}")
+
+                    sample = str(item.get("sample") or "").strip()
+                    if sample:
+                        snippet = re.sub(r'\s+', ' ', sample[:220]).strip()
+                        if snippet:
+                            lines.append(f"  Sample: {snippet}")
+
+        if binary_samples:
+            lines.append("")
+            lines.append("Representative binary or packaged files:")
+            for sample_path in binary_samples[:8]:
+                rel = os.path.relpath(sample_path, root)
+                lines.append(f"- {rel}: {self._describe_inspected_file(sample_path, '')}")
+
+        if not inspected_text:
+            lines.append("")
+            lines.append("I did not find readable text/config/script files in the inspected slice. This tree appears to be mostly binaries/assets, which I can classify by type but not honestly describe line-by-line as plain text.")
+
+        return {
+            "ok": True,
+            "result": {
+                "path": root,
+                "report": "\n".join(lines).strip(),
+                "total_files": total_files,
+                "total_dirs": total_dirs,
+                "inspected_text_files": len(inspected_text),
+                "truncated": truncated_walk,
+            },
+            "error": None,
+        }
+
+    def _is_high_risk_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> bool:
+        tname = str(tool_name or "")
+        if tname in {"__mina_shutdown__", "__mina_shutdown_status__", "__git_push__", "__git_snapshot__"}:
+            return True
+
+        if tname in self._write_auth_tool_names():
+            root = normalize_tool_path(full_access_root())
+            targets: List[str] = []
+            if tname == "file_move":
+                targets = [
+                    normalize_tool_path(str(tool_args.get("src") or "")),
+                    normalize_tool_path(str(tool_args.get("dst") or "")),
+                ]
+            elif tname == "safe_copy":
+                targets = [normalize_tool_path(str(tool_args.get("dst") or ""))]
+            else:
+                targets = [normalize_tool_path(str(tool_args.get("path") or ""))]
+
+            for target in [p for p in targets if p]:
+                try:
+                    if os.path.commonpath([os.path.normcase(target), os.path.normcase(root)]) != os.path.normcase(root):
+                        return True
+                except Exception:
+                    return True
+        return False
+
+    def _identity_gate_decision(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        request_context: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        if not bool(getattr(self, "identity_guard_enabled", True)):
+            return None
+        if not self._is_high_risk_tool(tool_name, tool_args):
+            return None
+        if self._is_trusted_client(request_context):
+            return None
+        if self._is_client_recently_verified(request_context):
+            return None
+        if not self._voice_passphrase_hash:
+            return (
+                "Identity check required for sensitive actions. "
+                "Please enroll a voice passphrase first: set voice passphrase to <your phrase>."
+            )
+        hint = self._voice_passphrase_hint or "your passphrase"
+        return (
+            "Identity check required for this action. "
+            f"Say: verify voice {hint}"
+        )
+
+    def _load_runtime_state(self) -> None:
+        path = self._runtime_state_path()
+        if not os.path.isfile(path):
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            if not isinstance(payload, dict):
+                return
+
+            last_user_activity = str(payload.get("last_user_activity_at") or "").strip()
+            if not last_user_activity:
+                return
+
+            last_dt = datetime.fromisoformat(last_user_activity)
+            now_dt = datetime.now()
+            age_seconds = max(0.0, (now_dt - last_dt).total_seconds())
+
+            now_mono = time.monotonic()
+            self._last_user_activity_at = last_user_activity
+            self._last_user_activity_monotonic = max(0.0, now_mono - age_seconds)
+
+            last_shutdown = str(payload.get("last_shutdown_at") or "").strip()
+            if last_shutdown:
+                self._last_shutdown_at = last_shutdown
+                shutdown_dt = datetime.fromisoformat(last_shutdown)
+                seconds_since_shutdown = max(0.0, (now_dt - shutdown_dt).total_seconds())
+                self._seconds_since_last_shutdown = seconds_since_shutdown
+                if seconds_since_shutdown >= float(self.away_nag_threshold_seconds):
+                    hours = max(0.1, round(seconds_since_shutdown / 3600.0, 1))
+                    self._away_nag_prompt_pending = True
+                    self._away_nag_prompt_text = (
+                        f"Reconnection check-in: user has been away about {hours} hours since last shutdown. "
+                        "Greet them and briefly ask how they are doing before diving into tasks."
+                    )
+        except Exception:
+            traceback.print_exc()
+
+    def _save_web_search_mode_state(self) -> None:
+        try:
+            payload = {
+                "web_search_mode": self.web_search_mode,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            with open(self._search_mode_state_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            traceback.print_exc()
+
+    def _load_web_search_mode_state(self) -> None:
+        path = self._search_mode_state_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return
+            mode = str(payload.get("web_search_mode") or "").strip().lower()
+            if mode in {"balanced", "strict", "wide"}:
+                self.web_search_mode = mode
+        except Exception:
+            traceback.print_exc()
+
+    def _set_web_search_mode(self, mode: str) -> Dict[str, Any]:
+        requested = str(mode or "").strip().lower()
+        if requested not in {"balanced", "strict", "wide"}:
+            return {
+                "ok": False,
+                "result": {
+                    "requested": requested,
+                    "allowed": ["balanced", "strict", "wide"],
+                    "current_mode": self.web_search_mode,
+                },
+                "error": "invalid_search_mode",
+            }
+
+        self.web_search_mode = requested
+        self._save_web_search_mode_state()
+        return {
+            "ok": True,
+            "result": {
+                "mode": self.web_search_mode,
+            },
+            "error": None,
+        }
+
+    def _get_web_search_mode(self) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "result": {
+                "mode": self.web_search_mode,
+                "allowed": ["balanced", "strict", "wide"],
+            },
+            "error": None,
+        }
+
+    def _normalize_user_intent_text(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+
+        out = raw
+        out = re.sub(r'^\s*(?:hey\s+)?(?:you|mina)[,\s:;-]+', '', out, flags=re.IGNORECASE).strip()
+        out = re.sub(
+            r'^\s*(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}[,\s:;-]+(?=(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\b|in\s+\d+\s*(?:seconds?|minutes?|hours?)\b)',
+            '',
+            out,
+            flags=re.IGNORECASE,
+        ).strip()
+        out = re.sub(r'^\s*(?:voice|audio|mic)\s*[:,-]?\s*', '', out, flags=re.IGNORECASE).strip()
+
+        out = re.sub(
+            r'^\s*(?:please\s+)?(?:can|could|would|will)\s+you\s+',
+            '',
+            out,
+            flags=re.IGNORECASE,
+        ).strip()
+        out = re.sub(
+            r'^\s*(?:please\s+)?i\s+(?:need|want|would\s+like)\s+you\s+to\s+',
+            '',
+            out,
+            flags=re.IGNORECASE,
+        ).strip()
+        out = re.sub(
+            r'^\s*(?:please\s+)?do\s+me\s+a\s+favo(?:u)?r\s+and\s+',
+            '',
+            out,
+            flags=re.IGNORECASE,
+        ).strip()
+        out = re.sub(
+            r'\s+(?:please|thanks|thank\s+you)\s*[.!?]*$',
+            '',
+            out,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        if out.lower().startswith("please "):
+            out = out[7:].strip()
+        return out
+
+    def _is_tool_self_test_request(self, text: str) -> bool:
+        t = str(text or "").strip().lower()
+        if not t:
+            return False
+        return (
+            re.search(r"\b(?:self[\s-]?test|smoke\s*test|tool\s*test|tool\s*smoke)\b", t) is not None
+            or (
+                re.search(r"\btest\b", t) is not None
+                and re.search(r"\btools?\b", t) is not None
+            )
+        )
+
+    def _tool_plan_confidence_threshold(self) -> float:
+        mode = str(getattr(self, "action_mode_strictness", "balanced") or "balanced").strip().lower()
+        if mode == "strict":
+            return 0.70
+        if mode == "relaxed":
+            return 0.50
+        return 0.60
+
+    def _truth_first_system_rules(self) -> str:
+        tone = "Keep Mina tone light but concise." if bool(getattr(self, "action_mode_light_tone", True)) else "Use direct, minimal tone."
+        return (
+            "Truth-first action mode is active. "
+            "Never claim external actions (texts, calls, file reads, web checks, Spotify state, system commands) unless verified by tool output in this turn. "
+            "If not verified, say what you can verify next. "
+            "Do not invent file contents, directory listings, or execution results. "
+            + tone
+        )
+
+    def _intent_alias_record(self, phrase: str, tool: str, args: Optional[Dict[str, Any]] = None) -> str:
+        payload = {
+            "phrase": str(phrase or "").strip().lower(),
+            "tool": str(tool or "").strip(),
+            "args": args if isinstance(args, dict) else {},
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        return "intent_alias::" + json.dumps(payload, sort_keys=True, ensure_ascii=True)
+
+    def _parse_intent_alias_record(self, text: str) -> Optional[Dict[str, Any]]:
+        src = str(text or "").strip()
+        if not src.startswith("intent_alias::"):
+            return None
+        raw = src[len("intent_alias::"):].strip()
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        phrase = str(payload.get("phrase") or "").strip().lower()
+        tool = str(payload.get("tool") or "").strip()
+        args = payload.get("args", {})
+        if not phrase or not tool:
+            return None
+        if not isinstance(args, dict):
+            args = {}
+        return {
+            "phrase": phrase,
+            "tool": tool,
+            "args": args,
+        }
+
+    def _get_intent_alias_map(self) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        try:
+            recent = self.memory.recent_memories(
+                top_k=1000,
+                include_kinds=["procedure", "fact"],
+                include_tags=["intent_alias"],
+            )
+            for item in recent or []:
+                parsed = self._parse_intent_alias_record(str(item.get("text") or ""))
+                if not parsed:
+                    continue
+                phrase = str(parsed.get("phrase") or "")
+                if phrase and phrase not in out:
+                    out[phrase] = {
+                        "tool": str(parsed.get("tool") or ""),
+                        "args": parsed.get("args", {}) if isinstance(parsed.get("args", {}), dict) else {},
+                    }
+        except Exception:
+            traceback.print_exc()
+        return out
+
+    def _resolve_intent_alias(self, text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        phrase = self._normalize_user_intent_text(text).lower().strip()
+        if not phrase:
+            return None
+
+        alias_map = self._intent_alias_cache if isinstance(getattr(self, "_intent_alias_cache", None), dict) else {}
+        row = alias_map.get(phrase)
+        if not isinstance(row, dict):
+            return None
+
+        tool = str(row.get("tool") or "").strip()
+        args = row.get("args", {}) if isinstance(row.get("args", {}), dict) else {}
+        if not tool:
+            return None
+
+        available = getattr(self.tools, "tools", {})
+        if tool.startswith("__") or tool in available:
+            return tool, dict(args)
+        return None
+
+    def _maybe_learn_intent_alias(
+        self,
+        user_input: str,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> None:
+        if not bool(getattr(self, "auto_learn_intent_aliases", True)):
+            return
+        if not isinstance(result, dict) or not bool(result.get("ok", True)):
+            return
+
+        allow_tools = {
+            "spotify_link",
+            "web_search",
+            "web_fetch",
+            "memory_read",
+            "memory_write",
+            "__mina_shutdown_status__",
+            "__mina_shutdown__",
+            "__driving_checkin_stop__",
+            "__task_memory_write__",
+        }
+        if tool_name not in allow_tools:
+            return
+
+        phrase = self._normalize_user_intent_text(user_input).lower().strip()
+        if not phrase or len(phrase) < 8 or len(phrase) > 180:
+            return
+        if "http://" in phrase or "https://" in phrase:
+            return
+        if re.search(r"[A-Za-z]:\\", phrase):
+            return
+        if "```" in phrase:
+            return
+
+        existing = self._intent_alias_cache.get(phrase)
+        if isinstance(existing, dict) and str(existing.get("tool") or "") == tool_name:
+            return
+
+        args_to_store = dict(tool_args or {})
+        if len(args_to_store) > 8:
+            args_to_store = {}
+
+        record_text = self._intent_alias_record(phrase=phrase, tool=tool_name, args=args_to_store)
+
+        try:
+            exists = False
+            if hasattr(self.memory, "find_memory_id_by_text"):
+                exists = self.memory.find_memory_id_by_text(
+                    record_text,
+                    include_kinds=["procedure"],
+                    include_tags=["intent_alias"],
+                ) is not None
+            if not exists:
+                self.memory.add_memory(
+                    record_text,
+                    kind="procedure",
+                    tags=["user_memory", "intent_alias"],
+                )
+            self._intent_alias_cache[phrase] = {
+                "tool": tool_name,
+                "args": args_to_store,
+            }
+        except Exception:
+            traceback.print_exc()
+
+    def _maybe_build_ambiguity_prompt(self, raw_text: str) -> Optional[str]:
+        if not bool(getattr(self, "ambiguity_ask_on_medium_low", True)):
+            return None
+
+        t = str(raw_text or "").lower()
+        spotify_available = "spotify_link" in getattr(self.tools, "tools", {})
+        if not spotify_available:
+            return None
+
+        game_signals = re.search(r"\b(game|interface|integrat(?:e|ion)|build|app|ui|character|npc|mod)\b", t) is not None
+        music_signals = re.search(r"\b(song|track|playlist|spotify|music|album|artist)\b", t) is not None
+        play_signal = re.search(r"\b(play|paly|place)\b", t) is not None
+
+        if play_signal and game_signals and not music_signals:
+            return (
+                "Quick clarify: do you want game integration help or Spotify playback? "
+                "Reply with 'game' or 'music'."
+            )
+
+        if re.search(r"\bplay\s+with\s+me\b", t) and (game_signals or not music_signals):
+            return (
+                "I can do both, but I need a quick choice: 'game' for integration/build help, "
+                "or 'music' for Spotify playback."
+            )
+
+        return None
+
+    def _write_auth_tool_names(self) -> set:
+        return {"dir_create", "file_write", "file_append", "file_delete", "file_move", "safe_copy"}
+
+    def _pending_write_target(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
+        if tool_name == "file_move":
+            src = str(tool_args.get("src") or "").strip()
+            dst = str(tool_args.get("dst") or "").strip()
+            return f"{src} -> {dst}".strip()
+        if tool_name == "safe_copy":
+            src = str(tool_args.get("src") or "").strip()
+            dst = str(tool_args.get("dst") or "").strip()
+            return f"{src} -> {dst}".strip()
+        return str(tool_args.get("path") or "").strip()
+
+    def _set_pending_write_authorization(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        user_input: str,
+        error: str,
+    ) -> None:
+        args_copy = dict(tool_args or {})
+        args_copy.pop("auth_token", None)
+        self._pending_write_auth = {
+            "tool_name": str(tool_name or "").strip(),
+            "tool_args": args_copy,
+            "user_input": str(user_input or "").strip(),
+            "target": self._pending_write_target(tool_name, args_copy),
+            "error": str(error or "").strip(),
+            "created_at": time.time(),
+        }
+
+    def _clear_pending_write_authorization(self) -> None:
+        self._pending_write_auth = None
+
+    def _is_write_authorization_confirmation(self, text: str) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return False
+        if low in {"yes", "y", "yep", "yeah", "ok", "okay", "do it", "proceed", "continue", "allow", "authorize", "authorise"}:
+            return True
+        return re.search(r"\b(authorize|authorise|approve|approved|allow|proceed|continue|go\s+ahead)\b", low) is not None
+
+    def _is_write_authorization_cancel(self, text: str) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return False
+        if low in {"no", "n", "cancel", "deny", "stop", "never mind", "nevermind"}:
+            return True
+        return re.search(r"\b(cancel|deny|stop|don't|do\s+not|abort)\b", low) is not None
+
+    def _stop_driving_checkins(self) -> Dict[str, Any]:
+        try:
+            mem = getattr(self, "memory", None)
+            if mem is None or not hasattr(mem, "get_task_memories"):
+                return {"ok": False, "result": None, "error": "task_memory_not_available"}
+
+            rows = mem.get_task_memories(top_k=250, include_done=False)
+            if not isinstance(rows, list):
+                rows = []
+
+            removed = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+
+                text = str(row.get("text") or "").strip().lower()
+                tags_raw = row.get("tags")
+                tags_l: List[str] = []
+                if isinstance(tags_raw, list):
+                    for tag in tags_raw:
+                        tag_text = str(tag).strip().lower()
+                        if tag_text:
+                            tags_l.append(tag_text)
+
+                is_drive = ("driving_checkin" in tags_l) or text.startswith("driving check-in")
+                if not is_drive:
+                    continue
+
+                task_id = int(row.get("id") or 0)
+                if task_id <= 0:
+                    continue
+
+                if hasattr(mem, "set_task_status"):
+                    try:
+                        if mem.set_task_status(task_id, "done"):
+                            removed += 1
+                    except Exception:
+                        traceback.print_exc()
+
+            return {
+                "ok": True,
+                "result": {
+                    "stopped_count": removed,
+                },
+                "error": None,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"ok": False, "result": None, "error": str(e)}
 
     def _validate_required_tool_routes(self) -> None:
         """
@@ -1020,6 +2164,7 @@ class MK1Core:
         ]
 
         missing: List[str] = []
+
         for sample, expected_tool in probes:
             try:
                 got_tool, _ = self.detect_tool_intent(sample)
@@ -1041,14 +2186,25 @@ class MK1Core:
         assistant_text: str,
     ) -> None:
         try:
+            user_mem = str(user_input or "").strip()
+            assistant_mem = str(assistant_text or "").strip()
+
+            if len(user_mem) > 1800:
+                user_mem = user_mem[:1800].rstrip() + "..."
+
+            # Long list/tool outputs can overwhelm embedding services.
+            # Persist a compact representative summary for short-term recall.
+            if len(assistant_mem) > 1800:
+                assistant_mem = self._compress_multiline(assistant_mem, max_lines=24, max_chars=1800)
+
             self.memory.add_memory(
-                user_input,
+                user_mem,
                 kind="interaction",
                 tags=["short_term", "user_turn"],
             )
 
             self.memory.add_memory(
-                assistant_text,
+                assistant_mem,
                 kind="interaction",
                 tags=["short_term", "assistant_turn"],
             )
@@ -1235,6 +2391,16 @@ class MK1Core:
         for args in re.findall(r"spotify_link\s*\{([\s\S]*?)\}", content, flags=re.IGNORECASE):
             _add("spotify_link", args)
 
+        # Fallback for pipe-arrow wrapper emitted by some templates, e.g.
+        # |>web_search{query: "...", max_results: 5}
+        # <|tool_call>
+        for name, args in re.findall(
+            r"\|>\s*([A-Za-z_][\w.-]*)\s*\{([\s\S]*?)\}\s*(?:<\|tool_call\>|<tool_call\|>)?",
+            content,
+            flags=re.IGNORECASE,
+        ):
+            _add(name, args)
+
         return out
 
     def _parse_tool_args(self, args_str: str) -> Dict[str, Any]:
@@ -1286,6 +2452,12 @@ class MK1Core:
         )
         cleaned = re.sub(
             r"\bcall\s*:\s*[A-Za-z_][\w.-]*\s*\{[\s\S]*?\}",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\|>\s*[A-Za-z_][\w.-]*\s*\{[\s\S]*?\}\s*(?:<\|tool_call\>|<tool_call\|>)?",
             "",
             cleaned,
             flags=re.IGNORECASE,
@@ -1394,7 +2566,31 @@ class MK1Core:
         if tool_name == "__tool_list__":
             return formatted
 
+        if tool_name == "__tool_self_test__":
+            return formatted
+
         if tool_name == "spotify_link":
+            return formatted
+
+        if tool_name == "web_search":
+            return formatted
+
+        if tool_name in {"dir_create", "file_write", "file_append", "file_delete", "file_move", "safe_copy"}:
+            return formatted
+
+        if tool_name in {"__search_mode_set__", "__search_mode_get__"}:
+            return formatted
+
+        if tool_name == "__task_memory_write__":
+            return formatted
+
+        if tool_name == "__driving_checkin_stop__":
+            return formatted
+
+        if tool_name == "__mina_shutdown_status__":
+            return formatted
+
+        if tool_name == "__mina_shutdown__":
             return formatted
 
         if tool_name == "file_read" and not self._wants_grounded_tool_analysis(user_input):
@@ -3041,6 +4237,10 @@ class MK1Core:
             "turn_clock_started_at": self._turn_clock_started_at,
             "turn_clock_tick": self._turn_clock_tick,
             "last_user_activity_at": self._last_user_activity_at,
+            "last_shutdown_at": self._last_shutdown_at,
+            "seconds_since_last_shutdown": self._seconds_since_last_shutdown,
+            "away_nag_threshold_seconds": self.away_nag_threshold_seconds,
+            "away_nag_prompt_pending": self._away_nag_prompt_pending,
             "idle_checkin_interval_seconds": self.idle_checkin_interval_seconds,
             "idle_checkin_pending": self._idle_checkin_pending,
             "idle_checkin_due_since_at": self._idle_checkin_due_since_at,
@@ -3084,6 +4284,7 @@ class MK1Core:
                 try:
                     self._advance_turn_clock()
                     self._refresh_idle_checkin_state()
+                    self._save_runtime_state(reason="heartbeat")
                 except Exception:
                     traceback.print_exc()
 
@@ -3099,6 +4300,268 @@ class MK1Core:
         thread = self._turn_clock_thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=1.0)
+        self._save_runtime_state(reason="shutdown")
+        try:
+            mem = getattr(self, "memory", None)
+            if mem is not None:
+                if hasattr(mem, "close"):
+                    mem.close(flush_rounds=4, flush_batch_size=200)
+                elif hasattr(mem, "flush_pending_memories"):
+                    mem.flush_pending_memories(max_items=200)
+        except Exception:
+            traceback.print_exc()
+
+    def _prepare_safe_shutdown(
+        self,
+        force: bool = False,
+        max_wait_seconds: int = 45,
+        poll_seconds: int = 2,
+        flush_max_items: int = 400,
+    ) -> Dict[str, Any]:
+        mem = getattr(self, "memory", None)
+        if mem is None:
+            return {
+                "ok": True,
+                "result": {
+                    "buffer_clear": True,
+                    "pending": 0,
+                    "forced": False,
+                    "attempts": 0,
+                    "waited_seconds": 0.0,
+                },
+                "error": None,
+            }
+
+        wait_s = max(0, int(max_wait_seconds))
+        poll_s = max(1, int(poll_seconds))
+        flush_items = max(1, min(2000, int(flush_max_items)))
+        started = time.monotonic()
+        deadline = started + float(wait_s)
+        attempts = 0
+        last_pending: Optional[int] = None
+        last_flush: Dict[str, Any] = {"flushed": 0, "failed": 0}
+
+        while True:
+            attempts += 1
+
+            if hasattr(mem, "flush_pending_memories"):
+                try:
+                    flush_result = mem.flush_pending_memories(max_items=flush_items)
+                    if isinstance(flush_result, dict):
+                        rr = flush_result.get("result", {}) if isinstance(flush_result.get("result"), dict) else {}
+                        last_flush = {
+                            "flushed": int(rr.get("flushed") or 0),
+                            "failed": int(rr.get("failed") or 0),
+                        }
+                except Exception:
+                    traceback.print_exc()
+
+            pending = 0
+            if hasattr(mem, "buffer_status"):
+                try:
+                    bs = mem.buffer_status()
+                    if isinstance(bs, dict):
+                        br = bs.get("result", {}) if isinstance(bs.get("result"), dict) else {}
+                        pending = int(br.get("pending") or 0)
+                except Exception:
+                    traceback.print_exc()
+
+            last_pending = pending
+            if pending <= 0:
+                waited = max(0.0, time.monotonic() - started)
+                return {
+                    "ok": True,
+                    "result": {
+                        "buffer_clear": True,
+                        "pending": 0,
+                        "forced": False,
+                        "attempts": attempts,
+                        "waited_seconds": round(waited, 2),
+                        "last_flush": last_flush,
+                    },
+                    "error": None,
+                }
+
+            if time.monotonic() >= deadline:
+                break
+
+            time.sleep(float(poll_s))
+
+        waited = max(0.0, time.monotonic() - started)
+        if force:
+            return {
+                "ok": True,
+                "result": {
+                    "buffer_clear": False,
+                    "pending": int(last_pending or 0),
+                    "forced": True,
+                    "attempts": attempts,
+                    "waited_seconds": round(waited, 2),
+                    "last_flush": last_flush,
+                },
+                "error": None,
+            }
+
+        return {
+            "ok": False,
+            "result": {
+                "buffer_clear": False,
+                "pending": int(last_pending or 0),
+                "forced": False,
+                "attempts": attempts,
+                "waited_seconds": round(waited, 2),
+                "last_flush": last_flush,
+            },
+            "error": "buffer_not_clear_before_shutdown",
+        }
+
+    def _request_safe_shutdown(
+        self,
+        force: bool = False,
+        max_wait_seconds: int = 45,
+        poll_seconds: int = 2,
+        flush_max_items: int = 400,
+        embed_port: int = 8084,
+        post_flush_delay_ms: int = 1200,
+    ) -> Dict[str, Any]:
+        try:
+            gate = self._prepare_safe_shutdown(
+                force=force,
+                max_wait_seconds=max_wait_seconds,
+                poll_seconds=poll_seconds,
+                flush_max_items=flush_max_items,
+            )
+            if not gate.get("ok"):
+                return gate
+
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            script_path = os.path.join(repo_root, "shutdown_mina_safe.ps1")
+            if not os.path.isfile(script_path):
+                return {
+                    "ok": False,
+                    "result": None,
+                    "error": f"shutdown_script_missing: {script_path}",
+                }
+
+            self._save_runtime_state(reason="shutdown_requested")
+
+            port = int(self.config.get("server", "port", 8000) or 8000)
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script_path,
+                "-Port",
+                str(port),
+                "-EmbedPort",
+                str(max(1, int(embed_port))),
+                "-FlushMaxItems",
+                str(max(1, min(2000, int(flush_max_items)))),
+                "-WaitForBufferSeconds",
+                str(max(0, int(max_wait_seconds))),
+                "-BufferPollSeconds",
+                str(max(1, int(poll_seconds))),
+                "-PostFlushDelayMs",
+                str(max(0, min(15000, int(post_flush_delay_ms)))),
+            ]
+            if force:
+                cmd.append("-ForceAfterTimeout")
+
+            popen_kwargs: Dict[str, Any] = {"cwd": repo_root}
+            if os.name == "nt":
+                flags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | int(
+                    getattr(subprocess, "DETACHED_PROCESS", 0)
+                )
+                if flags:
+                    popen_kwargs["creationflags"] = flags
+
+            subprocess.Popen(cmd, **popen_kwargs)
+            return {
+                "ok": True,
+                "result": {
+                    "script": script_path,
+                    "port": port,
+                    "embed_port": max(1, int(embed_port)),
+                    "status": "shutdown_requested",
+                    "gate": gate.get("result"),
+                    "post_flush_delay_ms": max(0, min(15000, int(post_flush_delay_ms))),
+                },
+                "error": None,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {
+                "ok": False,
+                "result": None,
+                "error": f"shutdown_request_failed: {str(e)}",
+            }
+
+    def _shutdown_gate_status(
+        self,
+        max_wait_seconds: int = 45,
+        poll_seconds: int = 2,
+        flush_max_items: int = 400,
+    ) -> Dict[str, Any]:
+        try:
+            mem = getattr(self, "memory", None)
+            if mem is None:
+                return {
+                    "ok": True,
+                    "result": {
+                        "buffer_available": False,
+                        "buffer_ready": True,
+                        "pending": 0,
+                        "wait_recommendation": "Memory buffer engine not available; shutdown should not block on buffer.",
+                        "max_wait_seconds": max(0, int(max_wait_seconds)),
+                        "poll_seconds": max(1, int(poll_seconds)),
+                        "flush_max_items": max(1, min(2000, int(flush_max_items))),
+                    },
+                    "error": None,
+                }
+
+            pending = 0
+            warning = False
+            last_flush_result: Dict[str, Any] = {}
+            if hasattr(mem, "buffer_status"):
+                bs = mem.buffer_status()
+                if isinstance(bs, dict):
+                    br = bs.get("result", {}) if isinstance(bs.get("result"), dict) else {}
+                    pending = int(br.get("pending") or 0)
+                    warning = bool(br.get("warning", False))
+                    last_flush_result = br.get("last_flush_result", {}) if isinstance(br.get("last_flush_result"), dict) else {}
+
+            ready = pending <= 0
+            recommendation = (
+                "Buffer clear. Safe shutdown can proceed now."
+                if ready
+                else "Buffer still processing. Wait for clear or use force override if needed."
+            )
+
+            return {
+                "ok": True,
+                "result": {
+                    "buffer_available": True,
+                    "buffer_ready": ready,
+                    "pending": int(pending),
+                    "warning": warning,
+                    "last_flush_result": last_flush_result,
+                    "wait_recommendation": recommendation,
+                    "max_wait_seconds": max(0, int(max_wait_seconds)),
+                    "poll_seconds": max(1, int(poll_seconds)),
+                    "flush_max_items": max(1, min(2000, int(flush_max_items))),
+                    "force_override_hint": "Say: shutdown mina force",
+                },
+                "error": None,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {
+                "ok": False,
+                "result": None,
+                "error": f"shutdown_status_failed: {str(e)}",
+            }
 
     def _refresh_idle_checkin_state(self) -> None:
         now_monotonic = time.monotonic()
@@ -3154,6 +4617,13 @@ class MK1Core:
                 "Briefly check in on them before continuing with the answer."
             )
         return ""
+
+    def _consume_away_nag_prompt(self) -> str:
+        if not self._away_nag_prompt_pending:
+            return ""
+
+        self._away_nag_prompt_pending = False
+        return str(self._away_nag_prompt_text or "").strip()
 
     def _extract_repeat_seconds_from_tags(self, tags: Any) -> Optional[int]:
         try:
@@ -3243,6 +4713,8 @@ class MK1Core:
 
             if isinstance(getattr(self, "startup_context", None), dict):
                 self.startup_context["last_user_activity_at"] = self._last_user_activity_at
+
+        self._save_runtime_state(reason="user_input")
 
     def _format_turn_clock_line(self, clock_state: Dict[str, Any]) -> str:
         tick = int(clock_state.get("tick") or 0)
@@ -3435,6 +4907,275 @@ class MK1Core:
 
         inventory.sort(key=lambda item: item["name"].lower())
         return inventory
+
+    def _tool_self_test_aliases(self, available: List[str]) -> Dict[str, str]:
+        alias_map: Dict[str, str] = {}
+
+        def add_alias(alias: str, tool: str) -> None:
+            key = str(alias or "").strip().lower()
+            if not key:
+                return
+            if tool not in available:
+                return
+            alias_map[key] = tool
+
+        for name in available:
+            low = str(name or "").strip().lower()
+            if not low:
+                continue
+            add_alias(low, name)
+            add_alias(low.replace("_", " "), name)
+            add_alias(low.replace("_", "-"), name)
+
+        common_aliases = {
+            "spotify": "spotify_link",
+            "spotify tool": "spotify_link",
+            "ps": "ps_run",
+            "powershell run": "powershell",
+            "power shell": "powershell",
+            "code exec": "code_execute",
+            "execute code": "code_execute",
+            "mkdir": "dir_create",
+            "list dir": "dir_list",
+            "list directory": "dir_list",
+            "read memory": "memory_read",
+            "write memory": "memory_write",
+            "copy file": "safe_copy",
+            "fetch web": "web_fetch",
+            "search web": "web_search",
+            "github": "github_repo",
+        }
+
+        for alias, tool in common_aliases.items():
+            add_alias(alias, tool)
+
+        return alias_map
+
+    def _tool_self_test_extract_tools(self, text: str, alias_map: Dict[str, str]) -> List[str]:
+        src = str(text or "").lower()
+        if not src:
+            return []
+
+        hits: List[str] = []
+        for alias, tool in alias_map.items():
+            pat = r"(?<!\\w)" + re.escape(alias) + r"(?!\\w)"
+            if re.search(pat, src):
+                hits.append(tool)
+
+        out: List[str] = []
+        seen = set()
+        for tool in hits:
+            if tool in seen:
+                continue
+            seen.add(tool)
+            out.append(tool)
+        return out
+
+    def _resolve_tool_self_test_selection(self, request: str) -> Dict[str, Any]:
+        available = sorted(list(getattr(self.tools, "tools", {}).keys()))
+        alias_map = self._tool_self_test_aliases(available)
+        text = str(request or "").strip()
+        lowered = text.lower()
+
+        only_mentions: List[str] = []
+        only_match = re.search(r"\b(?:only|just)\b\s+(.+)$", text, re.IGNORECASE)
+        if only_match:
+            only_mentions = self._tool_self_test_extract_tools(only_match.group(1), alias_map)
+
+        include_mentions: List[str] = []
+        include_match = re.search(r"\b(?:include|including|with)\b\s+(.+)$", text, re.IGNORECASE)
+        if include_match:
+            include_mentions = self._tool_self_test_extract_tools(include_match.group(1), alias_map)
+
+        exclude_mentions: List[str] = []
+        for m in re.finditer(r"\b(?:except|excluding|without|but\s+not)\b\s+(.+?)(?:$|[.;]|\band\b\s+then\b)", text, re.IGNORECASE):
+            exclude_mentions.extend(self._tool_self_test_extract_tools(m.group(1), alias_map))
+
+        selected: List[str]
+        if only_mentions:
+            selected = [x for x in available if x in only_mentions]
+        else:
+            selected = list(available)
+            for tool in include_mentions:
+                if tool not in selected and tool in available:
+                    selected.append(tool)
+
+        if ("all tools" in lowered or "all your tools" in lowered) and not only_mentions:
+            selected = list(available)
+
+        if exclude_mentions:
+            selected = [x for x in selected if x not in set(exclude_mentions)]
+
+        selected = sorted(selected)
+
+        unknown_requested = False
+        if not selected and (only_mentions or include_mentions):
+            unknown_requested = True
+
+        return {
+            "available": available,
+            "selected": selected,
+            "only": sorted(set(only_mentions)),
+            "included": sorted(set(include_mentions)),
+            "excluded": sorted(set(exclude_mentions)),
+            "unknown_requested": unknown_requested,
+            "request": text,
+        }
+
+    def _run_single_tool_self_test(self, tool_name: str, base_dir: str, stamp: str) -> Dict[str, Any]:
+        started = time.time()
+        try:
+            files_dir = os.path.join(base_dir, "files")
+            os.makedirs(files_dir, exist_ok=True)
+
+            write_path = os.path.join(files_dir, "write_target.txt")
+            move_src = os.path.join(files_dir, "move_src.txt")
+            move_dst = os.path.join(files_dir, "move_dst.txt")
+            copy_dst = os.path.join(files_dir, "copy_dst.txt")
+            delete_target = os.path.join(files_dir, "delete_target.txt")
+            mem_text = f"tool self test marker {stamp}"
+
+            if tool_name == "mina_echo":
+                args = {}
+            elif tool_name == "dir_create":
+                args = {"path": os.path.join(base_dir, "alpha", "beta")}
+            elif tool_name == "dir_list":
+                args = {"path": base_dir}
+            elif tool_name == "file_write":
+                args = {"path": write_path, "content": f"tool self test {stamp}", "overwrite": True}
+            elif tool_name == "file_append":
+                with open(write_path, "w", encoding="utf-8") as handle:
+                    handle.write("line1")
+                args = {"path": write_path, "content": "\nline2"}
+            elif tool_name == "file_read":
+                with open(write_path, "w", encoding="utf-8") as handle:
+                    handle.write("read check")
+                args = {"path": write_path}
+            elif tool_name == "file_move":
+                with open(move_src, "w", encoding="utf-8") as handle:
+                    handle.write("move me")
+                if os.path.exists(move_dst):
+                    os.remove(move_dst)
+                args = {"src": move_src, "dst": move_dst}
+            elif tool_name == "file_delete":
+                with open(delete_target, "w", encoding="utf-8") as handle:
+                    handle.write("delete me")
+                args = {"path": delete_target}
+            elif tool_name == "safe_copy":
+                with open(write_path, "w", encoding="utf-8") as handle:
+                    handle.write("copy me")
+                if os.path.exists(copy_dst):
+                    os.remove(copy_dst)
+                args = {"src": write_path, "dst": copy_dst}
+            elif tool_name == "powershell":
+                args = {"command": 'Get-Date -Format "yyyy-MM-dd"', "timeout": 10}
+            elif tool_name == "ps_run":
+                args = {"command": 'Get-Date -Format "yyyy-MM-dd"', "timeout": 10}
+            elif tool_name == "code_execute":
+                args = {"language": "python", "code": "print('tool-self-test-ok')", "timeout": 10}
+            elif tool_name == "web_fetch":
+                args = {"url": "https://example.com", "timeout": 15}
+            elif tool_name == "web_search":
+                args = {"query": "Mina MK1", "max_results": 3, "timeout": 20, "include_content": False}
+            elif tool_name == "github_repo":
+                args = {"action": "repo_info", "owner": "octocat", "repo": "Hello-World"}
+            elif tool_name == "memory_write":
+                args = {"text": mem_text, "kind": "note", "tags": ["tool_self_test"]}
+            elif tool_name == "memory_read":
+                args = {"query": mem_text, "top_k": 1}
+            elif tool_name == "gremlin_chaos":
+                args = {"level": 1}
+            elif tool_name == "spotify_link":
+                # Status-only probe; avoids changing playback state.
+                args = {"action": "connect_status"}
+            else:
+                return {
+                    "tool": tool_name,
+                    "ok": False,
+                    "error": "no_self_test_plan_for_tool",
+                    "duration_ms": int((time.time() - started) * 1000),
+                }
+
+            raw = self.tools.run(tool_name, args)
+            ok_flag = bool(isinstance(raw, dict) and raw.get("ok"))
+            err_text = ""
+            if isinstance(raw, dict):
+                err_text = str(raw.get("error") or "")
+            return {
+                "tool": tool_name,
+                "ok": ok_flag,
+                "error": err_text,
+                "duration_ms": int((time.time() - started) * 1000),
+                "result": raw,
+            }
+        except Exception as e:
+            return {
+                "tool": tool_name,
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "duration_ms": int((time.time() - started) * 1000),
+            }
+
+    def _run_tool_self_test(self, request: str) -> Dict[str, Any]:
+        selection = self._resolve_tool_self_test_selection(request)
+        selected = selection.get("selected", [])
+        if not selected:
+            if selection.get("unknown_requested"):
+                return {
+                    "ok": False,
+                    "result": {
+                        "request": selection.get("request"),
+                        "available": selection.get("available", []),
+                        "selected": [],
+                        "runs": [],
+                    },
+                    "error": "no_matching_tools_requested",
+                }
+            selected = list(selection.get("available", []))
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = os.path.join(self.workspace_root, "tmp", f"tool_self_test_{stamp}")
+        os.makedirs(base_dir, exist_ok=True)
+
+        runs: List[Dict[str, Any]] = []
+        for tool_name in selected:
+            runs.append(self._run_single_tool_self_test(tool_name=tool_name, base_dir=base_dir, stamp=stamp))
+
+        failed = [r for r in runs if not r.get("ok")]
+        summary = {str(r.get("tool")): bool(r.get("ok")) for r in runs}
+
+        report_payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "request": selection.get("request"),
+            "available": selection.get("available", []),
+            "selected": selected,
+            "excluded": selection.get("excluded", []),
+            "included": selection.get("included", []),
+            "only": selection.get("only", []),
+            "summary": summary,
+            "failed_count": len(failed),
+            "runs": runs,
+        }
+
+        report_path = os.path.join(base_dir, "tool_self_test_report.json")
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(report_payload, handle, indent=2, ensure_ascii=True)
+
+        return {
+            "ok": len(failed) == 0,
+            "result": {
+                "request": selection.get("request"),
+                "selected": selected,
+                "excluded": selection.get("excluded", []),
+                "included": selection.get("included", []),
+                "only": selection.get("only", []),
+                "failed_count": len(failed),
+                "summary": summary,
+                "runs": runs,
+                "report_path": report_path,
+            },
+            "error": None if len(failed) == 0 else "tool_self_test_failures",
+        }
 
     def _scratch_root(self) -> str:
         return os.path.join(self.workspace_root, "scratch")
@@ -4359,6 +6100,11 @@ class MK1Core:
         if not bool(getattr(self, "reflex_requires_prefix", False)):
             return True
 
+        # If prefix mode is enabled, still allow obvious command-like requests
+        # so users don't have to remember special trigger words.
+        if self._is_command_like_query(text):
+            return True
+
         low = text.lower()
         prefixes = getattr(self, "reflex_prefixes", ["/tool", "tool:", "run tool"])
         return any(low.startswith(p) for p in prefixes)
@@ -4376,6 +6122,54 @@ class MK1Core:
 
         return text
 
+    def _direct_render_tool_names(self) -> set:
+        return {
+            "__tool_list__",
+            "__tool_self_test__",
+            "__scratch_note__",
+            "__path_alias_set__",
+            "__path_alias_list__",
+            "__path_alias_forget__",
+            "__workspace_info__",
+            "__startup_status__",
+            "__git_init__",
+            "__git_status__",
+            "__git_snapshot__",
+            "__git_pull__",
+            "__git_push__",
+            "__project_test_run__",
+            "__project_tracker_status__",
+            "__project_tracker_update__",
+            "__project_bootstrap__",
+            "__memory_status__",
+            "__memory_tidy__",
+            "__search_mode_set__",
+            "__search_mode_get__",
+            "__driving_checkin_stop__",
+            "__mina_shutdown_status__",
+            "__mina_shutdown__",
+            "__task_memory_write__",
+            "__scaffold__",
+            "memory_write",
+            "web_search",
+            "web_fetch",
+            "dir_list",
+            "dir_create",
+            "file_read",
+            "file_write",
+            "file_append",
+            "file_delete",
+            "file_move",
+            "safe_copy",
+            "github_repo",
+            "ps_run",
+            "code_execute",
+            "spotify_link",
+        }
+
+    def _should_direct_render_tool(self, tool_name: str) -> bool:
+        return str(tool_name or "") in self._direct_render_tool_names()
+
 # ========================================================
 # PROCESS
 # ========================================================
@@ -4384,6 +6178,7 @@ class MK1Core:
         self,
         user_input: str,
         image_attachment: Optional[Dict[str, Any]] = None,
+        request_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
         try:
@@ -4397,6 +6192,7 @@ class MK1Core:
             turn_clock = self._advance_turn_clock()
             self._refresh_idle_checkin_state()
             checkin_prompt = self._consume_idle_checkin_prompt()
+            away_prompt = self._consume_away_nag_prompt()
             self._register_user_activity()
 
             # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -4445,6 +6241,12 @@ class MK1Core:
                     "content": checkin_prompt,
                 })
 
+            if away_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": away_prompt,
+                })
+
             due_task_prompt = self._build_due_task_prompt()
             if due_task_prompt:
                 messages.append({
@@ -4456,6 +6258,12 @@ class MK1Core:
                 "role": "system",
                 "content": self._format_turn_clock_line(turn_clock),
             })
+
+            if str(getattr(self, "action_mode_strictness", "balanced")) in {"balanced", "strict"}:
+                messages.append({
+                    "role": "system",
+                    "content": self._truth_first_system_rules(),
+                })
 
             # Add tool availability hint if tools are available
             # NOTE: Don't pass tools to model.chat() - LMStudio hangs with tools parameter
@@ -4488,6 +6296,7 @@ class MK1Core:
                         messages=messages,
                         reply={},
                         user_input=reflex_input,
+                        request_context=request_context,
                     )
 
             if reflex_reply is not None:
@@ -4677,12 +6486,14 @@ class MK1Core:
         self,
         user_input: str,
         image_attachment: Optional[Dict[str, Any]] = None,
+        request_context: Optional[Dict[str, Any]] = None,
     ):
 
         try:
             turn_clock = self._advance_turn_clock()
             self._refresh_idle_checkin_state()
             checkin_prompt = self._consume_idle_checkin_prompt()
+            away_prompt = self._consume_away_nag_prompt()
             self._register_user_activity()
             self._maybe_run_maintenance_tick()
 
@@ -4723,6 +6534,12 @@ class MK1Core:
                     "content": checkin_prompt,
                 })
 
+            if away_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": away_prompt,
+                })
+
             due_task_prompt = self._build_due_task_prompt()
             if due_task_prompt:
                 messages.append({
@@ -4759,6 +6576,7 @@ class MK1Core:
                         messages=messages,
                         reply={},
                         user_input=reflex_input,
+                        request_context=request_context,
                     )
             if reflex_reply is not None:
                 final_text = self._extract_text(reflex_reply)
@@ -4854,6 +6672,13 @@ class MK1Core:
         if re.search(r"\b(write|append|delete|remove|create)\s+(?:a\s+)?(?:file|folder|directory)\b", q):
             return True
         if re.search(r"\b(run|start|stop|restart)\s+(?:the\s+)?(?:server|api|script|service|test|tests)\b", q):
+            return True
+
+        # Media control commands should be treated as operational intents.
+        if re.search(r"\b(play|pause|resume|continue|unpause|stop)\b", q) and re.search(
+            r"\b(music|spotify|song|songs|track|tracks|playlist|playlists|liked\s+songs?|saved\s+songs?|favorites?|favourites?)\b",
+            q,
+        ):
             return True
 
         # Path-looking strings are usually operational commands.
@@ -5140,6 +6965,39 @@ class MK1Core:
                         lines.append(f"- {name}")
                 else:
                     lines.append(f"- {item}")
+            return "\n".join(lines)
+
+        if tool_name == "__tool_self_test__":
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            selected = payload.get("selected", []) if isinstance(payload.get("selected", []), list) else []
+            excluded = payload.get("excluded", []) if isinstance(payload.get("excluded", []), list) else []
+            report_path = str(payload.get("report_path") or "").strip()
+            runs = payload.get("runs", []) if isinstance(payload.get("runs", []), list) else []
+            failed_count = int(payload.get("failed_count") or 0)
+
+            lines: List[str] = []
+            lines.append("Tool self-test completed." if result.get("ok") else "Tool self-test completed with failures.")
+            if selected:
+                lines.append("Selected tools: " + ", ".join([str(x) for x in selected]))
+            if excluded:
+                lines.append("Excluded tools: " + ", ".join([str(x) for x in excluded]))
+            lines.append(f"Failed count: {failed_count}")
+
+            for row in runs:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("tool") or "")
+                ok_flag = bool(row.get("ok"))
+                err = str(row.get("error") or "")
+                duration = int(row.get("duration_ms") or 0)
+                if ok_flag:
+                    lines.append(f"- PASS {name} ({duration}ms)")
+                else:
+                    lines.append(f"- FAIL {name} ({duration}ms): {err}")
+
+            if report_path:
+                lines.append(f"Report: {report_path}")
+
             return "\n".join(lines)
 
         if tool_name == "__scratch_note__":
@@ -5485,7 +7343,9 @@ class MK1Core:
             lines = []
             seen = set()
             for item in entries:
-                text = item.get("text", "").strip()
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text", "") or "").strip()
                 if not text:
                     continue
                 norm = " ".join(text.lower().split())
@@ -5592,7 +7452,8 @@ class MK1Core:
             items = payload.get("results", []) if isinstance(payload.get("results", []), list) else []
             if not items:
                 q = payload.get("query") or "(no query)"
-                return f"No web results found for: {q}"
+                mode = str(payload.get("mode") or "balanced")
+                return f"No web results found for: {q} (mode={mode})"
 
             lines = []
             q = payload.get("query")
@@ -5613,10 +7474,83 @@ class MK1Core:
 
             return "\n".join(lines)
 
+        if tool_name == "__search_mode_set__":
+            if not result.get("ok"):
+                payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+                current = payload.get("current_mode")
+                return f"Search mode update failed: {result.get('error')} (current={current})"
+            payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+            return f"Web search mode set to: {payload.get('mode')}"
+
+        if tool_name == "__search_mode_get__":
+            if not result.get("ok"):
+                return f"Search mode check failed: {result.get('error')}"
+            payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+            mode = payload.get("mode")
+            allowed = payload.get("allowed") or ["balanced", "strict", "wide"]
+            return f"Current web search mode: {mode} (allowed: {', '.join([str(x) for x in allowed])})"
+
+        if tool_name == "__driving_checkin_stop__":
+            if not result.get("ok"):
+                return f"Driving check-in stop failed: {result.get('error')}"
+            payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+            stopped = int(payload.get("stopped_count") or 0)
+            if stopped <= 0:
+                return "No active driving check-ins were found."
+            return f"Stopped {stopped} driving check-in reminder(s)."
+
+        if tool_name == "__mina_shutdown_status__":
+            if not result.get("ok"):
+                return f"Shutdown status check failed: {result.get('error')}"
+            payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+            ready = bool(payload.get("buffer_ready", False))
+            pending = int(payload.get("pending") or 0)
+            recommendation = str(payload.get("wait_recommendation") or "").strip()
+            last_flush = payload.get("last_flush_result", {}) if isinstance(payload.get("last_flush_result"), dict) else {}
+            flushed = int(last_flush.get("flushed") or 0)
+            failed = int(last_flush.get("failed") or 0)
+            force_hint = str(payload.get("force_override_hint") or "").strip()
+            return (
+                f"Shutdown ready={ready}; pending buffer items={pending}; "
+                f"last flush flushed={flushed} failed={failed}. {recommendation}"
+                + (f" {force_hint}" if force_hint else "")
+            )
+
+        if tool_name == "__mina_shutdown__":
+            if not result.get("ok"):
+                return f"Safe shutdown failed: {result.get('error')}"
+            payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+            script_path = str(payload.get("script") or "").strip()
+            port = payload.get("port")
+            gate = payload.get("gate", {}) if isinstance(payload.get("gate"), dict) else {}
+            waited = gate.get("waited_seconds")
+            pending = gate.get("pending")
+            forced = bool(gate.get("forced", False))
+            if script_path:
+                return (
+                    f"Safe shutdown requested. Running {script_path} on port {port}. "
+                    f"Buffer wait={waited}s pending={pending} forced={forced}."
+                )
+            return "Safe shutdown requested."
+
         if tool_name == "spotify_link":
             if not result.get("ok"):
                 err = str(result.get("error") or "spotify_error")
                 payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+                status_code = payload.get("status_code")
+                path = str(payload.get("path") or "").strip().lower()
+
+                if (
+                    err == "spotify_forbidden_scope_or_premium_required"
+                    and status_code == 403
+                    and "/playlists" in path
+                ):
+                    return (
+                        "Spotify denied playlist write access (403 Forbidden). "
+                        "Mina sent the request correctly, but Spotify blocked create/add for this app/account right now. "
+                        "Check Spotify Developer app access or try again later while their dashboard changes settle."
+                    )
+
                 hint = str(payload.get("self_heal_hint") or "").strip()
                 if hint:
                     return f"Spotify request failed: {err}. {hint}"
@@ -5625,17 +7559,136 @@ class MK1Core:
             payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
             status = str(payload.get("status") or "").strip().lower()
 
+            def _artist_text(value: Any) -> str:
+                if not isinstance(value, list):
+                    return ""
+                return ", ".join([str(a).strip() for a in value if str(a).strip()])
+
+            playlists_raw = payload.get("playlists")
+
+            if status in {"dj_started", "dj_already_running", "dj_stopping", "dj_not_running", "dj_running", "dj_stopped"}:
+                dj_raw = payload.get("dj")
+                dj: Dict[str, Any] = dj_raw if isinstance(dj_raw, dict) else {}
+                running = bool(dj.get("running", False))
+                tracks_played = int(dj.get("tracks_played") or 0)
+                last_track = dj.get("last_track") if isinstance(dj.get("last_track"), dict) else {}
+                last_name = str((last_track or {}).get("name") or "").strip()
+
+                if status in {"dj_started", "dj_already_running"}:
+                    if last_name:
+                        return f"Favorites DJ is on. I will auto-switch tracks from your liked songs. Last pick: {last_name}."
+                    return "Favorites DJ is on. I will auto-switch tracks from your liked songs when each song ends."
+                if status == "dj_stopping":
+                    return "Favorites DJ is stopping now."
+                if status == "dj_not_running":
+                    return "Favorites DJ is not running."
+                if status == "dj_running" or running:
+                    if last_name:
+                        return f"Favorites DJ is running. Tracks switched so far: {tracks_played}. Current pick: {last_name}."
+                    return f"Favorites DJ is running. Tracks switched so far: {tracks_played}."
+                return "Favorites DJ is stopped."
+
+            if "playlists" in payload and isinstance(playlists_raw, list):
+                playlists = playlists_raw
+                if not playlists:
+                    return "No playlists found in your Spotify account."
+                lines = ["Spotify playlists:"]
+                for idx, row in enumerate(playlists[:30], start=1):
+                    if not isinstance(row, dict):
+                        continue
+                    name = str(row.get("name") or "(untitled playlist)").strip()
+                    total = row.get("tracks_total")
+                    suffix = f" ({total} tracks)" if isinstance(total, int) else ""
+                    lines.append(f"{idx}. {name}{suffix}")
+                return "\n".join(lines)
+
+            tracks_raw = payload.get("tracks")
+            if "tracks" in payload and isinstance(tracks_raw, list):
+                tracks = tracks_raw
+                if not tracks:
+                    if payload.get("playlist_id"):
+                        return "No tracks found in that playlist."
+                    return "No liked songs found."
+
+                if payload.get("playlist_id"):
+                    header = "Playlist tracks:"
+                else:
+                    shown = len(tracks)
+                    total_available = payload.get("total_available")
+                    try:
+                        total_num = int(total_available) if total_available is not None else shown
+                    except Exception:
+                        total_num = shown
+                    if total_num > shown:
+                        header = f"Liked songs (showing {shown} of {total_num}):"
+                    else:
+                        header = f"Liked songs ({shown} total):"
+                lines = [header]
+
+                if not payload.get("playlist_id"):
+                    def _track_line(idx: int, row: Dict[str, Any]) -> str:
+                        name = str(row.get("name") or "(untitled track)").strip()
+                        artist_text = _artist_text(row.get("artists"))
+                        if artist_text:
+                            return f"{idx}. {name} - {artist_text}"
+                        return f"{idx}. {name}"
+
+                    entries: List[str] = []
+                    for idx, row in enumerate(tracks, start=1):
+                        if not isinstance(row, dict):
+                            continue
+                        entries.append(_track_line(idx, row))
+
+                    if len(entries) <= 1:
+                        lines.extend(entries)
+                        return "\n".join(lines)
+
+                    mid = (len(entries) + 1) // 2
+                    left_col = entries[:mid]
+                    right_col = entries[mid:]
+                    left_width = min(90, max((len(x) for x in left_col), default=0) + 3)
+
+                    for i in range(mid):
+                        left = left_col[i]
+                        right = right_col[i] if i < len(right_col) else ""
+                        if right:
+                            lines.append(f"{left.ljust(left_width)}{right}")
+                        else:
+                            lines.append(left)
+                    return "\n".join(lines)
+
+                for idx, row in enumerate(tracks[:50], start=1):
+                    if not isinstance(row, dict):
+                        continue
+                    name = str(row.get("name") or "(untitled track)").strip()
+                    artist_text = _artist_text(row.get("artists"))
+                    if artist_text:
+                        lines.append(f"{idx}. {name} - {artist_text}")
+                    else:
+                        lines.append(f"{idx}. {name}")
+                return "\n".join(lines)
+
             # Most common happy-path payload for favorites/search play.
             played = payload.get("played") if isinstance(payload.get("played"), dict) else None
             if isinstance(played, dict):
                 name = str(played.get("name") or "").strip()
-                artists = played.get("artists") if isinstance(played.get("artists"), list) else []
-                artist_text = ", ".join([str(a).strip() for a in artists if str(a).strip()])
+                artist_text = _artist_text(played.get("artists"))
+                source = str(payload.get("source") or "").strip().lower()
                 if status == "already_playing":
                     if name and artist_text:
                         return f"Already playing {name} by {artist_text}."
                     if name:
                         return f"Already playing {name}."
+                if source == "favorites_library":
+                    if name and artist_text:
+                        return f"Playing {name} by {artist_text} from your liked songs."
+                    if name:
+                        return f"Playing {name} from your liked songs."
+                if source == "search_fallback_after_favorites_miss":
+                    if name and artist_text:
+                        return f"Playing {name} by {artist_text} as the closest Spotify match."
+                    if name:
+                        return f"Playing {name} as the closest Spotify match."
                 if name and artist_text:
                     return f"Playing {name} by {artist_text}."
                 if name:
@@ -5644,8 +7697,7 @@ class MK1Core:
             track = payload.get("track") if isinstance(payload.get("track"), dict) else None
             if isinstance(track, dict):
                 name = str(track.get("name") or "").strip()
-                artists = track.get("artists") if isinstance(track.get("artists"), list) else []
-                artist_text = ", ".join([str(a).strip() for a in artists if str(a).strip()])
+                artist_text = _artist_text(track.get("artists"))
                 if name and artist_text:
                     return f"Now playing {name} by {artist_text}."
                 if name:
@@ -5837,6 +7889,7 @@ class MK1Core:
         messages: List[Dict[str, Any]],
         reply: Dict[str, Any],
         user_input: str,
+        request_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
 
         tool_name, tool_args = self.detect_tool_intent(user_input)
@@ -5859,6 +7912,221 @@ class MK1Core:
                     {
                         "message": {
                             "content": "I am Mina, your chaotic gremlin-fox assistant.",
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__spotify_dj_capability__":
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "Yes. I can do that. I can read track duration and auto-switch songs from your liked list when each song ends. "
+                                "Say: 'start dj mode from my favorite list'. "
+                                "You can stop it with: 'stop dj mode'."
+                            ),
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__tool_self_test__":
+            result = self._run_tool_self_test(str(tool_args.get("request") or user_input))
+            formatted = self._format_tool_result(tool_name, result)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": formatted,
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__inspect_directory_tree__":
+            inspect_path = str(tool_args.get("path") or "").strip()
+            inspect_mode = str(tool_args.get("mode") or "all").strip().lower()
+            result = self._inspect_directory_tree(inspect_path, mode=inspect_mode)
+            if not result.get("ok"):
+                content = f"Directory inspection failed: {result.get('error')}"
+            else:
+                content = str((result.get("result") or {}).get("report") or "No inspection report generated.")
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": content,
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__inspect_sqlite_table__":
+            inspect_path = str(tool_args.get("path") or "").strip()
+            table_name = str(tool_args.get("table") or "").strip()
+            row_limit = int(tool_args.get("row_limit") or 8)
+            result = inspect_sqlite_table(inspect_path, table_name=table_name, row_limit=row_limit)
+            if not result.get("ok"):
+                content = f"SQLite table preview failed: {result.get('error')}"
+            else:
+                content = str((result.get("result") or {}).get("content") or "No SQLite preview generated.")
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": content,
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__clarify_intent__":
+            question = str(tool_args.get("question") or "Please clarify your intent.").strip()
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": question,
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__capability_limit__":
+            limitation = str(tool_args.get("message") or "I cannot perform that external action directly.").strip()
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": limitation,
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__voice_auth_status__":
+            enrolled = bool(self._voice_passphrase_hash)
+            trusted_cfg = bool(self.trusted_client_tokens)
+            trusted_client = self._is_trusted_client(request_context)
+            recently_verified = self._is_client_recently_verified(request_context)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                f"Voice passphrase enrolled={enrolled}. "
+                                f"Trusted-client tokens configured={trusted_cfg}. "
+                                f"This client trusted={trusted_client}. "
+                                f"This client recently voice-verified={recently_verified}."
+                            ),
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__voice_passphrase_enroll__":
+            enroll = self._enroll_voice_passphrase(str(tool_args.get("phrase") or ""))
+            if not enroll.get("ok"):
+                msg = "Voice passphrase enroll failed. Use a longer phrase."
+            else:
+                hint = str((enroll.get("result") or {}).get("hint") or "")
+                msg = f"Voice passphrase enrolled. Hint: {hint}."
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": msg,
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__voice_identity_verify__":
+            phrase = str(tool_args.get("phrase") or "").strip()
+            if self._is_voice_phrase_match(phrase):
+                self._mark_client_verified(request_context)
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "Voice verified for this client. Sensitive actions are unlocked for a short window.",
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Voice verification failed. Please try the exact enrolled phrase.",
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__cancel_external_write__":
+            pending = self._pending_write_auth if isinstance(self._pending_write_auth, dict) else None
+            self._clear_pending_write_authorization()
+            if pending:
+                target = str(pending.get("target") or "the pending path")
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": f"Canceled. I will not write outside E:\\workspace for {target}.",
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "No pending external write request to cancel.",
+                        }
+                    }
+                ]
+            }
+
+        if tool_name == "__confirm_external_write__":
+            pending = self._pending_write_auth if isinstance(self._pending_write_auth, dict) else None
+            if not pending:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "No pending external write request to authorize.",
+                            }
+                        }
+                    ]
+                }
+
+            pending_tool = str(pending.get("tool_name") or "").strip()
+            pending_args = dict(pending.get("tool_args") or {})
+            pending_args["authorized_write"] = True
+
+            result = self.tools.run(pending_tool, pending_args)
+            formatted = self._format_tool_result(pending_tool, result)
+
+            if bool(result.get("ok", False)):
+                self._clear_pending_write_authorization()
+            else:
+                err = str(result.get("error") or "")
+                if "write_auth_token_invalid" in err:
+                    formatted = (
+                        "Authorization acknowledged, but a write token is required and did not match. "
+                        "Set MK1_WRITE_AUTH_TOKEN in the environment and retry."
+                    )
+                else:
+                    self._clear_pending_write_authorization()
+
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": formatted,
                         }
                     }
                 ]
@@ -5908,6 +8176,35 @@ class MK1Core:
                 resolved_script = self._resolve_path_alias(user_input)
                 if resolved_script:
                     tool_args["script"] = f'& "{resolved_script}"'
+
+        if tool_name == "web_search":
+            mode = str(tool_args.get("mode") or "").strip().lower()
+            if mode not in {"balanced", "strict", "wide"}:
+                tool_args["mode"] = self.web_search_mode
+
+        gate_prompt = self._identity_gate_decision(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            request_context=request_context,
+        )
+        if gate_prompt:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": gate_prompt,
+                        }
+                    }
+                ]
+            }
+
+        if tool_name in self._write_auth_tool_names():
+            already_authorized = bool(tool_args.get("authorized_write", False))
+            if not already_authorized and (
+                self._is_trusted_client(request_context)
+                or self._is_client_recently_verified(request_context)
+            ):
+                tool_args["authorized_write"] = True
 
         if tool_name == "__tool_list__":
             inventory = self._usable_tool_inventory()
@@ -5967,6 +8264,27 @@ class MK1Core:
             result = self._memory_tidy(
                 dry_run=bool(tool_args.get("dry_run", False)),
             )
+        elif tool_name == "__search_mode_set__":
+            result = self._set_web_search_mode(str(tool_args.get("mode") or ""))
+        elif tool_name == "__search_mode_get__":
+            result = self._get_web_search_mode()
+        elif tool_name == "__driving_checkin_stop__":
+            result = self._stop_driving_checkins()
+        elif tool_name == "__mina_shutdown_status__":
+            result = self._shutdown_gate_status(
+                max_wait_seconds=int(tool_args.get("max_wait_seconds", 45) or 45),
+                poll_seconds=int(tool_args.get("poll_seconds", 2) or 2),
+                flush_max_items=int(tool_args.get("flush_max_items", 400) or 400),
+            )
+        elif tool_name == "__mina_shutdown__":
+            result = self._request_safe_shutdown(
+                force=bool(tool_args.get("force", False)),
+                max_wait_seconds=int(tool_args.get("max_wait_seconds", 45) or 45),
+                poll_seconds=int(tool_args.get("poll_seconds", 2) or 2),
+                flush_max_items=int(tool_args.get("flush_max_items", 400) or 400),
+                embed_port=int(tool_args.get("embed_port", 8084) or 8084),
+                post_flush_delay_ms=int(tool_args.get("post_flush_delay_ms", 1200) or 1200),
+            )
         elif tool_name == "__task_memory_write__":
             write_tags = tool_args.get("tags", ["user_memory"])
             if not isinstance(write_tags, list):
@@ -6000,6 +8318,35 @@ class MK1Core:
         else:
             result = self.tools.run(tool_name, tool_args)
 
+        blocked_external_write = (
+            tool_name in self._write_auth_tool_names()
+            and isinstance(result, dict)
+            and not bool(result.get("ok", True))
+            and "write_not_authorized_outside_workspace" in str(result.get("error") or "")
+        )
+        if blocked_external_write:
+            self._set_pending_write_authorization(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                user_input=user_input,
+                error=str(result.get("error") or ""),
+            )
+            target = self._pending_write_target(tool_name, tool_args)
+            prompt = (
+                "This write is outside E:\\workspace and needs your approval. "
+                f"Target: {target}. "
+                "Reply with 'authorize write' to approve this one action, or 'cancel' to deny."
+            )
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": prompt,
+                        }
+                    }
+                ]
+            }
+
         try:
             summary = (
                 f"Tool '{tool_name}' "
@@ -6014,6 +8361,13 @@ class MK1Core:
         except Exception:
             traceback.print_exc()
 
+        self._maybe_learn_intent_alias(
+            user_input=user_input,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            result=result,
+        )
+
         formatted = self._format_tool_result(tool_name, result)
         if not formatted.strip():
             formatted = "(tool returned no output)"
@@ -6026,42 +8380,7 @@ class MK1Core:
             formatted=formatted,
         )
 
-        if tool_name in (
-            "__tool_list__",
-            "__scratch_note__",
-            "__path_alias_set__",
-            "__path_alias_list__",
-            "__path_alias_forget__",
-            "__workspace_info__",
-            "__startup_status__",
-            "__git_init__",
-            "__git_status__",
-            "__git_snapshot__",
-            "__git_pull__",
-            "__git_push__",
-            "__project_test_run__",
-            "__project_tracker_status__",
-            "__project_tracker_update__",
-            "__project_bootstrap__",
-            "__memory_status__",
-            "__memory_tidy__",
-            "__scaffold__",
-            "memory_write",
-            "web_search",
-            "web_fetch",
-            "dir_list",
-            "dir_create",
-            "file_read",
-            "file_write",
-            "file_append",
-            "file_delete",
-            "file_move",
-            "safe_copy",
-            "github_repo",
-            "ps_run",
-            "code_execute",
-            "spotify_link",
-        ):
+        if self._should_direct_render_tool(tool_name):
             content = self._render_tool_response_as_mina(
                 messages=messages,
                 user_input=user_input,
@@ -6136,29 +8455,353 @@ IMPORTANT RULES:
         if not text:
             return None, {}
 
-        raw_text = text.strip()
+        original_text = text.strip()
+        raw_text = self._normalize_user_intent_text(original_text)
         t = raw_text.lower().strip()
 
-        # Users often prefix requests with vocatives like "you" or "mina".
-        # Strip these so intent routing still matches tool/memory patterns.
-        raw_text = re.sub(r'^\s*(?:hey\s+)?(?:you|mina)[,\s:;-]+', '', raw_text, flags=re.IGNORECASE).strip()
-        raw_text = re.sub(
-            r'^\s*(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}[,\s:;-]+(?=(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\b|in\s+\d+\s*(?:seconds?|minutes?|hours?)\b)',
-            '',
+        if isinstance(getattr(self, "_pending_write_auth", None), dict):
+            if self._is_write_authorization_confirmation(raw_text):
+                return "__confirm_external_write__", {}
+            if self._is_write_authorization_cancel(raw_text):
+                return "__cancel_external_write__", {}
+
+        enroll_match = re.search(
+            r"\b(?:set|enroll|register|save)\s+(?:my\s+)?voice\s+(?:passphrase|phrase|code)\s*(?:to|as|:)?\s*(.+)$",
+            raw_text,
+            re.IGNORECASE,
+        )
+        if enroll_match:
+            phrase = str(enroll_match.group(1) or "").strip().strip('"\'')
+            if phrase:
+                return "__voice_passphrase_enroll__", {"phrase": phrase}
+
+        verify_match = re.search(r"^\s*(?:mina\s+)?verify\s+voice\s+(.+)$", raw_text, re.IGNORECASE)
+        if verify_match:
+            phrase = str(verify_match.group(1) or "").strip().strip('"\'')
+            if phrase:
+                return "__voice_identity_verify__", {"phrase": phrase}
+
+        if re.search(r"\b(?:voice\s+auth\s+status|voice\s+passphrase\s+status|identity\s+status)\b", t):
+            return "__voice_auth_status__", {}
+
+        alias_hit = self._resolve_intent_alias(raw_text)
+        if alias_hit is not None:
+            return alias_hit
+
+        ambiguity_prompt = self._maybe_build_ambiguity_prompt(raw_text)
+        if ambiguity_prompt:
+            return "__clarify_intent__", {"question": ambiguity_prompt}
+
+        external_message_intent = (
+            re.search(r"\b(send|text|sms|message|call|phone)\b", t) is not None
+            and re.search(r"\b(to|my|him|her|them|brother|sister|mom|dad|friend|contact)\b", t) is not None
+        )
+        if external_message_intent:
+            tool_names = set(getattr(self.tools, "tools", {}).keys())
+            has_messaging_tool = any(name in tool_names for name in ["sms_send", "send_text", "phone_text", "twilio_sms"])
+            if not has_messaging_tool:
+                return "__capability_limit__", {
+                    "message": (
+                        "I cannot send real texts or calls directly from this setup yet. "
+                        "I can draft the exact message for you and keep a follow-up reminder."
+                    )
+                }
+
+        bulk_read_match = re.search(r"\bread\s+all\s+files\s+in\s+([A-Za-z]:\\[^\n\r]*)", raw_text, re.IGNORECASE)
+        if bulk_read_match:
+            folder = bulk_read_match.group(1).strip().rstrip(".,;:")
+            return "__clarify_intent__", {
+                "question": (
+                    f"I can do this reliably, but not as one giant blind read. "
+                    f"I will first list files in {folder}, then read them in chunks and report verified findings. "
+                    f"Say: 'yes scan now' to proceed."
+                )
+            }
+
+        # ====================================================
+        # DIRECT TOOL MARKUP (USER-PASTED)
+        # ====================================================
+        pasted_tool = re.search(
+            r"\|>\s*([A-Za-z_][\w.-]*)\s*\{([\s\S]*?)\}\s*(?:<\|tool_call\>|<tool_call\|>)?",
             raw_text,
             flags=re.IGNORECASE,
-        ).strip()
-        t = raw_text.lower().strip()
+        )
+        if pasted_tool:
+            tool_name = str(pasted_tool.group(1) or "").strip()
+            args = self._parse_tool_args(str(pasted_tool.group(2) or ""))
+            if tool_name in getattr(self.tools, "tools", {}):
+                return tool_name, args
 
-        if t.startswith("please "):
-            t = t[7:].strip()
+        # Route configurable tool self-test requests early so mentions like
+        # "spotify" or "github" don't get hijacked by other intent handlers.
+        if self._is_tool_self_test_request(t):
+            available_tools = sorted(list(getattr(self.tools, "tools", {}).keys()))
+            alias_map = self._tool_self_test_aliases(available_tools)
+            mentions = self._tool_self_test_extract_tools(raw_text, alias_map)
+            if re.search(r"\btools?\b", t) is not None or bool(mentions):
+                return "__tool_self_test__", {"request": raw_text}
+
+        # ====================================================
+        # TRAVEL PRICE SEARCH (DIRECT ROUTING)
+        # ====================================================
+        if "web_search" in getattr(self.tools, "tools", {}):
+            asks_price = re.search(r"\b(how\s+much|price|cost|fare|cheap|cheapest|budget)\b", t) is not None
+            travel_intent = re.search(r"\b(flight|flights|airfare|airline|airport|ticket|route|layover|itinerary|laos|vientiane|luang\s+prabang)\b", t) is not None
+            if asks_price and travel_intent:
+                search_query = raw_text
+
+                m = re.search(r"\b(?:cheap\s+)?flights?\s+to\s+(.+?)\s+(?:cost|price)\b", raw_text, re.IGNORECASE)
+                if m:
+                    dest = re.sub(r"\s+", " ", m.group(1)).strip(" ?.!,:;-")
+                    if dest:
+                        search_query = f"cheap flights to {dest} price"
+                else:
+                    m2 = re.search(r"\bto\s+([A-Za-z][A-Za-z\s-]{2,40})\b", raw_text, re.IGNORECASE)
+                    if m2:
+                        dest2 = re.sub(r"\s+", " ", m2.group(1)).strip(" ?.!,:;-")
+                        search_query = f"cheap flights to {dest2} price"
+                    else:
+                        normalized = re.sub(r"\bhow\s+much\s+does\b", "", raw_text, flags=re.IGNORECASE)
+                        normalized = re.sub(r"\bcost\b\??", "price", normalized, flags=re.IGNORECASE)
+                        normalized = re.sub(r"\s+", " ", normalized).strip(" ?.!,:;-")
+                        search_query = f"{normalized} price" if normalized else raw_text
+
+                return "web_search", {
+                    "query": search_query,
+                    "max_results": 5,
+                }
 
         # ====================================================
         # SPOTIFY INTENT (DIRECT ROUTING)
         # ====================================================
+        spotify_available = "spotify_link" in getattr(self.tools, "tools", {})
+        t_spotify = re.sub(r"\bplay\s+list(s)?\b", r"playlist\1", t, flags=re.IGNORECASE)
+        quoted_parts = re.findall(r'[^\w]?["\']([^"\']+)["\']', f" {raw_text}")
+
+        def _extract_playlist_name(src: str) -> str:
+            s = str(src or "").strip()
+            if not s:
+                return ""
+
+            candidates: List[str] = []
+
+            m = re.search(r"\b(?:tracks?|songs?)\s+(?:from|in)\s+(.+?)\s+playlist\b", s, re.IGNORECASE)
+            if m:
+                candidates.append(m.group(1).strip())
+
+            m = re.search(r"\bplaylist\s+(.+?)\s+(?:tracks?|songs?)\b", s, re.IGNORECASE)
+            if m:
+                candidates.append(m.group(1).strip())
+
+            m = re.search(r"\bfrom\s+(.+?)\s+playlist\b", s, re.IGNORECASE)
+            if m:
+                candidates.append(m.group(1).strip())
+
+            for cand in candidates:
+                cleaned = re.sub(
+                    r"\b(?:my|the|a|an|favorite|favourite|favorites|favourites|play\s+list|playlist)\b",
+                    " ",
+                    cand,
+                    flags=re.IGNORECASE,
+                )
+                cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,:;.-")
+                if cleaned:
+                    return cleaned
+
+            return ""
+
+        def _clean_track_query(src: str) -> str:
+            s = str(src or "").strip()
+            if not s:
+                return ""
+
+            s = re.sub(r"^(?:the\s+)?(?:song|track)\s+", "", s, flags=re.IGNORECASE)
+
+            # Voice dictation often appends explanation text after the song request.
+            # Keep the primary query and drop trailing commentary.
+            split_markers = [
+                r"\bit(?:'s| is)\b",
+                r"\bits\b",
+                r"\b(?:from|in|on)\s+my\b",
+                r"\b(?:there|because|since|please)\b",
+            ]
+            for marker in split_markers:
+                m = re.search(marker, s, re.IGNORECASE)
+                if m and m.start() > 0:
+                    s = s[:m.start()].strip()
+                    break
+
+            s = re.sub(r"\s+", " ", s).strip(" ,:;.-\"'")
+            return s
+
+        if spotify_available:
+            # Capability questions should not trigger playback actions.
+            # Example: "can you tell how long a song plays..."
+            capability_q = (
+                re.search(r"^\s*(?:(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}[,\s:;-]+){0,2}(?:can|could|would|will)\s+you\b", original_text, re.IGNORECASE) is not None
+                and re.search(r"\b(how\s+long|duration|when\s+one\s+song\s+ends?|switch\s+them\s+up|auto(?:matically)?\s+switch|dj)\b", original_text, re.IGNORECASE) is not None
+                and re.search(r"\b(song|track|favorites?|favourites?|liked\s+songs?|liked\s+list)\b", original_text, re.IGNORECASE) is not None
+            )
+            if capability_q:
+                return "__spotify_dj_capability__", {}
+
+            # Favorites DJ mode controls.
+            if re.search(r"\b(stop|disable|turn\s+off|cancel|end)\b", t_spotify) and re.search(r"\b(dj|auto\s*switch|continuous|hands?\s*free\s*music)\b", t_spotify):
+                return "spotify_link", {"action": "stop_favorites_dj"}
+
+            if re.search(r"\b(status|state|running)\b", t_spotify) and re.search(r"\b(dj|auto\s*switch)\b", t_spotify):
+                return "spotify_link", {"action": "favorites_dj_status"}
+
+            start_dj = (
+                re.search(r"\b(start|enable|turn\s+on|run|be)\b", t_spotify) is not None
+                and re.search(r"\b(dj|auto\s*switch|continuous|hands?\s*free\s*music)\b", t_spotify) is not None
+                and re.search(r"\b(favorites?|favourites?|liked\s+songs?|liked\s+list)\b", t_spotify) is not None
+            )
+            if start_dj:
+                offset_match = re.search(r"\b(?:switch|change)\s+(?:about\s+)?(\d{1,2})\s*(?:sec|secs|seconds?)\s+before\b", t_spotify, re.IGNORECASE)
+                offset_seconds = 2
+                if offset_match:
+                    try:
+                        offset_seconds = max(0, min(12, int(offset_match.group(1))))
+                    except Exception:
+                        offset_seconds = 2
+                return "spotify_link", {
+                    "action": "start_favorites_dj",
+                    "switch_offset_seconds": offset_seconds,
+                }
+
+            list_verb = re.search(r"\b(list|show|get)\b", t_spotify) is not None
+            liked_query = re.search(r"\b(liked\s+songs?|liked\s+list|saved\s+songs?|favorites?(?:\s+library)?|favourites?(?:\s+library)?)\b", t_spotify) is not None
+            playlist_words = re.search(r"\bplaylists?\b", t_spotify) is not None
+            track_words = re.search(r"\b(tracks?|songs?)\b", t_spotify) is not None
+
+            # Create playlist intent, optionally seeded with one or more track queries.
+            create_playlist_match = re.search(
+                r"\bcreate\s+(?:a\s+)?(?:new\s+)?(?:spotify\s+)?playlist\s+(?:called|named)?\s*[\"']?([^\"'.,]+?)[\"']?(?:\s+(?:and|then)\s+add\s+(?:song|track)\s+(.+))?$",
+                raw_text,
+                re.IGNORECASE,
+            )
+            if create_playlist_match:
+                playlist_name = str(create_playlist_match.group(1) or "").strip(" ,:;.-\"'")
+                seed_query = str(create_playlist_match.group(2) or "").strip()
+                if playlist_name:
+                    args: Dict[str, Any] = {
+                        "action": "create_playlist",
+                        "playlist_name": playlist_name,
+                    }
+                    if seed_query:
+                        args["track_queries"] = seed_query
+                    return "spotify_link", args
+
+            # Add track to existing playlist by name.
+            add_track_match = re.search(
+                r"\badd\s+(?:song|track)\s+(.+?)\s+to\s+(?:my\s+)?(?:spotify\s+)?playlist\s+[\"']?([^\"'.,]+)[\"']?\b",
+                raw_text,
+                re.IGNORECASE,
+            )
+            if add_track_match:
+                track_query = str(add_track_match.group(1) or "").strip(" ,:;.-\"'")
+                playlist_name = str(add_track_match.group(2) or "").strip(" ,:;.-\"'")
+                if track_query and playlist_name:
+                    return "spotify_link", {
+                        "action": "add_track_to_playlist",
+                        "playlist_name": playlist_name,
+                        "track_query": track_query,
+                    }
+
+            # Support commands like "play #50 Scissorhands" after a liked-songs listing,
+            # even when users omit the word "Spotify".
+            index_play = re.search(r"\b(?:play|place|paly)\s*(?:song\s*)?#\s*(\d{1,3})(?:\s+(.+))?", raw_text, re.IGNORECASE)
+            if index_play:
+                try:
+                    track_index = int(index_play.group(1))
+                except Exception:
+                    track_index = 0
+                if track_index > 0:
+                    tail = str(index_play.group(2) or "").strip()
+                    tail = re.sub(
+                        r"\b(?:from|in|on)\s+(?:my\s+)?(?:liked\s+songs?|liked\s+list|saved\s+songs?|favorites?|favourites?|library|spotify)\b",
+                        " ",
+                        tail,
+                        flags=re.IGNORECASE,
+                    )
+                    tail = re.sub(r"\s+", " ", tail).strip(" ,:;.-\"'")
+                    return "spotify_link", {
+                        "action": "play_favorite",
+                        "track_index": track_index,
+                        "track_query": tail,
+                        "track_selection": f"#{track_index}",
+                    }
+
+            if liked_query and re.search(r"\b(play|place|paly)\b", t_spotify):
+                m_play_tail = re.search(r"\b(?:play|place|paly)\s+(.+)$", raw_text, re.IGNORECASE)
+                play_tail = str((m_play_tail.group(1) if m_play_tail else "") or "").strip()
+                play_tail = re.sub(r"^song\s+", "", play_tail, flags=re.IGNORECASE)
+                play_tail = re.sub(
+                    r"\b(?:from|in|on)\s+(?:my\s+)?(?:liked\s+songs?|liked\s+list|saved\s+songs?|favorites?|favourites?|library|spotify)\b",
+                    " ",
+                    play_tail,
+                    flags=re.IGNORECASE,
+                )
+                play_tail = _clean_track_query(play_tail)
+                random_liked = re.search(
+                    r"\b(random|randome|shuffle|anything|whatever|surprise\s+me|any\s+(?:song|track)|a\s+(?:song|track))\b",
+                    play_tail,
+                    re.IGNORECASE,
+                ) is not None
+                return "spotify_link", {
+                    "action": "play_favorite",
+                    "track_query": "" if random_liked else play_tail,
+                    "track_selection": "random" if random_liked or not play_tail else "exact",
+                }
+
+            if liked_query and (list_verb or track_words):
+                return "spotify_link", {"action": "liked_songs", "limit": 500}
+
+            if playlist_words and track_words:
+                playlist_name = quoted_parts[0].strip() if quoted_parts else _extract_playlist_name(raw_text)
+                if playlist_name:
+                    return "spotify_link", {
+                        "action": "playlist_tracks",
+                        "playlist_name": playlist_name,
+                        "limit": 50,
+                    }
+                if re.search(r"\b(favorites?|favourites?)\b", t_spotify):
+                    return "spotify_link", {"action": "liked_songs", "limit": 500}
+                return "spotify_link", {"action": "list_playlists", "limit": 50}
+
+            if list_verb and playlist_words:
+                return "spotify_link", {"action": "list_playlists", "limit": 50}
+
+            # Fallback: direct song-like play requests without explicitly saying "Spotify".
+            # Examples: "paly On My Knees - RUFUS DU SOL", "play song blinding lights".
+            loose_play = re.search(r"\b(?:play|place|paly)\s+(.+)$", raw_text, re.IGNORECASE)
+            if loose_play:
+                tail = str(loose_play.group(1) or "").strip()
+                tail = re.sub(r"^(?:song|track)\s+", "", tail, flags=re.IGNORECASE)
+                tail = re.sub(
+                    r"\b(?:on|in|from)\s+(?:my\s+)?(?:spotify|liked\s+songs?|liked\s+list|saved\s+songs?|favorites?|favourites?|library)\b",
+                    " ",
+                    tail,
+                    flags=re.IGNORECASE,
+                )
+                tail = _clean_track_query(tail)
+
+                song_like = bool(
+                    re.search(r"\b(song|track)\b", t_spotify)
+                    or " - " in tail
+                    or re.search(r"\bby\b", tail, re.IGNORECASE)
+                )
+                looks_like_short_title = len([w for w in tail.split() if w.strip()]) <= 8
+                obviously_not_song = re.search(r"\b(game|video|movie|show|series|app|program|code|script)\b", tail, re.IGNORECASE) is not None
+                if tail and (song_like or (looks_like_short_title and not obviously_not_song)):
+                    return "spotify_link", {
+                        "action": "play_track",
+                        "track_query": tail,
+                    }
+
         spotify_mentioned = re.search(r"\b(?:spotify|sportify|spotfiy|spotfy|spotifi)\b", t) is not None
-        if spotify_mentioned and "spotify_link" in getattr(self.tools, "tools", {}):
-            quoted_parts = re.findall(r'["\']([^"\']+)["\']', raw_text)
+        if spotify_mentioned and spotify_available:
             quoted_track = quoted_parts[0].strip() if quoted_parts else ""
 
             def _extract_track_query(src: str) -> str:
@@ -6166,7 +8809,7 @@ IMPORTANT RULES:
                 if not s:
                     return ""
                 # play <track> on spotify
-                m = re.search(r"\bplay\s+(.+?)\s+on\s+(?:spotify|sportify|spotfiy|spotfy|spotifi)\b", s, re.IGNORECASE)
+                m = re.search(r"\b(?:play|paly)\s+(.+?)\s+on\s+(?:spotify|sportify|spotfiy|spotfy|spotifi)\b", s, re.IGNORECASE)
                 if m:
                     return m.group(1).strip().strip('"\'')
                 # place <track> on spotify (ASR typo)
@@ -6174,9 +8817,10 @@ IMPORTANT RULES:
                 if m:
                     return m.group(1).strip().strip('"\'')
                 # play <track>
-                m = re.search(r"\bplay\s+(.+)$", s, re.IGNORECASE)
+                m = re.search(r"\b(?:play|paly)\s+(.+)$", s, re.IGNORECASE)
                 if m:
                     tail = m.group(1)
+                    tail = re.sub(r"^song\s+", "", tail, flags=re.IGNORECASE)
                     tail = re.sub(r"\bon\s+(?:spotify|sportify|spotfiy|spotfy|spotifi)\b", "", tail, flags=re.IGNORECASE).strip()
                     return tail.strip('"\'')
                 return ""
@@ -6190,7 +8834,7 @@ IMPORTANT RULES:
             if re.search(r"\b(resume|continue|unpause)\b", t):
                 return "spotify_link", {"action": "resume"}
 
-            if re.search(r"\b(play|place)\b", t):
+            if re.search(r"\b(play|place|paly)\b", t):
                 track_query = quoted_track or _extract_track_query(raw_text)
                 if re.search(r"\b(favorites?|favourites?|liked|library)\b", t):
                     return "spotify_link", {
@@ -6203,6 +8847,22 @@ IMPORTANT RULES:
                         "action": "play_track",
                         "track_query": track_query,
                     }
+                return "spotify_link", {"action": "play"}
+
+        # Broad music fallback without explicit "Spotify" mention.
+        if spotify_available and not spotify_mentioned:
+            has_music_context = re.search(
+                r"\b(music|songs?|tracks?|playlist|playlists|liked\s+songs?|saved\s+songs?|favorites?|favourites?)\b",
+                t,
+            ) is not None
+
+            if has_music_context and re.search(r"\b(pause|stop)\b", t):
+                return "spotify_link", {"action": "pause"}
+
+            if has_music_context and re.search(r"\b(resume|continue|unpause)\b", t):
+                return "spotify_link", {"action": "resume"}
+
+            if re.search(r"\b(play|paly|place)\b", t) and re.search(r"\b(?:some\s+)?music\b", t):
                 return "spotify_link", {"action": "play"}
 
         # ====================================================
@@ -6663,6 +9323,91 @@ IMPORTANT RULES:
             "where is the workspace",
         ]):
             return "__workspace_info__", {}
+
+        set_search_mode_match = re.search(
+            r"\b(?:set|use|switch|change)\s+(?:the\s+)?(?:web\s+)?search\s+mode\s+(?:to\s+)?(balanced|strict|wide)\b",
+            raw_text,
+            re.IGNORECASE,
+        )
+        if set_search_mode_match:
+            return "__search_mode_set__", {
+                "mode": set_search_mode_match.group(1).strip().lower(),
+            }
+
+        if re.search(r"\b(?:what(?:'s|\s+is)\s+(?:the\s+)?)?(?:current\s+)?(?:web\s+)?search\s+mode\b", t):
+            return "__search_mode_get__", {}
+
+        if re.search(r"\b(?:stop|disable|turn\s+off|cancel)\s+(?:my\s+)?(?:driving|road)\s+(?:check\s*-?ins?|companion)\b", t):
+            return "__driving_checkin_stop__", {}
+
+        driving_checkin_match = re.search(
+            r"\b(?:start|enable|turn\s+on|set|begin)\s+(?:my\s+)?(?:driving|road)\s+(?:check\s*-?ins?|companion)(?:\s+(?:every|each)\s+(?P<num>\d{1,3})\s*(?P<unit>minutes?|hours?))?\b",
+            t,
+            re.IGNORECASE,
+        )
+        if not driving_checkin_match:
+            driving_checkin_match = re.search(
+                r"\bcheck\s*in\s+(?:with\s+me\s+)?(?:every|each)\s+(?P<num>\d{1,3})\s*(?P<unit>minutes?|hours?)\b.*\b(driv(?:e|ing)|road|trip)\b",
+                t,
+                re.IGNORECASE,
+            )
+
+        if not driving_checkin_match:
+            if ("driving" in t or "road" in t) and ("check-in" in t or "check in" in t or "chat partner" in t):
+                fallback = re.search(r"\b(?:every|each)\s+(?P<num>\d{1,3})\s*(?P<unit>minutes?|hours?)\b", t, re.IGNORECASE)
+                if fallback:
+                    driving_checkin_match = fallback
+
+        if driving_checkin_match:
+            num_val = driving_checkin_match.groupdict().get("num") if hasattr(driving_checkin_match, "groupdict") else None
+            unit_val = driving_checkin_match.groupdict().get("unit") if hasattr(driving_checkin_match, "groupdict") else None
+
+            try:
+                amount = int(num_val) if num_val else 20
+            except Exception:
+                amount = 20
+            amount = max(5, min(180, amount))
+
+            unit_text = str(unit_val or "minutes").lower()
+            repeat_seconds = amount * 60 if unit_text.startswith("minute") else amount * 3600
+            repeat_seconds = max(300, min(6 * 3600, repeat_seconds))
+
+            task_text = (
+                "Driving check-in: ask how I'm doing, remind me to hydrate, "
+                "check focus level, and keep me company for a minute."
+            )
+
+            return "__task_memory_write__", {
+                "text": task_text,
+                "due_at": time.time() + float(repeat_seconds),
+                "tags": ["user_memory", "recurring_task", f"repeat_{int(repeat_seconds)}s", "reminder_task", "driving_checkin"],
+                "status": "pending",
+            }
+
+        shutdown_phrase = re.search(r"\b(?:shutdown|shut\s*down|power\s*down|go\s+offline|safe\s+shutdown|stop)\b", t)
+        shutdown_targeted = (
+            re.search(r"\b(?:mina|mk1|api|server|yourself)\b", t) is not None
+            or re.search(r"\b(?:mina|mk1|api|server)\b", original_text.lower()) is not None
+            or t.startswith("shutdown")
+            or t.startswith("safe shutdown")
+        )
+        if shutdown_phrase and shutdown_targeted:
+            if re.search(r"\b(status|state|ready|readiness|waiting|blocked|clear|safe\s+to\s+shutdown)\b", t):
+                return "__mina_shutdown_status__", {
+                    "max_wait_seconds": 45,
+                    "poll_seconds": 2,
+                    "flush_max_items": 400,
+                }
+
+            force_shutdown = re.search(r"\b(force|override|even\s+if|dont\s+wait|do\s+not\s+wait)\b", t) is not None
+            return "__mina_shutdown__", {
+                "force": force_shutdown,
+                "max_wait_seconds": 45,
+                "poll_seconds": 2,
+                "flush_max_items": 400,
+                "embed_port": 8084,
+                "post_flush_delay_ms": 1200,
+            }
 
         if re.search(r"\b(anything new|see anything new|what(?:'s|\s+is) new|any updates?)\b", t):
             return "__git_status__", {}
@@ -7230,6 +9975,30 @@ IMPORTANT RULES:
             if path:
                 return "dir_create", {"path": path}
 
+        # ====================================================
+        # RECURSIVE DIRECTORY INSPECTION
+        # ====================================================
+
+        if self._is_recursive_directory_read_request(raw_text, t):
+            path = self._extract_explicit_windows_path(raw_text)
+            if path:
+                return "__inspect_directory_tree__", {"path": path, "mode": self._extract_directory_inspection_filter(raw_text)}
+
+        sqlite_table_match = re.search(
+            r'\b(?:read|show|preview|inspect|describe)\s+(?:the\s+)?table\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:from|in|inside)\s+(.+)$',
+            raw_text,
+            re.IGNORECASE,
+        )
+        if sqlite_table_match:
+            table_name = str(sqlite_table_match.group(1) or "").strip()
+            db_path = self._extract_explicit_windows_path(str(sqlite_table_match.group(2) or ""))
+            if table_name and db_path:
+                return "__inspect_sqlite_table__", {
+                    "path": db_path,
+                    "table": table_name,
+                    "row_limit": 8,
+                }
+
         
         # ====================================================
         # FILE READ
@@ -7623,6 +10392,13 @@ IMPORTANT RULES:
         ]):
             return "__tool_list__", {}
 
+        if self._is_tool_self_test_request(t):
+            available_tools = sorted(list(getattr(self.tools, "tools", {}).keys()))
+            alias_map = self._tool_self_test_aliases(available_tools)
+            mentions = self._tool_self_test_extract_tools(raw_text, alias_map)
+            if re.search(r"\btools?\b", t) is not None or bool(mentions):
+                return "__tool_self_test__", {"request": raw_text}
+
         scratch_note_triggers = [
             "put this in scratch",
             "save this in scratch",
@@ -7727,6 +10503,11 @@ IMPORTANT RULES:
 
             clean["include_content"] = bool(clean.get("include_content", False))
 
+            mode_val = str(clean.get("mode", "balanced") or "balanced").strip().lower()
+            if mode_val not in {"balanced", "strict", "wide"}:
+                mode_val = "balanced"
+            clean["mode"] = mode_val
+
         elif tool_name == "web_fetch":
             clean["url"] = str(clean.get("url") or "").strip()
             try:
@@ -7785,7 +10566,7 @@ IMPORTANT RULES:
             except Exception:
                 conf_val = 0.0
 
-            if conf_val < 0.55:
+            if conf_val < self._tool_plan_confidence_threshold():
                 return None
 
             args_raw = plan.get("args", {})
@@ -7929,6 +10710,20 @@ IMPORTANT RULES:
 
         try:
 
+            now_monotonic = time.monotonic()
+            seconds_since_last_input = max(
+                0.0,
+                now_monotonic - float(self._last_user_activity_monotonic),
+            )
+            seconds_since_shutdown: Optional[float] = self._seconds_since_last_shutdown
+            if self._last_shutdown_at:
+                try:
+                    shutdown_dt = datetime.fromisoformat(str(self._last_shutdown_at))
+                    seconds_since_shutdown = max(0.0, (datetime.now() - shutdown_dt).total_seconds())
+                    self._seconds_since_last_shutdown = seconds_since_shutdown
+                except Exception:
+                    pass
+
             return {
                 "core_temp": "STABLE",
                 "memory_bus": "ONLINE",
@@ -7942,6 +10737,16 @@ IMPORTANT RULES:
                 "idle_checkin_pending": self._idle_checkin_pending,
                 "idle_checkin_interval_seconds": self.idle_checkin_interval_seconds,
                 "last_user_activity_at": self._last_user_activity_at,
+                "seconds_since_last_user_input": round(seconds_since_last_input, 1),
+                "heartbeat_interval_seconds": self.idle_clock_interval_seconds,
+                "heartbeat_tick": self._turn_clock_tick,
+                "heartbeat_last_tick_at": self._turn_clock_last_tick_at,
+                "heartbeat_elapsed_seconds": round(float(self._turn_clock_last_elapsed_seconds), 1),
+                "runtime_state_last_written_at": self._runtime_state_last_written_at,
+                "last_shutdown_at": self._last_shutdown_at,
+                "seconds_since_last_shutdown": seconds_since_shutdown,
+                "away_nag_threshold_seconds": self.away_nag_threshold_seconds,
+                "away_nag_pending": self._away_nag_prompt_pending,
                 "memory_engine": self.memory.verify_integrity(),
                 "level": "NORMAL",
             }

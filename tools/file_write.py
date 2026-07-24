@@ -1,7 +1,15 @@
 import os
 from typing import Any, Dict
 
-def file_write_impl(path: str, content: str, overwrite: bool = True) -> Dict[str, Any]:
+from tools.file_access_policy import authorize_write_paths, normalize_tool_path
+
+def file_write_impl(
+    path: str,
+    content: str,
+    overwrite: bool = True,
+    authorized_write: bool = False,
+    auth_token: str = "",
+) -> Dict[str, Any]:
     try:
         # Reject empty paths early
         if not path:
@@ -11,12 +19,15 @@ def file_write_impl(path: str, content: str, overwrite: bool = True) -> Dict[str
                 "error": "no_path_provided"
             }
 
-        # Expand ~ and environment variables
-        path = os.path.expanduser(os.path.expandvars(path))
+        path = normalize_tool_path(path)
 
-        # Normalize relative paths
-        if not os.path.isabs(path):
-            path = os.path.abspath(path)
+        allowed, error, _ = authorize_write_paths(
+            [path],
+            authorized_write=authorized_write,
+            auth_token=auth_token,
+        )
+        if not allowed:
+            return {"ok": False, "result": None, "error": error}
 
         # Ensure parent directory exists
         parent = os.path.dirname(path)
@@ -47,7 +58,15 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     path = args.get("path") or ""
     content = args.get("content") or ""
     overwrite = bool(args.get("overwrite", True))
-    return file_write_impl(path, content, overwrite=overwrite)
+    authorized_write = bool(args.get("authorized_write", False))
+    auth_token = str(args.get("auth_token") or "")
+    return file_write_impl(
+        path,
+        content,
+        overwrite=overwrite,
+        authorized_write=authorized_write,
+        auth_token=auth_token,
+    )
 
 
 tool_entry.schema = {
@@ -67,6 +86,15 @@ tool_entry.schema = {
                 "type": "boolean",
                 "description": "Whether to overwrite existing files.",
                 "default": True,
+            },
+            "authorized_write": {
+                "type": "boolean",
+                "description": "Required for writes outside E:\\workspace.",
+                "default": False,
+            },
+            "auth_token": {
+                "type": "string",
+                "description": "Optional write authorization token for writes outside E:\\workspace.",
             },
         },
         "required": ["path", "content"],

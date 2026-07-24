@@ -8,6 +8,7 @@ __pycache__/
 logs/
 *.pid
 .mk1_api.pid
+.mk1_last_shutdown.json
 
 # Large local model and index artifacts
 Models/
@@ -21,6 +22,18 @@ memory/memory.db*
 cleanup_archive/
 sandbox/
 .tmp_publish_android_repo/
+tmp/
+backup/
+
+# Android/Gradle generated files
+android/.idea/
+android/mina-voice-app/.idea/
+android/mina-voice-app/.artifacts/
+android/mina-voice-app/.gradle/
+android/mina-voice-app/app/build/
+android/mina-voice-app/build/
+android/mina-voice-app/local.properties
+android/mina-voice-app/gradle/gradle-daemon-jvm.properties
 
 # OS/editor noise
 .DS_Store

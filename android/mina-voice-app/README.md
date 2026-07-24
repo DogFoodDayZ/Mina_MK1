@@ -24,6 +24,10 @@ If you prefer command-line builds, generate Gradle wrapper once after installing
 - Optional wake-word gate (`Hey Mina`)
 - Sends command text to MK1 API `/process`
 - Speaks Mina reply on phone via Android TTS
+- Driving Mode toggle for hands-free road support:
+   - Starts recurring Mina driving check-ins (default 20 minutes)
+   - Keeps listening active while driving
+   - Stops check-ins with one tap
 
 ## Notes
 
@@ -42,6 +46,30 @@ If you prefer command-line builds, generate Gradle wrapper once after installing
    - Tailscale HTTPS (if enabled): `https://your-node-name.your-tailnet.ts.net`
    - LAN fallback: `http://192.168.1.100:8000`
 5. Tap `Start Listening` and grant microphone permission.
+
+## Android Auto Visibility Troubleshooting
+
+If Mina installs on the phone but does not appear on your car screen:
+
+1. Open Android Auto on phone -> Settings -> Version, tap repeatedly to unlock developer mode.
+2. In Android Auto developer settings, enable `Unknown sources`.
+3. In Android Auto -> `Customize launcher`, ensure `Mina Voice` is enabled.
+4. Disconnect/reconnect USB or wireless Android Auto session.
+5. Re-run deployment script from repo root:
+   - `./deploy_mina_android_auto.ps1`
+
+The deploy script now validates that the app's CarAppService is discoverable by
+the package manager after install.
+
+## Driving Mode (Hands-Free)
+
+1. Enter your API URL and tap `Save API`.
+2. Set `Check-in every (minutes)` (allowed range 5-180).
+3. Tap `Start Driving` (or toggle `Driving Mode` on).
+   - App sends: `start my driving check-ins every <N> minutes`
+   - MK1 schedules recurring companion check-ins.
+4. Tap `Stop Driving` (or toggle off) when done.
+   - App sends: `stop my driving check-ins`
 
 ## Typical command
 

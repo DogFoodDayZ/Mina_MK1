@@ -46,6 +46,8 @@ class ProcessRequest(BaseModel):
     voice_hint: Optional[str] = None
     image_attachment: Optional[dict] = None
     input_source: Optional[str] = None
+    client_id: Optional[str] = None
+    client_token: Optional[str] = None
 
 
 class TTSRequest(BaseModel):
@@ -103,6 +105,9 @@ def _resolve_tts_rate() -> float:
 # ------------------------------------------------------------
 core = MK1Core()
 app = FastAPI(title="MK1 Core API", version="1.0")
+
+_restart_lock = threading.Lock()
+_restart_requested_until = 0.0
 
 
 @app.on_event("shutdown")
@@ -1558,11 +1563,19 @@ def process(req: ProcessRequest):
         out = core.process(
             req.input,
             image_attachment=req.image_attachment,
+            request_context={
+                "input_source": req.input_source,
+                "client_id": req.client_id,
+                "client_token": req.client_token,
+            },
         )
     except TypeError as e:
         # Backward-compatible path for tests/mocks or older core adapters
         # that still expose process(user_input) without image_attachment.
-        if "unexpected keyword argument 'image_attachment'" in str(e):
+        if (
+            "unexpected keyword argument 'image_attachment'" in str(e)
+            or "unexpected keyword argument 'request_context'" in str(e)
+        ):
             out = core.process(req.input)
         else:
             raise
@@ -1637,6 +1650,11 @@ def process_stream(req: ProcessRequest):
             out = core.process(
                 req.input,
                 image_attachment=req.image_attachment,
+                request_context={
+                    "input_source": req.input_source,
+                    "client_id": req.client_id,
+                    "client_token": req.client_token,
+                },
             )
             reply_text = str((out or {}).get("reply") or "") if isinstance(out, dict) else str(out)
 
@@ -1717,7 +1735,13 @@ def voice_tts(req: TTSRequest):
 if MULTIPART_AVAILABLE:
 
     @app.post("/voice/process")
-    def voice_process(file: UploadFile = File(...), speak_response: bool = False, voice_hint: Optional[str] = None):
+    def voice_process(
+        file: UploadFile = File(...),
+        speak_response: bool = False,
+        voice_hint: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_token: Optional[str] = None,
+    ):
         suffix = Path(file.filename or "audio.wav").suffix or ".wav"
         tmp_path = None
         try:
@@ -1746,7 +1770,14 @@ if MULTIPART_AVAILABLE:
                     "stt_engine": stt.get("engine"),
                 }
 
-            proc = core.process(user_text)
+            proc = core.process(
+                user_text,
+                request_context={
+                    "input_source": "voice",
+                    "client_id": client_id,
+                    "client_token": client_token,
+                },
+            )
             reply_text = str(proc.get("reply") or "").strip()
 
             response = {
@@ -2210,6 +2241,165 @@ def memory_delete(req: MemoryDeleteRequest):
         "text": text or None,
         "memory_id": req.memory_id,
     }
+
+
+@app.get("/memory/buffer_status")
+def memory_buffer_status():
+    mem = getattr(core, "memory", None)
+    if mem is None or not hasattr(mem, "buffer_status"):
+        return {"ok": False, "error": "buffer_status_not_supported", "result": None}
+    try:
+        return mem.buffer_status()
+    except Exception as e:
+        return {"ok": False, "error": str(e), "result": None}
+
+
+@app.post("/memory/flush_buffer")
+def memory_flush_buffer(max_items: int = 200):
+    mem = getattr(core, "memory", None)
+    if mem is None or not hasattr(mem, "flush_pending_memories"):
+        return {"ok": False, "error": "buffer_flush_not_supported", "result": None}
+    try:
+        safe_max = max(1, min(2000, int(max_items)))
+        return mem.flush_pending_memories(max_items=safe_max)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "result": None}
+
+
+@app.post("/system/shutdown_gate")
+def system_shutdown_gate(
+    force: bool = False,
+    max_wait_seconds: int = 45,
+    poll_seconds: int = 2,
+    flush_max_items: int = 400,
+):
+    try:
+        if not hasattr(core, "_prepare_safe_shutdown"):
+            return {
+                "ok": False,
+                "error": "shutdown_gate_not_supported",
+                "result": None,
+            }
+
+        safe_wait = max(0, min(600, int(max_wait_seconds)))
+        safe_poll = max(1, min(15, int(poll_seconds)))
+        safe_flush = max(1, min(2000, int(flush_max_items)))
+        return core._prepare_safe_shutdown(  # type: ignore[attr-defined]
+            force=bool(force),
+            max_wait_seconds=safe_wait,
+            poll_seconds=safe_poll,
+            flush_max_items=safe_flush,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e), "result": None}
+
+
+@app.get("/system/shutdown_status")
+def system_shutdown_status(
+    max_wait_seconds: int = 45,
+    poll_seconds: int = 2,
+    flush_max_items: int = 400,
+):
+    try:
+        if not hasattr(core, "_shutdown_gate_status"):
+            return {
+                "ok": False,
+                "error": "shutdown_status_not_supported",
+                "result": None,
+            }
+
+        safe_wait = max(0, min(600, int(max_wait_seconds)))
+        safe_poll = max(1, min(15, int(poll_seconds)))
+        safe_flush = max(1, min(2000, int(flush_max_items)))
+        return core._shutdown_gate_status(  # type: ignore[attr-defined]
+            max_wait_seconds=safe_wait,
+            poll_seconds=safe_poll,
+            flush_max_items=safe_flush,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e), "result": None}
+
+
+@app.post("/system/restart")
+def system_restart(
+    delay_ms: int = 900,
+    port: int = 8000,
+    embed_port: int = 8084,
+):
+    global _restart_requested_until
+
+    try:
+        safe_delay = max(200, min(5000, int(delay_ms)))
+        safe_port = max(1, min(65535, int(port)))
+        safe_embed_port = max(1, min(65535, int(embed_port)))
+
+        now = time.time()
+        with _restart_lock:
+            if now < _restart_requested_until:
+                wait_seconds = int(max(1.0, _restart_requested_until - now))
+                return {
+                    "ok": False,
+                    "error": "restart_already_requested",
+                    "result": {
+                        "retry_in_seconds": wait_seconds,
+                    },
+                }
+            _restart_requested_until = now + 90.0
+
+        app_root = Path(__file__).resolve().parents[2]
+        script_path = app_root / "mk1_api.ps1"
+        if not script_path.exists():
+            with _restart_lock:
+                _restart_requested_until = 0.0
+            return {
+                "ok": False,
+                "error": "restart_script_missing",
+                "result": {
+                    "script": str(script_path),
+                },
+            }
+
+        restart_command = (
+            f"Start-Sleep -Milliseconds {safe_delay}; "
+            f"& '{script_path}' restart -Port {safe_port} -EmbedPort {safe_embed_port}"
+        )
+
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            )
+
+        subprocess.Popen(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                restart_command,
+            ],
+            cwd=str(app_root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+
+        return {
+            "ok": True,
+            "error": None,
+            "result": {
+                "message": "restart_requested",
+                "delay_ms": safe_delay,
+                "port": safe_port,
+                "embed_port": safe_embed_port,
+            },
+        }
+    except Exception as e:
+        with _restart_lock:
+            _restart_requested_until = 0.0
+        return {"ok": False, "error": str(e), "result": None}
 
 
 # ------------------------------------------------------------

@@ -56,6 +56,8 @@ class MK1Memory:
 
         self.embed_small_url = embed_small_url
         self.embed_base_url = embed_base_url
+        self.embed_max_chars = max(256, int(os.getenv("MK1_EMBED_MAX_CHARS", "4000") or 4000))
+        self.buffer_warn_threshold = max(1, int(os.getenv("MK1_BUFFER_WARN_THRESHOLD", "25") or 25))
         require_embed_env = os.getenv("MK1_REQUIRE_EMBED", "1").strip().lower()
         self.require_embed_startup = require_embed_env not in {"0", "false", "no", "off"}
 
@@ -71,6 +73,11 @@ class MK1Memory:
             "last_backup": None,
             "last_rebuild": None,
             "last_maintenance": None,
+            "buffer_pending_count": 0,
+            "buffer_last_enqueue": None,
+            "buffer_last_flush": None,
+            "buffer_last_flush_result": None,
+            "buffer_warning": False,
         }
 
         # maintenance / backup config
@@ -213,8 +220,23 @@ class MK1Memory:
         url = self.embed_base_url if use_base else self.embed_small_url
         status_key = "embed_base_ok" if use_base else "embed_small_ok"
 
+        raw = str(text or "")
+        # Protect embed server from very large payloads (e.g., long tool/list outputs).
+        # Keep the head/tail to preserve most identifying context.
+        if len(raw) > self.embed_max_chars:
+            head = max(64, self.embed_max_chars // 2)
+            tail = max(64, self.embed_max_chars - head - 32)
+            raw = raw[:head] + "\n...[truncated for embedding]...\n" + raw[-tail:]
+
+        payload_text = raw.strip()
+        if not payload_text:
+            msg = "embed_empty_text"
+            self._set_error(msg)
+            self._set_ok_flag(status_key, False)
+            return []
+
         try:
-            resp = requests.post(url, json={"text": text}, timeout=30)
+            resp = requests.post(url, json={"text": payload_text}, timeout=30)
             if resp.status_code >= 400:
                 msg = f"embed_http_{resp.status_code}"
                 self._set_error(msg)
@@ -268,9 +290,263 @@ class MK1Memory:
         if "task_status" not in columns:
             cur.execute("ALTER TABLE memories ADD COLUMN task_status TEXT NOT NULL DEFAULT 'stored'")
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            tags TEXT,
+            due_at REAL,
+            task_status TEXT NOT NULL DEFAULT 'stored',
+            created_at REAL NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT
+        );
+        """)
+
         conn.commit()
         conn.close()
         self._set_ok_flag("db_ok", True)
+        self.status["buffer_pending_count"] = self._pending_buffer_count()
+
+    def _pending_buffer_count(self) -> int:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM pending_memories")
+            row = cur.fetchone()
+            conn.close()
+            return int((row or [0])[0] or 0)
+        except Exception:
+            return 0
+
+    def _refresh_buffer_health_flags(self) -> None:
+        pending = self._pending_buffer_count()
+        self.status["buffer_pending_count"] = pending
+        self.status["buffer_warning"] = pending >= int(self.buffer_warn_threshold)
+
+    def _enqueue_pending_memory(
+        self,
+        text: str,
+        kind: str,
+        tags: List[str],
+        due_at: Optional[float],
+        task_status: str,
+        last_error: str,
+    ) -> Optional[int]:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO pending_memories (text, kind, tags, due_at, task_status, created_at, attempts, last_error)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    text,
+                    kind,
+                    json.dumps(tags or []),
+                    due_at,
+                    str(task_status or "stored"),
+                    time.time(),
+                    str(last_error or "embed_failed"),
+                ),
+            )
+            conn.commit()
+            pending_id = cur.lastrowid
+            conn.close()
+            self._refresh_buffer_health_flags()
+            self.status["buffer_last_enqueue"] = time.time()
+            if self.status.get("buffer_warning"):
+                print(
+                    f">>> MK1Memory WARNING: pending buffer high "
+                    f"({self.status.get('buffer_pending_count')} >= {self.buffer_warn_threshold})"
+                )
+            return int(pending_id) if pending_id is not None else None
+        except Exception as e:
+            self._set_error(f"pending_enqueue_error: {e}")
+            return None
+
+    def _insert_memory_with_vectors(
+        self,
+        text: str,
+        kind: str,
+        tags: List[str],
+        due_at: Optional[float],
+        task_status: str,
+        vec_small: List[float],
+        vec_base: List[float],
+    ) -> Optional[int]:
+        vs = np.array(vec_small, dtype=np.float32)
+        vb = np.array(vec_base, dtype=np.float32)
+
+        dim_small = len(vs)
+        dim_base = len(vb)
+
+        if self.small_index is None or self.small_index.d != dim_small:
+            self.small_index = faiss.IndexIDMap2(faiss.IndexFlatL2(dim_small))
+
+        if self.base_index is None or self.base_index.d != dim_base:
+            self.base_index = faiss.IndexIDMap2(faiss.IndexFlatL2(dim_base))
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO memories (text, kind, tags, timestamp, due_at, task_status, emb_small, dim_small, emb_base, dim_base)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            text,
+            kind,
+            json.dumps(tags or []),
+            time.time(),
+            due_at,
+            str(task_status or "stored"),
+            vs.tobytes(),
+            len(vs),
+            vb.tobytes(),
+            len(vb),
+        ))
+
+        conn.commit()
+        mem_id = cur.lastrowid
+        conn.close()
+
+        self.small_index.add_with_ids(np.array([vs]), np.array([mem_id], dtype=np.int64))
+        self.base_index.add_with_ids(np.array([vb]), np.array([mem_id], dtype=np.int64))
+
+        faiss.write_index(self.small_index, self.faiss_small_path)
+        faiss.write_index(self.base_index, self.faiss_base_path)
+
+        self._write_counter += 1
+        if (
+            self.auto_backup_every_writes is not None
+            and self._write_counter >= self.auto_backup_every_writes
+        ):
+            self.backup(reason="scheduled_writes")
+            self._write_counter = 0
+
+        return int(mem_id) if mem_id is not None else None
+
+    def _flush_pending_memories(self, max_items: int = 20) -> Dict[str, int]:
+        flushed = 0
+        failed = 0
+
+        try:
+            read_conn = sqlite3.connect(self.db_path)
+            read_cur = read_conn.cursor()
+            read_cur.execute(
+                """
+                SELECT id, text, kind, tags, due_at, task_status, attempts
+                FROM pending_memories
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (max(1, int(max_items)),),
+            )
+            rows = read_cur.fetchall()
+            read_conn.close()
+
+            if not rows:
+                self._refresh_buffer_health_flags()
+                self.status["buffer_last_flush_result"] = {"flushed": 0, "failed": 0}
+                return {"flushed": 0, "failed": 0}
+
+            for row in rows:
+                pid = int(row[0])
+                text = str(row[1] or "")
+                kind = str(row[2] or "fact")
+                tags = json.loads(row[3]) if row[3] else []
+                due_at = row[4]
+                task_status = str(row[5] or "stored")
+                attempts = int(row[6] or 0)
+
+                vec_small = self._embed(text, use_base=False)
+                vec_base = self._embed(text, use_base=True)
+
+                if not vec_small or not vec_base:
+                    failed += 1
+                    write_conn = sqlite3.connect(self.db_path)
+                    write_cur = write_conn.cursor()
+                    write_cur.execute(
+                        "UPDATE pending_memories SET attempts = ?, last_error = ? WHERE id = ?",
+                        (attempts + 1, str(self.status.get("last_error") or "embed_failed"), pid),
+                    )
+                    write_conn.commit()
+                    write_conn.close()
+                    # If embedding service is currently down, stop early and retry later.
+                    if not (self.status.get("embed_small_ok", True) and self.status.get("embed_base_ok", True)):
+                        break
+                    continue
+
+                mem_id = self._insert_memory_with_vectors(
+                    text=text,
+                    kind=kind,
+                    tags=tags if isinstance(tags, list) else [],
+                    due_at=due_at,
+                    task_status=task_status,
+                    vec_small=vec_small,
+                    vec_base=vec_base,
+                )
+
+                if mem_id is None:
+                    failed += 1
+                    write_conn = sqlite3.connect(self.db_path)
+                    write_cur = write_conn.cursor()
+                    write_cur.execute(
+                        "UPDATE pending_memories SET attempts = ?, last_error = ? WHERE id = ?",
+                        (attempts + 1, str(self.status.get("last_error") or "insert_failed"), pid),
+                    )
+                    write_conn.commit()
+                    write_conn.close()
+                    continue
+
+                write_conn = sqlite3.connect(self.db_path)
+                write_cur = write_conn.cursor()
+                write_cur.execute("DELETE FROM pending_memories WHERE id = ?", (pid,))
+                write_conn.commit()
+                write_conn.close()
+                flushed += 1
+
+            self._refresh_buffer_health_flags()
+            self.status["buffer_last_flush"] = time.time()
+            self.status["buffer_last_flush_result"] = {"flushed": int(flushed), "failed": int(failed)}
+            if flushed > 0 or failed > 0:
+                print(f">>> MK1Memory buffer flush: flushed={flushed} failed={failed} pending={self.status.get('buffer_pending_count')}")
+            return {"flushed": flushed, "failed": failed}
+        except Exception as e:
+            self._set_error(f"pending_flush_error: {e}")
+            self._refresh_buffer_health_flags()
+            self.status["buffer_last_flush_result"] = {"flushed": int(flushed), "failed": int(failed + 1)}
+            return {"flushed": flushed, "failed": failed + 1}
+
+    def flush_pending_memories(self, max_items: int = 200) -> Dict[str, Any]:
+        result = self._flush_pending_memories(max_items=max_items)
+        return {
+            "ok": True,
+            "result": {
+                "flushed": int(result.get("flushed") or 0),
+                "failed": int(result.get("failed") or 0),
+                "pending": int(self.status.get("buffer_pending_count") or 0),
+                "warning": bool(self.status.get("buffer_warning", False)),
+            },
+            "error": None,
+        }
+
+    def buffer_status(self) -> Dict[str, Any]:
+        self._refresh_buffer_health_flags()
+        return {
+            "ok": True,
+            "result": {
+                "pending": int(self.status.get("buffer_pending_count") or 0),
+                "warning": bool(self.status.get("buffer_warning", False)),
+                "warn_threshold": int(self.buffer_warn_threshold),
+                "last_enqueue": self.status.get("buffer_last_enqueue"),
+                "last_flush": self.status.get("buffer_last_flush"),
+                "last_flush_result": self.status.get("buffer_last_flush_result"),
+            },
+            "error": None,
+        }
 
     # ================= FAISS LOAD / REBUILD =================
 
@@ -737,6 +1013,9 @@ class MK1Memory:
         now = time.time()
         self.status["last_maintenance"] = now
 
+        # Best-effort flush of buffered writes that previously failed embedding.
+        self._flush_pending_memories(max_items=20)
+
         # scheduled backup by time
         last_backup = self.status.get("last_backup")
         if (
@@ -753,6 +1032,39 @@ class MK1Memory:
         if self.trim_max_age_seconds is not None:
             self.trim_by_age(self.trim_max_age_seconds)
 
+    def close(self, flush_rounds: int = 3, flush_batch_size: int = 200) -> Dict[str, Any]:
+        """
+        Graceful shutdown hook for core: drain buffered pending memories and
+        persist a final backup snapshot when possible.
+        """
+        rounds = max(1, int(flush_rounds))
+        batch = max(1, int(flush_batch_size))
+        total_flushed = 0
+        total_failed = 0
+
+        for _ in range(rounds):
+            result = self._flush_pending_memories(max_items=batch)
+            flushed = int(result.get("flushed") or 0)
+            failed = int(result.get("failed") or 0)
+            total_flushed += flushed
+            total_failed += failed
+
+            pending = int(self.status.get("buffer_pending_count") or 0)
+            if pending <= 0 or (flushed == 0 and failed == 0):
+                break
+
+        backup_path = self.backup(reason="shutdown")
+        return {
+            "ok": True,
+            "result": {
+                "flushed": total_flushed,
+                "failed": total_failed,
+                "pending": int(self.status.get("buffer_pending_count") or 0),
+                "backup_path": backup_path,
+            },
+            "error": None,
+        }
+
     # ================= ADD MEMORY =================
 
     def add_memory(
@@ -767,63 +1079,36 @@ class MK1Memory:
         if tags is None:
             tags = []
 
+        due_at = kwargs.get("due_at")
+        task_status = str(kwargs.get("task_status") or "stored")
+
         vec_small = self._embed(text, use_base=False)
         vec_base = self._embed(text, use_base=True)
 
         if not vec_small or not vec_base:
             self._set_error("no_embedding_returned")
+            self._enqueue_pending_memory(
+                text=str(text or ""),
+                kind=str(kind or "fact"),
+                tags=tags,
+                due_at=due_at if isinstance(due_at, (int, float)) else None,
+                task_status=task_status,
+                last_error=str(self.status.get("last_error") or "no_embedding_returned"),
+            )
             return None
 
-        vs = np.array(vec_small, dtype=np.float32)
-        vb = np.array(vec_base, dtype=np.float32)
+        mem_id = self._insert_memory_with_vectors(
+            text=str(text or ""),
+            kind=str(kind or "fact"),
+            tags=tags,
+            due_at=due_at if isinstance(due_at, (int, float)) else None,
+            task_status=task_status,
+            vec_small=vec_small,
+            vec_base=vec_base,
+        )
 
-        dim_small = len(vs)
-        dim_base = len(vb)
-
-        if self.small_index is None or self.small_index.d != dim_small:
-            self.small_index = faiss.IndexIDMap2(faiss.IndexFlatL2(dim_small))
-
-        if self.base_index is None or self.base_index.d != dim_base:
-            self.base_index = faiss.IndexIDMap2(faiss.IndexFlatL2(dim_base))
-
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-
-        cur.execute("""
-            INSERT INTO memories (text, kind, tags, timestamp, due_at, task_status, emb_small, dim_small, emb_base, dim_base)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            text,
-            kind,
-            json.dumps(tags),
-            time.time(),
-            kwargs.get("due_at"),
-            str(kwargs.get("task_status") or "stored"),
-            vs.tobytes(),
-            len(vs),
-            vb.tobytes(),
-            len(vb),
-        ))
-
-        conn.commit()
-        mem_id = cur.lastrowid
-        conn.close()
-
-        self.small_index.add_with_ids(np.array([vs]), np.array([mem_id], dtype=np.int64))
-        self.base_index.add_with_ids(np.array([vb]), np.array([mem_id], dtype=np.int64))
-
-        faiss.write_index(self.small_index, self.faiss_small_path)
-        faiss.write_index(self.base_index, self.faiss_base_path)
-
-        # write‑based maintenance triggers
-        self._write_counter += 1
-        if (
-            self.auto_backup_every_writes is not None
-            and self._write_counter >= self.auto_backup_every_writes
-        ):
-            self.backup(reason="scheduled_writes")
-            self._write_counter = 0
-
+        # Opportunistically flush a few buffered items while embedding is healthy.
+        self._flush_pending_memories(max_items=3)
         return mem_id
 
     def add_time_passage_note(self, text: str, tags: Optional[List[str]] = None) -> Optional[int]:

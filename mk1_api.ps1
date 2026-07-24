@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('start', 'stop', 'status', 'restart', 'smoke', 'setup', 'gui', 'voice', 'voice-check', 'voice-devices', 'voice-monitor', 'model-status', 'model-list', 'model-set')]
+    [ValidateSet('start', 'stop', 'status', 'restart', 'smoke', 'setup', 'gui', 'voice', 'voice-check', 'voice-devices', 'voice-monitor', 'model-status', 'model-list', 'model-set', 'shutdown', 'shutdown-status')]
     [string]$Action = 'status',
 
     [int]$Port = 8000,
@@ -17,7 +17,13 @@ param(
     [string]$GuiDir = '',
     [switch]$AutoVoice,
     [switch]$Foreground,
-    [switch]$RunTests
+    [switch]$RunTests,
+    [int]$ShutdownWaitSeconds = 45,
+    [int]$ShutdownPollSeconds = 2,
+    [int]$ShutdownFlushMaxItems = 400,
+    [int]$ShutdownPostFlushDelayMs = 1200,
+    [switch]$ForceShutdown,
+    [string]$ShutdownGuiDir = ''
 )
 
 Set-StrictMode -Version Latest
@@ -27,6 +33,7 @@ Set-Location -Path $PSScriptRoot
 
 $startScript = Join-Path $PSScriptRoot 'start_mk1_api.ps1'
 $stopScript = Join-Path $PSScriptRoot 'stop_mk1_api.ps1'
+$shutdownScript = Join-Path $PSScriptRoot 'shutdown_mina_safe.ps1'
 $statusScript = Join-Path $PSScriptRoot 'status_mk1_api.ps1'
 $setupScript = Join-Path $PSScriptRoot 'setup_mk1_env.ps1'
 $guiScript = Join-Path $PSScriptRoot 'agent\gui\mina_gui.py'
@@ -35,7 +42,7 @@ $voiceMonitorScript = Join-Path $PSScriptRoot 'start_mina_voice_monitor.ps1'
 $baseUrl = "http://127.0.0.1:$Port"
 $embedBaseUrl = "http://${EmbedHost}:${EmbedPort}"
 
-foreach ($scriptPath in @($startScript, $stopScript, $statusScript, $setupScript)) {
+foreach ($scriptPath in @($startScript, $stopScript, $statusScript, $setupScript, $shutdownScript)) {
     if (-not (Test-Path $scriptPath)) {
         throw "Required script missing: $scriptPath"
     }
@@ -330,6 +337,24 @@ switch ($Action) {
     'stop' {
         & $stopScript -Port $Port
         exit (Get-SafeExitCode)
+    }
+
+    'shutdown' {
+        & $shutdownScript -Port $Port -EmbedPort $EmbedPort -WaitForBufferSeconds $ShutdownWaitSeconds -BufferPollSeconds $ShutdownPollSeconds -FlushMaxItems $ShutdownFlushMaxItems -PostFlushDelayMs $ShutdownPostFlushDelayMs -ForceAfterTimeout:$ForceShutdown -GuiDir $ShutdownGuiDir
+        exit (Get-SafeExitCode)
+    }
+
+    'shutdown-status' {
+        try {
+            $uri = "$baseUrl/system/shutdown_status?max_wait_seconds=$ShutdownWaitSeconds&poll_seconds=$ShutdownPollSeconds&flush_max_items=$ShutdownFlushMaxItems"
+            $resp = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 15
+            $resp | ConvertTo-Json -Depth 8
+            exit 0
+        }
+        catch {
+            Write-Error "Shutdown status check failed: $($_.Exception.Message)"
+            exit 1
+        }
     }
 
     'status' {

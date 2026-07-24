@@ -2,9 +2,18 @@ import os
 import shutil
 from typing import Any, Dict
 
-def safe_copy_impl(src: str, dst: str, verbose: bool = False, chunk_size: int = 1024 * 1024) -> Dict[str, Any]:
+from tools.file_access_policy import authorize_write_paths, normalize_tool_path
+
+
+def safe_copy_impl(
+    src: str,
+    dst: str,
+    verbose: bool = False,
+    chunk_size: int = 1024 * 1024,
+    authorized_write: bool = False,
+    auth_token: str = "",
+) -> Dict[str, Any]:
     try:
-        # Validate src
         if not src:
             return {
                 "ok": False,
@@ -19,17 +28,9 @@ def safe_copy_impl(src: str, dst: str, verbose: bool = False, chunk_size: int = 
                 "error": "no_dst_provided",
             }
 
-        # Expand ~ and env vars
-        src = os.path.expanduser(os.path.expandvars(src))
-        dst = os.path.expanduser(os.path.expandvars(dst))
+        src = normalize_tool_path(src)
+        dst = normalize_tool_path(dst)
 
-        # Normalize to absolute paths
-        if not os.path.isabs(src):
-            src = os.path.abspath(src)
-        if not os.path.isabs(dst):
-            dst = os.path.abspath(dst)
-
-        # Ensure src exists and is a file
         if not os.path.exists(src):
             return {
                 "ok": False,
@@ -44,14 +45,22 @@ def safe_copy_impl(src: str, dst: str, verbose: bool = False, chunk_size: int = 
                 "error": f"src_not_file: {src}",
             }
 
-        # If dst is a directory, copy into it using the same file name
         if os.path.isdir(dst) or dst.endswith(os.sep):
             dst = os.path.join(dst, os.path.basename(src))
+        dst = normalize_tool_path(dst)
 
-        if not os.path.isabs(dst):
-            dst = os.path.abspath(dst)
+        allowed, error, _ = authorize_write_paths(
+            [dst],
+            authorized_write=authorized_write,
+            auth_token=auth_token,
+        )
+        if not allowed:
+            return {
+                "ok": False,
+                "result": None,
+                "error": error,
+            }
 
-        # Prevent copying a file onto itself
         try:
             if os.path.exists(dst) and os.path.samefile(src, dst):
                 return {
@@ -62,7 +71,6 @@ def safe_copy_impl(src: str, dst: str, verbose: bool = False, chunk_size: int = 
         except OSError:
             pass
 
-        # Ensure destination directory exists
         dst_dir = os.path.dirname(dst)
         if dst_dir and not os.path.isdir(dst_dir):
             os.makedirs(dst_dir, exist_ok=True)
@@ -110,12 +118,23 @@ def safe_copy_impl(src: str, dst: str, verbose: bool = False, chunk_size: int = 
             "error": str(e),
         }
 
+
 def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     src = args.get("src") or ""
     dst = args.get("dst") or ""
     verbose = bool(args.get("verbose", False))
     chunk_size = int(args.get("chunk_size", 1024 * 1024))
-    return safe_copy_impl(src, dst, verbose=verbose, chunk_size=chunk_size)
+    authorized_write = bool(args.get("authorized_write", False))
+    auth_token = str(args.get("auth_token") or "")
+    return safe_copy_impl(
+        src,
+        dst,
+        verbose=verbose,
+        chunk_size=chunk_size,
+        authorized_write=authorized_write,
+        auth_token=auth_token,
+    )
+
 
 # Optional schema to help the model
 tool_entry.schema = {
@@ -125,22 +144,32 @@ tool_entry.schema = {
         "properties": {
             "src": {
                 "type": "string",
-                "description": "Source file path to copy from."
+                "description": "Source file path to copy from.",
             },
             "dst": {
                 "type": "string",
-                "description": "Destination file path to copy to."
+                "description": "Destination file path to copy to.",
             },
             "verbose": {
                 "type": "boolean",
-                "description": "If true, print progress updates while copying."
+                "description": "If true, print progress updates while copying.",
             },
             "chunk_size": {
                 "type": "integer",
                 "description": "Number of bytes to copy per chunk when showing progress.",
-                "default": 1048576
-            }
+                "default": 1048576,
+            },
+            "authorized_write": {
+                "type": "boolean",
+                "description": "Required when destination is outside E:\\workspace.",
+                "default": False,
+            },
+            "auth_token": {
+                "type": "string",
+                "description": "Optional write authorization token for destinations outside E:\\workspace.",
+            },
         },
-        "required": ["src", "dst"]
-    }
+        "required": ["src", "dst"],
+        "additionalProperties": False,
+    },
 }

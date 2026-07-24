@@ -1,20 +1,30 @@
 import os
 from typing import Any, Dict
 
-def file_move_impl(src: str, dst: str) -> Dict[str, Any]:
+from tools.file_access_policy import authorize_write_paths, normalize_tool_path
+
+def file_move_impl(
+    src: str,
+    dst: str,
+    authorized_write: bool = False,
+    auth_token: str = "",
+) -> Dict[str, Any]:
     try:
         if not src:
             return {"ok": False, "result": None, "error": "no_source_path_provided"}
         if not dst:
             return {"ok": False, "result": None, "error": "no_destination_path_provided"}
 
-        src = os.path.expanduser(os.path.expandvars(src))
-        dst = os.path.expanduser(os.path.expandvars(dst))
+        src = normalize_tool_path(src)
+        dst = normalize_tool_path(dst)
 
-        if not os.path.isabs(src):
-            src = os.path.abspath(src)
-        if not os.path.isabs(dst):
-            dst = os.path.abspath(dst)
+        allowed, error, _ = authorize_write_paths(
+            [src, dst],
+            authorized_write=authorized_write,
+            auth_token=auth_token,
+        )
+        if not allowed:
+            return {"ok": False, "result": None, "error": error}
 
         if not os.path.exists(src):
             return {"ok": False, "result": None, "error": "source_not_found"}
@@ -39,7 +49,14 @@ def file_move_impl(src: str, dst: str) -> Dict[str, Any]:
 def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     src = args.get("src") or ""
     dst = args.get("dst") or ""
-    return file_move_impl(src, dst)
+    authorized_write = bool(args.get("authorized_write", False))
+    auth_token = str(args.get("auth_token") or "")
+    return file_move_impl(
+        src,
+        dst,
+        authorized_write=authorized_write,
+        auth_token=auth_token,
+    )
 
 
 tool_entry.schema = {
@@ -54,6 +71,15 @@ tool_entry.schema = {
             "dst": {
                 "type": "string",
                 "description": "Destination file path.",
+            },
+            "authorized_write": {
+                "type": "boolean",
+                "description": "Required for moves affecting paths outside E:\\workspace.",
+                "default": False,
+            },
+            "auth_token": {
+                "type": "string",
+                "description": "Optional write authorization token for moves outside E:\\workspace.",
             },
         },
         "required": ["src", "dst"],

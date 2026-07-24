@@ -1,6 +1,9 @@
 import os
 from typing import Any, Dict
 
+from tools.file_access_policy import normalize_tool_path
+from tools.file_inspector import inspect_file
+
 def file_read_impl(path: str) -> Dict[str, Any]:
     try:
         # Reject empty paths early
@@ -11,12 +14,7 @@ def file_read_impl(path: str) -> Dict[str, Any]:
                 "error": "no_path_provided"
             }
 
-        # Expand ~ and environment variables
-        path = os.path.expanduser(os.path.expandvars(path))
-
-        # Normalize relative paths
-        if not os.path.isabs(path):
-            path = os.path.abspath(path)
+        path = normalize_tool_path(path)
 
         # Ensure file exists
         if not os.path.isfile(path):
@@ -26,10 +24,10 @@ def file_read_impl(path: str) -> Dict[str, Any]:
                 "error": f"file_not_found: {path}"
             }
 
-        with open(path, "r", encoding="utf-8") as f:
-            data = f.read()
-
-        return {"ok": True, "result": {"content": data}, "error": None}
+        inspected = inspect_file(path)
+        if not inspected.get("ok"):
+            return inspected
+        return inspected
 
     except Exception as e:
         return {"ok": False, "result": None, "error": str(e)}
@@ -40,7 +38,7 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 tool_entry.schema = {
-    "description": "Read the full text content of a file.",
+    "description": "Read text files with encoding detection, or return a grounded metadata/header summary for binary files.",
     "parameters": {
         "type": "object",
         "properties": {

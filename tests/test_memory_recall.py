@@ -1,11 +1,13 @@
 import sys
 import json
 import hashlib
+import time
 from types import SimpleNamespace
 
 sys.path.insert(0, 'e:/Mina_MK1')
 
 from agent.core import MK1Core
+from agent.pending_actions import PendingActionStore
 
 
 class FakeMemory:
@@ -128,6 +130,40 @@ def test_store_turn_memory_invokes_auto_promotion_with_settings():
     assert call["min_hits"] == 3
     assert call["recent_window"] == 25
     assert call["semantic_top_k"] == 5
+
+
+def test_store_turn_memory_tags_failed_decisions_and_corrections():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    core.auto_promote_min_hits = 2
+    core.auto_promote_recent_window = 40
+    core.auto_promote_semantic_top_k = 8
+
+    MK1Core._store_turn_memory(
+        core,
+        "That was a project request, not a text request.",
+        "I cannot send real texts directly from this setup yet.",
+    )
+
+    assert "routing_correction" in core.memory.writes[0]["tags"]
+    assert "user_memory" in core.memory.writes[0]["tags"]
+    assert "failed_decision" in core.memory.writes[1]["tags"]
+
+
+def test_detect_relative_alarm_with_called_label():
+    core = MK1Core.__new__(MK1Core)
+    core._pending_actions = PendingActionStore()
+    core.tools = SimpleNamespace(tools={})
+
+    tool_name, args = MK1Core.detect_tool_intent(
+        core,
+        "set an alarm to go off in 5 seconds called phone alarm deployment test",
+    )
+
+    assert tool_name == "__task_memory_write__"
+    assert args["text"] == "Alarm: phone alarm deployment test"
+    assert args["tags"] == ["user_memory", "recurring_task", "repeat_120s", "alarm_task", "beep"]
+    assert 0 < args["due_at"] - time.time() <= 5
 
 
 def test_core_exposes_auto_promoted_memories():
@@ -366,6 +402,55 @@ def test_detect_code_execute_strips_trailing_explanation_phrase():
     assert tool_name == "code_execute"
     assert args["language"] == "powershell"
     assert args["code"] == "Get-Date -Format o"
+
+
+def test_project_named_message_does_not_route_to_external_texting_limit():
+    core = MK1Core.__new__(MK1Core)
+    core.tools = SimpleNamespace(tools={})
+    core._intent_alias_cache = {}
+    core._pending_actions = PendingActionStore()
+
+    prompt = (
+        "Mina, create a project called midnight-message in my workspace. "
+        "Make a Python script that prints a random mysterious but funny message, "
+        "run it, then tell me the exact file path and verified output."
+    )
+    tool_name, _args = MK1Core.detect_tool_intent(core, prompt)
+
+    assert tool_name != "__capability_limit__"
+
+
+def test_send_text_to_brother_routes_to_external_texting_limit():
+    core = MK1Core.__new__(MK1Core)
+    core.tools = SimpleNamespace(tools={})
+    core._intent_alias_cache = {}
+    core._pending_actions = PendingActionStore()
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "send my brother a hello text from Mina")
+
+    assert tool_name == "__capability_limit__"
+    assert "cannot send real texts" in args["message"]
+
+
+def test_voice_transcript_corrects_ostranauts_in_game_context():
+    core = MK1Core.__new__(MK1Core)
+    core.tools = SimpleNamespace(tools={"web_search": object()})
+    core._intent_alias_cache = {}
+    core._pending_actions = PendingActionStore()
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "web search astronauts mods")
+
+    assert tool_name == "web_search"
+    assert args["query"] == "Ostranauts mods"
+
+
+def test_voice_transcript_keeps_literal_astronauts_outside_game_context():
+    core = MK1Core.__new__(MK1Core)
+
+    normalized = MK1Core._normalize_user_intent_text(core, "how do astronauts sleep in space")
+
+    assert "astronauts" in normalized
+    assert "Ostranauts" not in normalized
 
 
 def test_detect_repo_review_with_url_routes_to_github_repo():

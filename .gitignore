@@ -4,6 +4,20 @@ __pycache__/
 .pytest_cache/
 *.pyc
 
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+google-services.json
+local.properties
+*.jks
+*.keystore
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+
 # Runtime and logs
 logs/
 *.pid
@@ -24,6 +38,8 @@ sandbox/
 .tmp_publish_android_repo/
 tmp/
 backup/
+integrations/**/build/
+integrations/**/install_record.json
 
 # Android/Gradle generated files
 android/.idea/

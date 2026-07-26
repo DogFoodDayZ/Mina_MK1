@@ -5,12 +5,16 @@ import json
 import shutil
 import hashlib
 import re
+import threading
+from functools import wraps
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import faiss
 import requests
+
+from memory.retention import plan_conversation_retention
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +24,25 @@ DB_PATH_DEFAULT = os.path.join(MEMORY_DIR, "memory.db")
 FAISS_SMALL_PATH_DEFAULT = os.path.join(MEMORY_DIR, "faiss_small.index")
 FAISS_BASE_PATH_DEFAULT = os.path.join(MEMORY_DIR, "faiss_base.index")
 BACKUP_DIR_DEFAULT = os.path.join(MEMORY_DIR, "backups")
+
+
+def _tracked_memory_operation(name: str, allow_while_quiescing: bool = False, rejected: Any = None):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if not self._begin_memory_operation(name, allow_while_quiescing=allow_while_quiescing):
+                return rejected(self, *args, **kwargs) if callable(rejected) else rejected
+
+            self._memory_operation_serial_lock.acquire()
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                self._memory_operation_serial_lock.release()
+                self._end_memory_operation(name)
+
+        return wrapper
+
+    return decorator
 
 
 class MK1Memory:
@@ -48,6 +71,11 @@ class MK1Memory:
         backup_max_total: int = 120,
         trim_max_rows: Optional[int] = None,
         trim_max_age_seconds: Optional[int] = None,
+        retention_enabled: bool = True,
+        interaction_retention_days: int = 90,
+        failed_decision_retention_days: int = 14,
+        retention_interval_seconds: int = 86400,
+        retention_max_delete: int = 1000,
     ):
         self.db_path = db_path
         self.faiss_small_path = faiss_small_path
@@ -90,8 +118,15 @@ class MK1Memory:
         self.backup_max_total = backup_max_total
         self.trim_max_rows = trim_max_rows
         self.trim_max_age_seconds = trim_max_age_seconds
+        self.retention_enabled = bool(retention_enabled)
+        self.interaction_retention_days = max(1, int(interaction_retention_days))
+        self.failed_decision_retention_days = max(1, int(failed_decision_retention_days))
+        self.retention_interval_seconds = max(3600, int(retention_interval_seconds))
+        self.retention_max_delete = max(1, int(retention_max_delete))
+        self._last_retention_maintenance = 0.0
 
         self._write_counter = 0
+        self._init_operation_tracking()
 
         for path in [
             os.path.dirname(self.db_path),
@@ -122,6 +157,91 @@ class MK1Memory:
         print(">>> MK1Memory online")
 
     # ================= STATUS / ERROR =================
+
+    def _init_operation_tracking(self) -> None:
+        self._memory_operation_condition = threading.Condition(threading.RLock())
+        self._memory_operation_serial_lock = threading.RLock()
+        self._memory_operation_local = threading.local()
+        self._memory_active_operations = 0
+        self._memory_active_by_name: Dict[str, int] = {}
+        self._memory_quiescing = False
+        self._memory_closing = False
+        self._memory_closed = False
+
+    def _ensure_operation_tracking(self) -> None:
+        if not hasattr(self, "_memory_operation_condition"):
+            self._init_operation_tracking()
+
+    def _begin_memory_operation(
+        self,
+        name: str,
+        allow_while_quiescing: bool = False,
+        internal_close: bool = False,
+    ) -> bool:
+        self._ensure_operation_tracking()
+        depth = int(getattr(self._memory_operation_local, "depth", 0) or 0)
+        with self._memory_operation_condition:
+            if depth <= 0:
+                if self._memory_closed:
+                    return False
+                if self._memory_closing and not internal_close:
+                    return False
+                if self._memory_quiescing and not allow_while_quiescing and not internal_close:
+                    return False
+
+            self._memory_active_operations += 1
+            self._memory_active_by_name[name] = self._memory_active_by_name.get(name, 0) + 1
+            self._memory_operation_local.depth = depth + 1
+            return True
+
+    def _end_memory_operation(self, name: str) -> None:
+        self._ensure_operation_tracking()
+        with self._memory_operation_condition:
+            depth = int(getattr(self._memory_operation_local, "depth", 1) or 1)
+            self._memory_operation_local.depth = max(0, depth - 1)
+            self._memory_active_operations = max(0, self._memory_active_operations - 1)
+            remaining = max(0, self._memory_active_by_name.get(name, 1) - 1)
+            if remaining:
+                self._memory_active_by_name[name] = remaining
+            else:
+                self._memory_active_by_name.pop(name, None)
+            self._memory_operation_condition.notify_all()
+
+    def begin_shutdown_quiesce(self) -> Dict[str, Any]:
+        self._ensure_operation_tracking()
+        with self._memory_operation_condition:
+            self._memory_quiescing = True
+            return self.memory_activity_status()
+
+    def resume_memory_operations(self) -> Dict[str, Any]:
+        self._ensure_operation_tracking()
+        with self._memory_operation_condition:
+            if not self._memory_closing and not self._memory_closed:
+                self._memory_quiescing = False
+            self._memory_operation_condition.notify_all()
+            return self.memory_activity_status()
+
+    def wait_for_memory_idle(self, timeout_seconds: float) -> bool:
+        self._ensure_operation_tracking()
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        with self._memory_operation_condition:
+            while self._memory_active_operations > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._memory_operation_condition.wait(timeout=remaining)
+            return True
+
+    def memory_activity_status(self) -> Dict[str, Any]:
+        self._ensure_operation_tracking()
+        with self._memory_operation_condition:
+            return {
+                "active_operations": int(self._memory_active_operations),
+                "active_by_name": dict(self._memory_active_by_name),
+                "quiescing": bool(self._memory_quiescing),
+                "closing": bool(self._memory_closing),
+                "closed": bool(self._memory_closed),
+            }
 
     def _set_error(self, msg: str):
         print(">>> MK1Memory ERROR:", msg)
@@ -520,6 +640,15 @@ class MK1Memory:
             self.status["buffer_last_flush_result"] = {"flushed": int(flushed), "failed": int(failed + 1)}
             return {"flushed": flushed, "failed": failed + 1}
 
+    @_tracked_memory_operation(
+        "buffer_flush",
+        allow_while_quiescing=True,
+        rejected=lambda self, *args, **kwargs: {
+            "ok": False,
+            "result": None,
+            "error": "memory_closing",
+        },
+    )
     def flush_pending_memories(self, max_items: int = 200) -> Dict[str, Any]:
         result = self._flush_pending_memories(max_items=max_items)
         return {
@@ -577,6 +706,10 @@ class MK1Memory:
 
         return small, base  # type: ignore[return-value]
 
+    @_tracked_memory_operation(
+        "faiss_rebuild",
+        rejected=lambda self, *args, **kwargs: (self.small_index, self.base_index),
+    )
     def _rebuild_indexes(self) -> Tuple[Optional[faiss.IndexIDMap2], Optional[faiss.IndexIDMap2]]:
         print(">>> Rebuilding FAISS indexes…")
 
@@ -771,6 +904,7 @@ class MK1Memory:
                 self._set_error(f"backup_prune_error: {e}")
         return deleted
 
+    @_tracked_memory_operation("backup", allow_while_quiescing=True)
     def backup(self, reason: str = "manual", force: bool = False) -> Optional[str]:
         now = time.time()
 
@@ -828,6 +962,7 @@ class MK1Memory:
 
     # ================= TRIMMING =================
 
+    @_tracked_memory_operation("trim_by_age", rejected=0)
     def trim_by_age(self, max_age_seconds: float) -> int:
         cutoff = time.time() - max_age_seconds
         try:
@@ -844,6 +979,7 @@ class MK1Memory:
             self._set_error(f"trim_by_age_error: {e}")
             return 0
 
+    @_tracked_memory_operation("trim_by_size", rejected=0)
     def trim_by_size(self, max_rows: int) -> int:
         try:
             conn = sqlite3.connect(self.db_path)
@@ -872,6 +1008,10 @@ class MK1Memory:
             self._set_error(f"trim_by_size_error: {e}")
             return 0
 
+    @_tracked_memory_operation(
+        "memory_hygiene",
+        rejected=lambda self, *args, **kwargs: {"ok": False, "error": "memory_quiescing"},
+    )
     def memory_hygiene(self, dry_run: bool = False, max_delete: int = 500) -> Dict[str, Any]:
         """
         Conservative memory cleanup pass:
@@ -1002,6 +1142,167 @@ class MK1Memory:
 
     # ================= MAINTENANCE CYCLE =================
 
+    def _build_conversation_digest(self, day: str, rows: List[Dict[str, Any]]) -> str:
+        stop_words = {
+            "about", "after", "again", "also", "because", "before", "could", "from",
+            "have", "mina", "should", "that", "their", "there", "these", "they", "this",
+            "through", "what", "when", "where", "which", "with", "would", "your",
+        }
+        counts: Dict[str, int] = {}
+        highlights: List[str] = []
+
+        for row in rows or []:
+            text = " ".join(str(row.get("text") or "").split())
+            if not text:
+                continue
+            tags = {str(tag or "").strip().lower() for tag in (row.get("tags") or [])}
+            role = "User" if "user_turn" in tags else "Mina" if "assistant_turn" in tags else "Turn"
+            if len(highlights) < 12:
+                highlights.append(f"{role}: {text[:180]}")
+            for token in re.findall(r"[a-z0-9][a-z0-9_-]{3,}", text.lower()):
+                token = token.strip("_-")
+                if len(token) < 4 or token in stop_words or token.isdigit():
+                    continue
+                counts[token] = counts.get(token, 0) + 1
+
+        topics = [token for token, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:10]]
+        topic_text = ", ".join(topics) if topics else "general conversation"
+        highlight_text = " | ".join(highlights)[:1500]
+        return f"Conversation digest {day}. Topics: {topic_text}. Highlights: {highlight_text}".strip()
+
+    @_tracked_memory_operation(
+        "retention_lifecycle",
+        rejected=lambda self, *args, **kwargs: {"ok": False, "error": "memory_quiescing"},
+    )
+    def run_retention_lifecycle(
+        self,
+        dry_run: bool = True,
+        now_ts: Optional[float] = None,
+        max_delete: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        now_value = float(now_ts if now_ts is not None else time.time())
+        delete_limit = max(1, int(max_delete if max_delete is not None else self.retention_max_delete))
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, text, kind, tags, timestamp FROM memories "
+                "WHERE kind = 'interaction' ORDER BY timestamp ASC"
+            )
+            rows = []
+            for memory_id, text, kind, tags_json, timestamp in cur.fetchall():
+                try:
+                    tags = json.loads(tags_json) if tags_json else []
+                except Exception:
+                    tags = []
+                rows.append({
+                    "id": int(memory_id),
+                    "text": str(text or ""),
+                    "kind": str(kind or "interaction"),
+                    "tags": tags if isinstance(tags, list) else [],
+                    "timestamp": float(timestamp or 0.0),
+                })
+
+            cur.execute("SELECT tags FROM memories WHERE tags LIKE '%conversation_digest%'")
+            existing_digest_days = set()
+            for (tags_json,) in cur.fetchall():
+                try:
+                    tags = json.loads(tags_json) if tags_json else []
+                except Exception:
+                    tags = []
+                for tag in tags if isinstance(tags, list) else []:
+                    tag_text = str(tag or "").strip().lower()
+                    if tag_text.startswith("digest_day_"):
+                        existing_digest_days.add(tag_text[len("digest_day_"):])
+            conn.close()
+            conn = None
+
+            plan = plan_conversation_retention(
+                rows,
+                now_ts=now_value,
+                interaction_retention_days=self.interaction_retention_days,
+                failed_decision_retention_days=self.failed_decision_retention_days,
+            )
+
+            failed_ids = list(plan.get("failed_ids", []))[:delete_limit]
+            remaining = max(0, delete_limit - len(failed_ids))
+            selected_by_day: Dict[str, List[Dict[str, Any]]] = {}
+            regular_ids: List[int] = []
+            for day in sorted(plan.get("regular_by_day", {})):
+                if remaining <= 0:
+                    break
+                day_rows = list(plan["regular_by_day"].get(day, []))
+                selected_rows = day_rows[:remaining]
+                if not selected_rows:
+                    continue
+                selected_by_day[day] = selected_rows
+                ids = [int(row.get("id") or 0) for row in selected_rows if int(row.get("id") or 0) > 0]
+                regular_ids.extend(ids)
+                remaining -= len(ids)
+
+            report = {
+                "ok": True,
+                "dry_run": bool(dry_run),
+                "interaction_retention_days": self.interaction_retention_days,
+                "failed_decision_retention_days": self.failed_decision_retention_days,
+                "total_interactions": len(rows),
+                "failed_decision_delete_count": len(failed_ids),
+                "regular_delete_count": len(regular_ids),
+                "delete_count": len(failed_ids) + len(regular_ids),
+                "digest_days_needed": [day for day in selected_by_day if day not in existing_digest_days],
+                "digest_days_existing": sorted(day for day in selected_by_day if day in existing_digest_days),
+                "preserved_durable_count": len(plan.get("preserved_ids", [])),
+                "recent_count": len(plan.get("recent_ids", [])),
+                "deleted": 0,
+                "digests_created": [],
+            }
+            if dry_run or report["delete_count"] <= 0:
+                return report
+
+            backup_path = self.backup(reason="retention_lifecycle", force=True)
+            report["backup_path"] = backup_path
+            digest_ready_days = set(existing_digest_days)
+            for day, selected_rows in selected_by_day.items():
+                if day in digest_ready_days:
+                    continue
+                digest_text = self._build_conversation_digest(day, selected_rows)
+                digest_id = self.add_memory(
+                    digest_text,
+                    kind="procedure",
+                    tags=["long_term", "conversation_digest", "summarized_history", f"digest_day_{day}"],
+                )
+                if digest_id is not None:
+                    digest_ready_days.add(day)
+                    report["digests_created"].append({"day": day, "id": digest_id})
+
+            covered_regular_ids = [
+                int(row.get("id") or 0)
+                for day, selected_rows in selected_by_day.items()
+                if day in digest_ready_days
+                for row in selected_rows
+                if int(row.get("id") or 0) > 0
+            ]
+            delete_ids = list(dict.fromkeys(failed_ids + covered_regular_ids))
+            if delete_ids:
+                conn = sqlite3.connect(self.db_path)
+                cur = conn.cursor()
+                placeholders = ",".join(["?"] * len(delete_ids))
+                cur.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", tuple(delete_ids))
+                report["deleted"] = int(cur.rowcount or 0)
+                conn.commit()
+                conn.close()
+                conn = None
+                self.small_index, self.base_index = self._rebuild_indexes()
+
+            return report
+        except Exception as e:
+            if conn is not None:
+                conn.close()
+            self._set_error(f"retention_lifecycle_error: {e}")
+            return {"ok": False, "dry_run": bool(dry_run), "error": str(e)}
+
+    @_tracked_memory_operation("maintenance")
     def maintenance_tick(self):
         """
         Call this periodically from core.py (e.g. every N user turns).
@@ -1032,41 +1333,70 @@ class MK1Memory:
         if self.trim_max_age_seconds is not None:
             self.trim_by_age(self.trim_max_age_seconds)
 
+        if (
+            self.retention_enabled
+            and (now - float(self._last_retention_maintenance or 0.0)) >= float(self.retention_interval_seconds)
+        ):
+            self._last_retention_maintenance = now
+            self.status["last_retention"] = self.run_retention_lifecycle(dry_run=False, now_ts=now)
+
     def close(self, flush_rounds: int = 3, flush_batch_size: int = 200) -> Dict[str, Any]:
         """
         Graceful shutdown hook for core: drain buffered pending memories and
         persist a final backup snapshot when possible.
         """
+        self._ensure_operation_tracking()
+        self.begin_shutdown_quiesce()
+        if not self.wait_for_memory_idle(timeout_seconds=600.0):
+            return {
+                "ok": False,
+                "result": self.memory_activity_status(),
+                "error": "active_memory_operations_not_complete",
+            }
+
+        with self._memory_operation_condition:
+            self._memory_closing = True
+
+        if not self._begin_memory_operation("shutdown_close", internal_close=True):
+            return {"ok": False, "result": self.memory_activity_status(), "error": "memory_close_not_started"}
+
+        self._memory_operation_serial_lock.acquire()
         rounds = max(1, int(flush_rounds))
         batch = max(1, int(flush_batch_size))
         total_flushed = 0
         total_failed = 0
+        try:
+            for _ in range(rounds):
+                result = self._flush_pending_memories(max_items=batch)
+                flushed = int(result.get("flushed") or 0)
+                failed = int(result.get("failed") or 0)
+                total_flushed += flushed
+                total_failed += failed
 
-        for _ in range(rounds):
-            result = self._flush_pending_memories(max_items=batch)
-            flushed = int(result.get("flushed") or 0)
-            failed = int(result.get("failed") or 0)
-            total_flushed += flushed
-            total_failed += failed
+                pending = int(self.status.get("buffer_pending_count") or 0)
+                if pending <= 0 or (flushed == 0 and failed == 0):
+                    break
 
-            pending = int(self.status.get("buffer_pending_count") or 0)
-            if pending <= 0 or (flushed == 0 and failed == 0):
-                break
-
-        backup_path = self.backup(reason="shutdown")
-        return {
-            "ok": True,
-            "result": {
-                "flushed": total_flushed,
-                "failed": total_failed,
-                "pending": int(self.status.get("buffer_pending_count") or 0),
-                "backup_path": backup_path,
-            },
-            "error": None,
-        }
+            backup_path = self.backup(reason="shutdown", force=True)
+            with self._memory_operation_condition:
+                self._memory_closed = True
+            return {
+                "ok": True,
+                "result": {
+                    "flushed": total_flushed,
+                    "failed": total_failed,
+                    "pending": int(self.status.get("buffer_pending_count") or 0),
+                    "backup_path": backup_path,
+                },
+                "error": None,
+            }
+        finally:
+            self._memory_operation_serial_lock.release()
+            self._end_memory_operation("shutdown_close")
 
     # ================= ADD MEMORY =================
 
+    @_tracked_memory_operation("add_memory")
     def add_memory(
         self,
         text: str,
@@ -1111,6 +1441,7 @@ class MK1Memory:
         self._flush_pending_memories(max_items=3)
         return mem_id
 
+    @_tracked_memory_operation("add_time_passage_note")
     def add_time_passage_note(self, text: str, tags: Optional[List[str]] = None) -> Optional[int]:
         base_tags = ["system_seed", "time_tick"]
         if tags:
@@ -1124,6 +1455,7 @@ class MK1Memory:
             task_status="stored",
         )
 
+    @_tracked_memory_operation("add_task_memory")
     def add_task_memory(
         self,
         text: str,
@@ -1144,6 +1476,7 @@ class MK1Memory:
             task_status=status,
         )
 
+    @_tracked_memory_operation("get_due_tasks", rejected=lambda self, *args, **kwargs: [])
     def get_due_tasks(
         self,
         now_ts: Optional[float] = None,
@@ -1183,6 +1516,7 @@ class MK1Memory:
 
         return out
 
+    @_tracked_memory_operation("get_task_memories", rejected=lambda self, *args, **kwargs: [])
     def get_task_memories(
         self,
         top_k: int = 20,
@@ -1221,6 +1555,7 @@ class MK1Memory:
 
         return out
 
+    @_tracked_memory_operation("set_task_status", rejected=False)
     def set_task_status(self, task_id: int, status: str) -> bool:
         try:
             safe_status = str(status or "pending").strip().lower()
@@ -1241,6 +1576,7 @@ class MK1Memory:
             self._set_error(f"set_task_status_error: {e}")
             return False
 
+    @_tracked_memory_operation("snooze_task", rejected=False)
     def snooze_task(self, task_id: int, seconds: int) -> bool:
         try:
             delta = max(1, int(seconds))
@@ -1297,6 +1633,7 @@ class MK1Memory:
 
         return True
 
+    @_tracked_memory_operation("recent_memories", rejected=lambda self, *args, **kwargs: [])
     def recent_memories(
         self,
         top_k: int = 6,
@@ -1426,6 +1763,7 @@ class MK1Memory:
 
         return False
 
+    @_tracked_memory_operation("find_memory", rejected=None)
     def find_memory_id_by_text(
         self,
         text: str,
@@ -1466,6 +1804,7 @@ class MK1Memory:
 
         return None
 
+    @_tracked_memory_operation("delete_memory", rejected=0)
     def delete_memory_ids(self, memory_ids: List[int]) -> int:
         ids = []
         for mem_id in memory_ids or []:
@@ -1494,6 +1833,7 @@ class MK1Memory:
             self._set_error(f"delete_memory_ids_error: {e}")
             return 0
 
+    @_tracked_memory_operation("delete_memory_by_text", rejected=0)
     def delete_memory_by_text(
         self,
         text: str,
@@ -1537,6 +1877,7 @@ class MK1Memory:
             self._set_error(f"delete_memory_by_text_error: {e}")
             return 0
 
+    @_tracked_memory_operation("touch_memory", rejected=False)
     def touch_memory_by_text(
         self,
         text: str,
@@ -1595,6 +1936,7 @@ class MK1Memory:
             self._set_error(f"touch_memory_by_text_error: {e}")
             return False
 
+    @_tracked_memory_operation("auto_promote", rejected=lambda self, *args, **kwargs: [])
     def auto_promote_short_term(
         self,
         seed_text: str,
@@ -1672,6 +2014,7 @@ class MK1Memory:
 
         return promoted
 
+    @_tracked_memory_operation("get_promoted_memories", rejected=lambda self, *args, **kwargs: [])
     def get_auto_promoted_memories(self, limit: int = 20) -> List[Dict[str, Any]]:
         safe_limit = max(1, int(limit))
 
@@ -1703,6 +2046,7 @@ class MK1Memory:
 
         return out
 
+    @_tracked_memory_operation("search", rejected=lambda self, *args, **kwargs: [])
     def search(
         self,
         query: str,
@@ -1796,5 +2140,6 @@ class MK1Memory:
 
         return merged[:top_k]
 
+    @_tracked_memory_operation("get_context", rejected=lambda self, *args, **kwargs: [])
     def get_context(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         return self.search(query, top_k=top_k)

@@ -31,7 +31,12 @@
     "backup_keep_hourly_hours": 48,
     "backup_keep_daily_days": 30,
     "backup_keep_weekly_weeks": 26,
-    "backup_max_total": 120
+    "backup_max_total": 120,
+    "retention_enabled": true,
+    "interaction_retention_days": 90,
+    "failed_decision_retention_days": 14,
+    "retention_interval_seconds": 86400,
+    "retention_max_delete": 1000
   },
   "tools": {
     "directory": "E:\\mina_mk1\\tools"
@@ -44,6 +49,31 @@
       "templates",
       "archive"
     ]
+  },
+  "curiosity": {
+    "enabled": true,
+    "approved_roots": [
+      "D:\\",
+      "E:\\",
+      "G:\\"
+    ],
+    "idle_seconds": 600,
+    "local_interval_seconds": 3600,
+    "news_interval_seconds": 21600,
+    "work_interval_seconds": 1800,
+    "max_work_retries": 2,
+    "allow_source_edits": true,
+    "keep_patch_files": true,
+    "code_backup_dir": "E:\\workspace\\mina_code_backups",
+    "watchdog_dir": "E:\\workspace\\mina_watchdog",
+    "project_roots": [
+      "E:\\Mina_MK1"
+    ],
+    "todo_paths": [
+      "E:\\Mina_MK1\\TODO.md"
+    ],
+    "max_directories_per_cycle": 40,
+    "max_file_bytes": 2000000
   },
   "performance": {
     "fast_command_mode": true,

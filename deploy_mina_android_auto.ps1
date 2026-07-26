@@ -240,6 +240,9 @@ if (-not (Test-Path $apkPath)) {
 Write-Step 'Installing APK on phone'
 & $adb @adbTargetArgs install -r $apkPath | Write-Host
 
+Write-Step 'Granting phone alarm notification permission'
+& $adb @adbTargetArgs shell pm grant com.mina.voice android.permission.POST_NOTIFICATIONS 2>$null | Out-Null
+
 Write-Step 'Refreshing Mina and Android Auto processes'
 & $adb @adbTargetArgs shell am force-stop com.mina.voice | Out-Null
 & $adb @adbTargetArgs shell am force-stop com.google.android.projection.gearhead | Out-Null

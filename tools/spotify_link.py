@@ -1531,7 +1531,30 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
 
     if action == "add_tracks_to_playlist":
         playlist_id = str(in_args.get("playlist_id") or "").strip()
+        playlist_name = str(in_args.get("playlist_name") or in_args.get("name") or "").strip()
+        if not playlist_id and playlist_name:
+            found = _find_playlist_by_name(playlist_name)
+            if not found.get("ok"):
+                return found
+            playlist_id = str((found.get("result") or {}).get("id") or "").strip()
+
         uris = _split_pipe_list(in_args.get("track_uris"))
+        query = str(in_args.get("track_query") or in_args.get("query") or "").strip()
+        if not uris and query:
+            try:
+                limit = max(1, min(50, int(in_args.get("limit") or 10)))
+            except Exception:
+                limit = 10
+            searched = _search_track(query=query, limit=limit)
+            if not searched.get("ok"):
+                return searched
+            tracks = (searched.get("result") or {}).get("tracks") or []
+            uris = list(dict.fromkeys(
+                str(track.get("uri") or "").strip()
+                for track in tracks
+                if isinstance(track, dict) and str(track.get("uri") or "").strip()
+            ))[:limit]
+
         return _add_tracks_to_playlist(playlist_id=playlist_id, uris=uris)
 
     if action == "playlist_tracks":

@@ -35,6 +35,7 @@ except Exception:
     MULTIPART_AVAILABLE = False
 
 from agent.core import MK1Core  # <-- note: from agent.core
+from agent.ostranauts import get_ostranauts_status
 
 
 # ------------------------------------------------------------
@@ -108,6 +109,8 @@ app = FastAPI(title="MK1 Core API", version="1.0")
 
 _restart_lock = threading.Lock()
 _restart_requested_until = 0.0
+_shutdown_commit_lock = threading.Lock()
+_shutdown_commit_started = False
 
 
 @app.on_event("shutdown")
@@ -1891,6 +1894,11 @@ def voice_status():
     }
 
 
+@app.get("/games/ostranauts/status")
+def ostranauts_status():
+    return get_ostranauts_status()
+
+
 @app.get("/tasks/queue_status")
 def tasks_queue_status(limit: int = 5):
     safe_limit = max(1, min(25, int(limit)))
@@ -1903,7 +1911,7 @@ def tasks_queue_status(limit: int = 5):
 
 @app.get("/tasks/list")
 def tasks_list(limit: int = 12):
-    safe_limit = max(1, min(50, int(limit)))
+    safe_limit = max(1, min(250, int(limit)))
     now_ts = time.time()
 
     try:
@@ -1942,6 +1950,7 @@ def tasks_list(limit: int = 12):
                     "id": item.get("id"),
                     "text": item.get("text"),
                     "status": item.get("task_status", "pending"),
+                    "tags": tags,
                     "due_at": due_at,
                     "due": due,
                     "alarm": is_alarm,
@@ -2086,6 +2095,27 @@ def model_select(req: ModelSelectRequest):
 @app.get("/events/recent")
 def events_recent(since_id: int = 0, limit: int = 50, source: str = ""):
     return _get_gui_events_since(since_id=since_id, limit=limit, source=source)
+
+
+@app.get("/curiosity/status")
+def curiosity_status():
+    curiosity = getattr(core, "curiosity", None)
+    if curiosity is None:
+        return {"enabled": False, "error": "curiosity_not_available"}
+    status = curiosity.status()
+    status["source_edits_enabled"] = bool(core.config.get("curiosity", "allow_source_edits", False))
+    status["code_backup_dir"] = str(core.config.get("curiosity", "code_backup_dir", ""))
+    status["watchdog_dir"] = str(core.config.get("curiosity", "watchdog_dir", ""))
+    status["autonomous_tools"] = core._autonomous_tool_status()
+    return status
+
+
+@app.get("/curiosity/events")
+def curiosity_events(since_id: int = 0, limit: int = 20):
+    curiosity = getattr(core, "curiosity", None)
+    if curiosity is None:
+        return []
+    return curiosity.events_since(since_id=since_id, limit=limit)
 
 
 @app.post("/restore/open")
@@ -2290,6 +2320,15 @@ def memory_flush_buffer(max_items: int = 200):
         return {"ok": False, "error": str(e), "result": None}
 
 
+@app.post("/memory/retention")
+def memory_retention(dry_run: bool = True, max_delete: int = 1000):
+    mem = getattr(core, "memory", None)
+    if mem is None or not hasattr(mem, "run_retention_lifecycle"):
+        return {"ok": False, "error": "retention_not_supported"}
+    safe_max = max(1, min(5000, int(max_delete)))
+    return mem.run_retention_lifecycle(dry_run=bool(dry_run), max_delete=safe_max)
+
+
 @app.post("/system/shutdown_gate")
 def system_shutdown_gate(
     force: bool = False,
@@ -2316,6 +2355,44 @@ def system_shutdown_gate(
         )
     except Exception as e:
         return {"ok": False, "error": str(e), "result": None}
+
+
+@app.post("/system/shutdown_commit")
+def system_shutdown_commit():
+    global _shutdown_commit_started
+
+    with _shutdown_commit_lock:
+        if _shutdown_commit_started:
+            return {"ok": True, "result": {"status": "shutdown_already_committed"}, "error": None}
+
+        mem = getattr(core, "memory", None)
+        if mem is not None and hasattr(mem, "memory_activity_status"):
+            activity = mem.memory_activity_status()
+            if int(activity.get("active_operations") or 0) > 0:
+                return {"ok": False, "result": activity, "error": "active_memory_operations_not_complete"}
+            if not bool(activity.get("quiescing", False)):
+                return {"ok": False, "result": activity, "error": "shutdown_gate_not_prepared"}
+
+        close_result = core.close()
+        if not isinstance(close_result, dict) or not close_result.get("ok"):
+            return {
+                "ok": False,
+                "result": close_result.get("result") if isinstance(close_result, dict) else None,
+                "error": close_result.get("error") if isinstance(close_result, dict) else "core_close_failed",
+            }
+
+        _shutdown_commit_started = True
+
+        def _exit_after_response() -> None:
+            time.sleep(0.35)
+            os._exit(0)
+
+        threading.Thread(target=_exit_after_response, name="mk1-graceful-exit", daemon=True).start()
+        return {
+            "ok": True,
+            "result": {"status": "shutdown_committed", "close": close_result.get("result")},
+            "error": None,
+        }
 
 
 @app.get("/system/shutdown_status")

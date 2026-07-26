@@ -24,10 +24,18 @@ If you prefer command-line builds, generate Gradle wrapper once after installing
 - Optional wake-word gate (`Hey Mina`)
 - Sends command text to MK1 API `/process`
 - Speaks Mina reply on phone via Android TTS
+   - Uses navigation-guidance audio so Spotify ducks under Mina instead of being paused.
+- Continuous listening keeps a stable enabled state across recognizer sessions.
+   - Longer silence windows reduce clipped commands.
+   - A wake word heard by itself arms the next speech segment for six seconds.
 - Driving Mode toggle for hands-free road support:
    - Starts recurring Mina driving check-ins (default 20 minutes)
    - Keeps listening active while driving
    - Stops check-ins with one tap
+- Phone Alarms foreground sync:
+   - Polls Mina for due alarms every 15 seconds.
+   - Rings and vibrates locally with a high-priority notification.
+   - Deduplicates each task/due-time pair and restarts after reboot or app update.
 
 ## Notes
 
@@ -46,6 +54,15 @@ If you prefer command-line builds, generate Gradle wrapper once after installing
    - Tailscale HTTPS (if enabled): `https://your-node-name.your-tailnet.ts.net`
    - LAN fallback: `http://192.168.1.100:8000`
 5. Tap `Start Listening` and grant microphone permission.
+6. Leave `Phone Alarms` enabled and grant notification permission.
+
+For USB-only development, route the phone's localhost port to Mina before testing:
+
+- `adb reverse tcp:8000 tcp:8000`
+- Set the app API URL to `http://127.0.0.1:8000`.
+
+Without USB, use a reachable Tailscale or LAN URL. A saved host that responds to
+ping but cannot reach port 8000 will not deliver alarms.
 
 ## Android Auto Visibility Troubleshooting
 

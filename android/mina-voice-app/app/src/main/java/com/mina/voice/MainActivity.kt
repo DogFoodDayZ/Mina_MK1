@@ -4,7 +4,12 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.MediaPlayer
 import android.os.Bundle
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.speech.RecognitionListener
@@ -71,6 +76,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONObject
+import java.io.File
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
@@ -93,6 +99,11 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         .writeTimeout(12, TimeUnit.SECONDS)
         .build()
     private lateinit var tts: TextToSpeech
+    private lateinit var audioManager: AudioManager
+    private lateinit var speechFocusRequest: AudioFocusRequest
+    private var speechPlayer: MediaPlayer? = null
+    private var speechFile: File? = null
+    private var speechSynthesisId: String? = null
 
     private var recognizer: SpeechRecognizer? = null
     private var shouldKeepListening = false
@@ -103,6 +114,8 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var ttsReady = false
     private var ttsSpeaking = false
     private var suppressListeningUntilMs = 0L
+    private var lastPartialCandidate = ""
+    private var wakeWordArmedUntilMs = 0L
 
     private val logs = mutableStateListOf<String>()
     private var partialText by mutableStateOf("")
@@ -110,7 +123,9 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var requireWakeWord by mutableStateOf(true)
     private var speakingEnabled by mutableStateOf(true)
     private var isListening by mutableStateOf(false)
+    private var listeningEnabled by mutableStateOf(false)
     private var drivingModeEnabled by mutableStateOf(false)
+    private var phoneAlarmsEnabled by mutableStateOf(true)
     private var drivingCheckinMinutes by mutableStateOf(20)
     private var showRepliesPanel by mutableStateOf(false)
     private var drivingCheckinWatcherJob: Job? = null
@@ -127,12 +142,33 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        appendLog(if (granted) "Phone alarm notifications enabled" else "Phone alarm notifications denied")
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         apiBaseUrl = loadApiUrl(this)
         drivingModeEnabled = loadDrivingModeEnabled(this)
         drivingCheckinMinutes = loadDrivingCheckinMinutes(this)
+        phoneAlarmsEnabled = AlarmSyncService.isAlarmSyncEnabled(this)
+        audioManager = getSystemService(AudioManager::class.java)
+        speechFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(speechAudioAttributes())
+            .setOnAudioFocusChangeListener { }
+            .setWillPauseWhenDucked(false)
+            .build()
         tts = TextToSpeech(this, this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (phoneAlarmsEnabled) {
+            AlarmSyncService.start(this)
+        }
         if (drivingModeEnabled) {
             startDrivingCheckinWatcher()
         }
@@ -149,9 +185,17 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (drivingModeEnabled) {
+            startDrivingCheckinWatcher()
+        }
+    }
+
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts.language = Locale.US
+            tts.setAudioAttributes(speechAudioAttributes())
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     ttsSpeaking = true
@@ -159,11 +203,15 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 }
 
                 override fun onDone(utteranceId: String?) {
-                    resumeListeningAfterTts()
+                    if (utteranceId == speechSynthesisId) {
+                        playSynthesizedSpeech()
+                    }
                 }
 
                 override fun onError(utteranceId: String?) {
-                    resumeListeningAfterTts()
+                    if (utteranceId == speechSynthesisId) {
+                        finishSpeechPlayback()
+                    }
                 }
             })
             ttsReady = true
@@ -177,6 +225,11 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         super.onDestroy()
         stopListening()
         stopDrivingCheckinWatcher()
+        speechPlayer?.release()
+        speechPlayer = null
+        speechFile?.delete()
+        speechFile = null
+        abandonSpeechAudioFocus()
         tts.stop()
         tts.shutdown()
         uiScope.cancel()
@@ -225,12 +278,82 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     isListening = false
                 }
                 partialText = ""
-                tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+                tts.stop()
+                speechPlayer?.release()
+                speechPlayer = null
+                speechFile?.delete()
+                val outputFile = File.createTempFile("mina_tts_", ".wav", cacheDir)
+                val synthesisId = "${utteranceId}_synth_${System.nanoTime()}"
+                speechFile = outputFile
+                speechSynthesisId = synthesisId
+                val result = tts.synthesizeToFile(text, Bundle(), outputFile, synthesisId)
+                if (result == TextToSpeech.ERROR) {
+                    finishSpeechPlayback()
+                }
             } catch (t: Throwable) {
                 Log.e("MinaVoice", "TTS speak failed", t)
                 appendLog("TTS error: ${t.message}")
-                resumeListeningAfterTts()
+                finishSpeechPlayback()
             }
+        }
+    }
+
+    private fun playSynthesizedSpeech() {
+        runOnMain {
+            val outputFile = speechFile
+            if (outputFile == null || !outputFile.isFile) {
+                finishSpeechPlayback()
+                return@runOnMain
+            }
+            try {
+                val player = MediaPlayer().apply {
+                    setAudioAttributes(speechAudioAttributes())
+                    setDataSource(outputFile.absolutePath)
+                    setOnPreparedListener { preparedPlayer ->
+                        val focusResult = audioManager.requestAudioFocus(speechFocusRequest)
+                        if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                            appendLog("Spotify ducking request was not granted")
+                        }
+                        preparedPlayer.start()
+                    }
+                    setOnCompletionListener { finishSpeechPlayback() }
+                    setOnErrorListener { _, _, _ ->
+                        finishSpeechPlayback()
+                        true
+                    }
+                }
+                speechPlayer = player
+                player.prepareAsync()
+            } catch (t: Throwable) {
+                Log.e("MinaVoice", "Synthesized speech playback failed", t)
+                appendLog("Speech playback error: ${t.message}")
+                finishSpeechPlayback()
+            }
+        }
+    }
+
+    private fun finishSpeechPlayback() {
+        runOnMain {
+            speechPlayer?.release()
+            speechPlayer = null
+            speechFile?.delete()
+            speechFile = null
+            speechSynthesisId = null
+            abandonSpeechAudioFocus()
+            resumeListeningAfterTts()
+        }
+    }
+
+    private fun speechAudioAttributes(): AudioAttributes {
+        return AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+    }
+
+    private fun abandonSpeechAudioFocus() {
+        if (::audioManager.isInitialized && ::speechFocusRequest.isInitialized) {
+            audioManager.abandonAudioFocusRequest(speechFocusRequest)
         }
     }
 
@@ -303,13 +426,19 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }
 
         shouldKeepListening = true
+        listeningEnabled = true
         pausedForTextInput = false
 
         if (recognizer == null) {
             try {
                 recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
                 setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) {}
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        runOnMain {
+                            isListening = true
+                            startListeningPending = false
+                        }
+                    }
                     override fun onBeginningOfSpeech() {}
                     override fun onRmsChanged(rmsdB: Float) {}
                     override fun onBufferReceived(buffer: ByteArray?) {}
@@ -319,7 +448,23 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                         runOnMain {
                             isListening = false
                             startListeningPending = false
-                            queueListeningRestart(650)
+                            if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                                shouldKeepListening = false
+                                listeningEnabled = false
+                                appendLog("Microphone permission is required for listening")
+                                return@runOnMain
+                            }
+
+                            val restartDelay = when (error) {
+                                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> 900L
+                                SpeechRecognizer.ERROR_CLIENT -> 650L
+                                SpeechRecognizer.ERROR_NETWORK,
+                                SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
+                                SpeechRecognizer.ERROR_SERVER,
+                                SpeechRecognizer.ERROR_SERVER_DISCONNECTED -> 500L
+                                else -> 180L
+                            }
+                            queueListeningRestart(restartDelay)
                         }
                     }
 
@@ -333,10 +478,17 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                             isListening = false
                             startListeningPending = false
                             partialText = ""
-                            if (heardCandidates.isNotEmpty()) {
-                                processTranscriptCandidates(heardCandidates)
+                            val candidates = buildList {
+                                addAll(heardCandidates)
+                                if (lastPartialCandidate.isNotBlank()) {
+                                    add(lastPartialCandidate)
+                                }
+                            }.distinct()
+                            lastPartialCandidate = ""
+                            if (candidates.isNotEmpty()) {
+                                processTranscriptCandidates(candidates)
                             }
-                            queueListeningRestart(350)
+                            queueListeningRestart(150)
                         }
                     }
 
@@ -347,6 +499,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                             .orEmpty()
                         runOnMain {
                             partialText = next
+                            lastPartialCandidate = next
+                            if (containsWakeWord(next)) {
+                                wakeWordArmedUntilMs = System.currentTimeMillis() + WAKE_WORD_ARM_WINDOW_MS
+                            }
                         }
                     }
 
@@ -382,9 +538,9 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, Locale.US.toLanguageTag())
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1200L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1300L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1800L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2600L)
         }
         startListeningPending = true
         try {
@@ -401,6 +557,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     private fun stopListening() {
         shouldKeepListening = false
+        listeningEnabled = false
         pausedForTextInput = false
         startListeningPending = false
         restartScheduled = false
@@ -410,6 +567,8 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         recognizer?.destroy()
         recognizer = null
         partialText = ""
+        lastPartialCandidate = ""
+        wakeWordArmedUntilMs = 0L
     }
 
     private fun processTranscriptCandidates(candidates: List<String>) {
@@ -426,12 +585,35 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             .mapNotNull { extractCommandAfterWakeWord(it) }
             .firstOrNull()
 
-        if (command.isNullOrBlank()) {
-            appendLog("Wake word not detected")
+        if (!command.isNullOrBlank()) {
+            wakeWordArmedUntilMs = 0L
+            sendToMina(command)
             return
         }
 
-        sendToMina(command)
+        val now = System.currentTimeMillis()
+        val wakeOnly = candidates.any { containsWakeWord(it) }
+        if (wakeOnly) {
+            wakeWordArmedUntilMs = now + WAKE_WORD_ARM_WINDOW_MS
+            appendLog("Wake word heard - listening for command")
+            return
+        }
+
+        if (now <= wakeWordArmedUntilMs) {
+            wakeWordArmedUntilMs = 0L
+            sendToMina(primary)
+            return
+        }
+
+        appendLog("Wake word not detected")
+    }
+
+    private fun containsWakeWord(spoken: String): Boolean {
+        val tokens = Regex("[a-z0-9']+")
+            .findAll(spoken.lowercase(Locale.US))
+            .map { it.value }
+            .toList()
+        return findWakeTokenIndex(tokens) >= 0
     }
 
     private fun extractCommandAfterWakeWord(spoken: String): String? {
@@ -544,6 +726,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                         val reply = json?.optString("reply")?.takeIf { it.isNotBlank() }
                             ?: "(No reply)"
                         appendLog("Mina: $reply")
+                        syncDrivingModeFromVoiceCommand(command)
                         safeSpeak(reply, "mina-reply")
                         persistWorkingBaseUrlFrom(processUrl)
                         return@launch
@@ -557,50 +740,80 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun syncDrivingModeFromVoiceCommand(command: String) {
+        val lower = command.trim().lowercase(Locale.US)
+        val isDrivingCommand =
+            (lower.contains("driving") || lower.contains("road")) &&
+                (lower.contains("check-in") || lower.contains("check in") || lower.contains("companion"))
+        if (!isDrivingCommand) return
+
+        val stopping = listOf("stop", "disable", "turn off", "cancel").any { lower.contains(it) }
+        val starting = listOf("start", "enable", "turn on", "begin").any { lower.contains(it) }
+        if (!stopping && !starting) return
+
+        runOnMain {
+            if (stopping) {
+                drivingModeEnabled = false
+                saveDrivingModeEnabled(this, false)
+                stopDrivingCheckinWatcher()
+            } else {
+                drivingModeEnabled = true
+                saveDrivingModeEnabled(this, true)
+                startDrivingCheckinWatcher()
+            }
+        }
+    }
+
+    private suspend fun sendCompanionCommandNow(command: String, speakResult: Boolean = false): Boolean {
+        try {
+            val normalizedBase = normalizeApiBaseUrl(apiBaseUrl)
+            val processUrls = buildEndpointCandidates(normalizedBase, "/process")
+            if (processUrls.isEmpty()) {
+                appendLog("Invalid API URL: $normalizedBase")
+                return false
+            }
+            val payload = JSONObject()
+                .put("input", command)
+                .put("speak_response", false)
+                .put("input_source", "voice")
+                .toString()
+
+            var lastError: String? = null
+            for (processUrl in processUrls) {
+                val request = Request.Builder()
+                    .url(processUrl)
+                    .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        lastError = "${response.code} @ ${processUrl.encodedPath}"
+                        return@use
+                    }
+                    val json = runCatching { JSONObject(body) }.getOrNull()
+                    val reply = json?.optString("reply")?.takeIf { it.isNotBlank() }
+                        ?: "(No reply)"
+                    appendLog("Mina: $reply")
+                    if (speakResult) {
+                        safeSpeak(reply, "mina-companion")
+                    }
+                    persistWorkingBaseUrlFrom(processUrl)
+                    return true
+                }
+            }
+
+            appendLog("Companion request failed${if (lastError != null) ": $lastError" else ""}")
+        } catch (e: Exception) {
+            appendLog("Companion command error: ${e.message}")
+        }
+
+        return false
+    }
+
     private fun sendCompanionCommand(command: String, speakResult: Boolean = false) {
         ioScope.launch {
-            try {
-                val normalizedBase = normalizeApiBaseUrl(apiBaseUrl)
-                val processUrls = buildEndpointCandidates(normalizedBase, "/process")
-                if (processUrls.isEmpty()) {
-                    appendLog("Invalid API URL: $normalizedBase")
-                    return@launch
-                }
-                val payload = JSONObject()
-                    .put("input", command)
-                    .put("speak_response", false)
-                    .put("input_source", "voice")
-                    .toString()
-
-                var lastError: String? = null
-                for (processUrl in processUrls) {
-                    val request = Request.Builder()
-                        .url(processUrl)
-                        .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
-                        .build()
-
-                    httpClient.newCall(request).execute().use { response ->
-                        val body = response.body?.string().orEmpty()
-                        if (!response.isSuccessful) {
-                            lastError = "${response.code} @ ${processUrl.encodedPath}"
-                            return@use
-                        }
-                        val json = runCatching { JSONObject(body) }.getOrNull()
-                        val reply = json?.optString("reply")?.takeIf { it.isNotBlank() }
-                            ?: "(No reply)"
-                        appendLog("Mina: $reply")
-                        if (speakResult) {
-                            safeSpeak(reply, "mina-companion")
-                        }
-                        persistWorkingBaseUrlFrom(processUrl)
-                        return@launch
-                    }
-                }
-
-                appendLog("Companion request failed${if (lastError != null) ": $lastError" else ""}")
-            } catch (e: Exception) {
-                appendLog("Companion command error: ${e.message}")
-            }
+            sendCompanionCommandNow(command = command, speakResult = speakResult)
         }
     }
 
@@ -623,10 +836,130 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         } else {
             appendLog("Driving mode disabled")
             stopDrivingCheckinWatcher()
-            sendCompanionCommand(
-                command = "stop my driving check-ins",
-                speakResult = false,
-            )
+            ioScope.launch {
+                try {
+                    val stopSent = sendCompanionCommandNow(
+                        command = "stop my driving check-ins",
+                        speakResult = false,
+                    )
+                    val cleared = clearDrivingTasksNow()
+                    if (!stopSent && cleared <= 0) {
+                        appendLog("Driving stop command did not confirm; no tasks cleared")
+                    } else if (cleared > 0) {
+                        appendLog("Driving tasks cleared: $cleared")
+                    }
+                } catch (e: Exception) {
+                    appendLog("Driving stop fallback error: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private suspend fun clearDrivingTasksNow(): Int {
+        try {
+            val normalizedBase = normalizeApiBaseUrl(apiBaseUrl)
+            if (isWildcardBindAddress(normalizedBase)) {
+                return 0
+            }
+
+            val listUrls = buildEndpointCandidates(normalizedBase, "/tasks/list")
+            if (listUrls.isEmpty()) return 0
+
+            var responseJson: JSONObject? = null
+            for (listUrl in listUrls) {
+                try {
+                    val urlWithLimit = listUrl.newBuilder()
+                        .setQueryParameter("limit", DRIVING_CHECKIN_TASK_SCAN_LIMIT.toString())
+                        .build()
+                    val request = Request.Builder().url(urlWithLimit).get().build()
+
+                    httpClient.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) return@use
+                        val body = response.body?.string().orEmpty()
+                        responseJson = runCatching { JSONObject(body) }.getOrNull()
+                        if (responseJson != null) {
+                            persistWorkingBaseUrlFrom(listUrl)
+                        }
+                    }
+                    if (responseJson != null) {
+                        break
+                    }
+                } catch (_: Exception) {
+                    // Try next candidate URL; this fallback must never crash the app.
+                    continue
+                }
+            }
+
+            val payload = responseJson ?: return 0
+            val tasks = payload.optJSONArray("tasks") ?: return 0
+            var cleared = 0
+
+            for (i in 0 until tasks.length()) {
+                val task = tasks.optJSONObject(i) ?: continue
+                val status = task.optString("status", "pending").lowercase(Locale.US)
+                if (status == "done") continue
+
+                val tagsJson = task.optJSONArray("tags")
+                val tags = mutableSetOf<String>()
+                if (tagsJson != null) {
+                    for (j in 0 until tagsJson.length()) {
+                        val tag = tagsJson.optString(j, "").trim().lowercase(Locale.US)
+                        if (tag.isNotBlank()) {
+                            tags.add(tag)
+                        }
+                    }
+                }
+
+                val text = task.optString("text", "")
+                val lower = text.lowercase(Locale.US)
+                val isDriving = tags.contains("driving_checkin") ||
+                    lower.contains("driving check-in") ||
+                    (lower.contains("driving") && lower.contains("check"))
+                if (!isDriving) continue
+
+                val taskId = task.optInt("id", -1)
+                if (taskId <= 0) continue
+
+                val markUrls = buildEndpointCandidates(normalizedBase, "/tasks/mark_done")
+                if (markUrls.isEmpty()) continue
+
+                var marked = false
+                for (markUrl in markUrls) {
+                    try {
+                        val urlWithTask = markUrl.newBuilder()
+                            .setQueryParameter("task_id", taskId.toString())
+                            .build()
+                        val request = Request.Builder()
+                            .url(urlWithTask)
+                            .post("".toRequestBody("text/plain".toMediaType()))
+                            .build()
+
+                        httpClient.newCall(request).execute().use { response ->
+                            if (!response.isSuccessful) return@use
+                            val body = response.body?.string().orEmpty()
+                            val json = runCatching { JSONObject(body) }.getOrNull()
+                            if (json?.optBoolean("ok", false) == true) {
+                                persistWorkingBaseUrlFrom(markUrl)
+                                marked = true
+                            }
+                        }
+                    } catch (_: Exception) {
+                        continue
+                    }
+
+                    if (marked) {
+                        break
+                    }
+                }
+
+                if (marked) {
+                    cleared += 1
+                }
+            }
+
+            return cleared
+        } catch (_: Exception) {
+            return 0
         }
     }
 
@@ -664,7 +997,9 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
         var responseJson: JSONObject? = null
         for (listUrl in listUrls) {
-            val urlWithLimit = listUrl.newBuilder().setQueryParameter("limit", "25").build()
+            val urlWithLimit = listUrl.newBuilder()
+                .setQueryParameter("limit", DRIVING_CHECKIN_TASK_SCAN_LIMIT.toString())
+                .build()
             val request = Request.Builder().url(urlWithLimit).get().build()
 
             httpClient.newCall(request).execute().use { response ->
@@ -686,9 +1021,21 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             val due = task.optBoolean("due", false)
             if (!due) continue
 
+            val tagsJson = task.optJSONArray("tags")
+            val tags = mutableSetOf<String>()
+            if (tagsJson != null) {
+                for (j in 0 until tagsJson.length()) {
+                    val tag = tagsJson.optString(j, "").trim().lowercase(Locale.US)
+                    if (tag.isNotBlank()) {
+                        tags.add(tag)
+                    }
+                }
+            }
+
             val text = task.optString("text", "")
             val lower = text.lowercase(Locale.US)
-            val isDriving = lower.contains("driving check-in") ||
+            val isDriving = tags.contains("driving_checkin") ||
+                lower.contains("driving check-in") ||
                 (lower.contains("driving") && lower.contains("check"))
             if (!isDriving) continue
 
@@ -707,10 +1054,17 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             lastDrivingDueSignature = signature
             lastDrivingDueTriggeredAtMs = nowMs
             appendLog("Driving check-in due -> prompting Mina")
-            sendCompanionCommand(
+            val sent = sendCompanionCommandNow(
                 command = "Do my due driving check-in reminder now.",
                 speakResult = true,
             )
+            if (!sent) {
+                // Local fallback so one failed network call does not drop the reminder entirely.
+                safeSpeak(
+                    "Driving check-in. Quick reset: breathe, hydrate, and stay focused.",
+                    "driving-checkin-fallback",
+                )
+            }
             return
         }
     }
@@ -1060,15 +1414,46 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 }
 
                 item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Phone Alarms", style = MaterialTheme.typography.bodyMedium)
+                        Switch(
+                            checked = phoneAlarmsEnabled,
+                            onCheckedChange = { enabled ->
+                                phoneAlarmsEnabled = enabled
+                                AlarmSyncService.setAlarmSyncEnabled(this@MainActivity, enabled)
+                                if (enabled) {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                        ContextCompat.checkSelfPermission(
+                                            this@MainActivity,
+                                            Manifest.permission.POST_NOTIFICATIONS,
+                                        ) != PackageManager.PERMISSION_GRANTED
+                                    ) {
+                                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                    }
+                                    AlarmSyncService.start(this@MainActivity)
+                                    appendLog("Phone alarm watcher enabled")
+                                } else {
+                                    AlarmSyncService.stop(this@MainActivity)
+                                    appendLog("Phone alarm watcher disabled")
+                                }
+                            },
+                        )
+                    }
+                }
+
+                item {
                     Button(
                         modifier = Modifier.fillMaxWidth(),
                         onClick = {
                             safeUiAction("toggle_listening") {
-                                if (isListening) stopListening() else ensureAudioPermissionAndStart()
+                                if (listeningEnabled) stopListening() else ensureAudioPermissionAndStart()
                             }
                         }
                     ) {
-                        Text(if (isListening) "Stop Listening" else "Start Listening")
+                        Text(if (listeningEnabled) "Stop Listening" else "Start Listening")
                     }
                 }
 
@@ -1188,8 +1573,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         private val WAKE_PREFIXES = setOf("hey", "hi", "ok", "okay", "yo", "hello")
         private val WAKE_WORD_ALIASES = setOf("mina", "nima", "amina", "meena", "mena", "mini")
         private const val TTS_RESUME_DELAY_MS = 900L
+        private const val WAKE_WORD_ARM_WINDOW_MS = 6000L
         private const val DRIVING_CHECKIN_POLL_MS = 45000L
         private const val DRIVING_CHECKIN_TRIGGER_COOLDOWN_MS = 90000L
+        private const val DRIVING_CHECKIN_TASK_SCAN_LIMIT = 200
 
         private fun loadApiUrl(context: Context): String {
             return context.getSharedPreferences(PREFS, MODE_PRIVATE)

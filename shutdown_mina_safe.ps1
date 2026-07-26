@@ -136,11 +136,13 @@ $flushResult = $null
 $flushError = $null
 $gateResult = $null
 $gateError = $null
+$commitResult = $null
+$commitError = $null
 $guiStopped = @()
 
 # 1) Stop GUI first.
 $resolvedGuiDir = Resolve-FancyGuiDir -CliGuiDir $GuiDir
-$guiStopped = Stop-GuiProcesses -ResolvedGuiDir $resolvedGuiDir
+$guiStopped = @(Stop-GuiProcesses -ResolvedGuiDir $resolvedGuiDir)
 if ($guiStopped.Count -gt 0) {
     Write-Host "Stopped GUI processes:" ($guiStopped -join ', ')
 }
@@ -199,7 +201,26 @@ $payload = [ordered]@{
     flush_attempted         = $true
     flush_error             = $flushError
     flush_result            = $flushResult
+    shutdown_commit_error   = $null
+    shutdown_commit_result  = $null
 }
+
+try {
+    $commitUri = "$baseUrl/system/shutdown_commit"
+    $commitResult = Invoke-RestMethod -Uri $commitUri -Method Post -TimeoutSec ([Math]::Max(30, $WaitForBufferSeconds + 30))
+    if (-not $commitResult.ok) {
+        throw "Shutdown commit failed: $($commitResult.error)"
+    }
+    Write-Host "Memory close committed. Waiting for core API process to exit..."
+}
+catch {
+    $commitError = $_.Exception.Message
+    Write-Error "Aborting safe shutdown because the core did not confirm memory close: $commitError"
+    exit 3
+}
+
+$payload.shutdown_commit_error = $commitError
+$payload.shutdown_commit_result = $commitResult
 
 try {
     $payload | ConvertTo-Json -Depth 8 | Set-Content -Path $shutdownRefPath -Encoding UTF8
@@ -208,13 +229,30 @@ catch {
     Write-Warning "Could not write shutdown reference file: $($_.Exception.Message)"
 }
 
-# 2) Stop core API.
-& $stopScript -Port $Port
-$stopCode = $LASTEXITCODE
+# 2) The commit endpoint exits only after memory close and final backup finish.
+$coreExited = $false
+for ($i = 0; $i -lt 60; $i++) {
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+    if (-not $listener) {
+        $coreExited = $true
+        break
+    }
+    Start-Sleep -Milliseconds 250
+}
 
-if ($stopCode -ne 0) {
-    Write-Error "Safe shutdown stop step failed with code $stopCode"
-    exit $stopCode
+if (-not $coreExited) {
+    Write-Warning "Core remained alive after confirmed memory close; stopping the closed process."
+    & $stopScript -Port $Port
+    $stopCode = $LASTEXITCODE
+    if ($stopCode -ne 0) {
+        Write-Error "Safe shutdown stop step failed with code $stopCode"
+        exit $stopCode
+    }
+}
+else {
+    Remove-Item -Path (Join-Path $PSScriptRoot '.mk1_api.pid') -Force -ErrorAction SilentlyContinue
+    Write-Host "Core API exited after graceful memory close."
 }
 
 # 3) Stop embed/database server last.

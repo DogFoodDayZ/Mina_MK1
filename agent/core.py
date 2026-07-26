@@ -14,12 +14,14 @@ import subprocess
 import sys
 import threading
 import mimetypes
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from agent.file_intents import detect_file_directory_intent
+from agent.curiosity import AutonomousCuriosity, TOPIC_STOP_WORDS
 from agent.pending_actions import (
     PendingActionStore,
     is_directory_scan_cancel,
@@ -34,11 +36,13 @@ from agent.reflex_helpers import (
     handle_identity_reflex,
     message_choice,
 )
+from agent.ostranauts import build_ostranauts_context, is_ostranauts_query
 from config.config_loader import load_config
 from tools.tool_loader import ToolLoader
 from tools.file_access_policy import full_access_root, normalize_tool_path
 from tools.file_inspector import inspect_file, inspect_sqlite_table, is_probably_text_path
 from memory.mk1_memory import MK1Memory
+from memory.retention import is_failed_decision_text
 
 
 
@@ -822,6 +826,36 @@ class MK1Core:
                 "backup_max_total",
                 120,
             ),
+
+            retention_enabled=self.config.get(
+                "memory",
+                "retention_enabled",
+                True,
+            ),
+
+            interaction_retention_days=self.config.get(
+                "memory",
+                "interaction_retention_days",
+                90,
+            ),
+
+            failed_decision_retention_days=self.config.get(
+                "memory",
+                "failed_decision_retention_days",
+                14,
+            ),
+
+            retention_interval_seconds=self.config.get(
+                "memory",
+                "retention_interval_seconds",
+                86400,
+            ),
+
+            retention_max_delete=self.config.get(
+                "memory",
+                "retention_max_delete",
+                1000,
+            ),
         )
 
         tools_dir = self.config.get(
@@ -1115,6 +1149,25 @@ class MK1Core:
         self._intent_alias_cache_loaded = True
         self.last_active_project_path: Optional[str] = None
 
+        curiosity_roots = self.config.get("curiosity", "approved_roots", ["D:\\", "E:\\", "G:\\"])
+        if not isinstance(curiosity_roots, list):
+            curiosity_roots = ["D:\\", "E:\\", "G:\\"]
+        self.curiosity = AutonomousCuriosity(
+            memory=self.memory,
+            tools=self.tools,
+            approved_roots=curiosity_roots,
+            enabled=bool(self.config.get("curiosity", "enabled", True)),
+            idle_seconds=int(self.config.get("curiosity", "idle_seconds", 1800)),
+            local_interval_seconds=int(self.config.get("curiosity", "local_interval_seconds", 3600)),
+            news_interval_seconds=int(self.config.get("curiosity", "news_interval_seconds", 21600)),
+            work_interval_seconds=int(self.config.get("curiosity", "work_interval_seconds", 1800)),
+            max_directories_per_cycle=int(self.config.get("curiosity", "max_directories_per_cycle", 40)),
+            max_file_bytes=int(self.config.get("curiosity", "max_file_bytes", 2000000)),
+            max_work_retries=int(self.config.get("curiosity", "max_work_retries", 2)),
+            work_provider=self._autonomous_work_candidates,
+            work_executor=self._run_autonomous_work_task,
+        )
+
         self._validate_required_tool_routes()
         self._start_turn_clock_heartbeat()
         atexit.register(self.close)
@@ -1126,6 +1179,7 @@ class MK1Core:
         return os.path.join(self.workspace_root, ".mina_runtime_state.json")
 
     def _save_runtime_state(self, reason: str = "tick") -> None:
+        temp_path: Optional[str] = None
         try:
             now_iso = datetime.now().isoformat(timespec="seconds")
             reason_text = str(reason or "tick")
@@ -1144,11 +1198,23 @@ class MK1Core:
                 "idle_checkin_pending": bool(self._idle_checkin_pending),
                 "idle_checkin_due_since_at": self._idle_checkin_due_since_at,
             }
-            with open(self._runtime_state_path(), "w", encoding="utf-8") as f:
+            path = self._runtime_state_path()
+            temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
             self._runtime_state_last_written_at = now_iso
         except Exception:
             traceback.print_exc()
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except FileNotFoundError:
+                    pass
 
     def _identity_state_path(self) -> str:
         return os.path.join(self.workspace_root, ".mina_identity_state.json")
@@ -1815,7 +1881,7 @@ class MK1Core:
         if not raw:
             return ""
 
-        out = raw
+        out = self._correct_contextual_transcript(raw)
         out = re.sub(r'^\s*(?:hey\s+)?(?:you|mina)[,\s:;-]+', '', out, flags=re.IGNORECASE).strip()
         out = re.sub(
             r'^\s*(?:hey\s+)?[A-Za-z][A-Za-z0-9_-]{1,30}[,\s:;-]+(?=(?:please\s+)?(?:remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\b|in\s+\d+\s*(?:seconds?|minutes?|hours?)\b)',
@@ -1852,6 +1918,16 @@ class MK1Core:
 
         if out.lower().startswith("please "):
             out = out[7:].strip()
+        return out
+
+    def _correct_contextual_transcript(self, text: str) -> str:
+        out = str(text or "")
+        if re.search(r'\bastronauts\b', out, re.IGNORECASE) and re.search(
+            r'\b(?:steam|games?|mods?|modding|vortex|library)\b',
+            out,
+            re.IGNORECASE,
+        ):
+            return re.sub(r'\bastronauts\b', 'Ostranauts', out, flags=re.IGNORECASE)
         return out
 
     def _is_tool_self_test_request(self, text: str) -> bool:
@@ -1953,11 +2029,22 @@ class MK1Core:
         args = row.get("args", {}) if isinstance(row.get("args", {}), dict) else {}
         if not tool:
             return None
+        if tool == "spotify_link" and self._is_explicit_spotify_command(phrase):
+            return None
 
         available = getattr(self.tools, "tools", {})
         if tool.startswith("__") or tool in available:
             return tool, dict(args)
         return None
+
+    def _is_explicit_spotify_command(self, text: str) -> bool:
+        phrase = self._normalize_user_intent_text(text).lower().strip()
+        action = re.search(r"\b(add|create|make|list|show|get|play|pause|stop|resume|shuffle|search|find)\b", phrase)
+        subject = re.search(
+            r"\b(spotify|music|songs?|tracks?|play\s*lists?|albums?|artists?|liked|favorites?|favourites?)\b",
+            phrase,
+        )
+        return action is not None and subject is not None
 
     def _maybe_learn_intent_alias(
         self,
@@ -1979,6 +2066,7 @@ class MK1Core:
             "memory_write",
             "__mina_shutdown_status__",
             "__mina_shutdown__",
+            "__driving_checkin_start__",
             "__driving_checkin_stop__",
             "__task_memory_write__",
         }
@@ -1987,6 +2075,8 @@ class MK1Core:
 
         phrase = self._normalize_user_intent_text(user_input).lower().strip()
         if not phrase or len(phrase) < 8 or len(phrase) > 180:
+            return
+        if tool_name == "spotify_link" and self._is_explicit_spotify_command(phrase):
             return
         if "http://" in phrase or "https://" in phrase:
             return
@@ -2036,7 +2126,7 @@ class MK1Core:
             return None
 
         game_signals = re.search(r"\b(game|interface|integrat(?:e|ion)|build|app|ui|character|npc|mod)\b", t) is not None
-        music_signals = re.search(r"\b(song|track|playlist|spotify|music|album|artist)\b", t) is not None
+        music_signals = re.search(r"\b(song|track|play\s*list|spotify|music|album|artist)\b", t) is not None
         play_signal = re.search(r"\b(play|paly|place)\b", t) is not None
 
         if play_signal and game_signals and not music_signals:
@@ -2060,7 +2150,10 @@ class MK1Core:
         self._pending_actions.set(action_key, payload)
 
     def _get_pending_action(self, action_key: str) -> Optional[Dict[str, Any]]:
-        return self._pending_actions.get(action_key)
+        store = getattr(self, "_pending_actions", None)
+        if store is None:
+            return None
+        return store.get(action_key)
 
     def _clear_pending_action(self, action_key: str) -> None:
         self._pending_actions.clear(action_key)
@@ -2214,6 +2307,85 @@ class MK1Core:
             traceback.print_exc()
             return {"ok": False, "result": None, "error": str(e)}
 
+    def _start_driving_checkins(self, repeat_seconds: int) -> Dict[str, Any]:
+        try:
+            safe_repeat = max(300, min(6 * 3600, int(repeat_seconds or 1200)))
+            mem = getattr(self, "memory", None)
+            if mem is None or not hasattr(mem, "get_task_memories"):
+                return {"ok": False, "result": None, "error": "task_memory_not_available"}
+
+            rows = mem.get_task_memories(top_k=500, include_done=False)
+            if not isinstance(rows, list):
+                rows = []
+
+            removed = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+
+                text = str(row.get("text") or "").strip().lower()
+                tags_raw = row.get("tags")
+                tags_l: List[str] = []
+                if isinstance(tags_raw, list):
+                    for tag in tags_raw:
+                        tag_text = str(tag).strip().lower()
+                        if tag_text:
+                            tags_l.append(tag_text)
+
+                is_drive = ("driving_checkin" in tags_l) or text.startswith("driving check-in")
+                if not is_drive:
+                    continue
+
+                task_id = int(row.get("id") or 0)
+                if task_id <= 0:
+                    continue
+
+                if hasattr(mem, "set_task_status"):
+                    try:
+                        if mem.set_task_status(task_id, "done"):
+                            removed += 1
+                    except Exception:
+                        traceback.print_exc()
+
+            task_text = (
+                "Driving check-in: ask how I'm doing, remind me to hydrate, "
+                "check focus level, and keep me company for a minute."
+            )
+            due_at = time.time() + float(safe_repeat)
+            tags = [
+                "user_memory",
+                "recurring_task",
+                f"repeat_{int(safe_repeat)}s",
+                "reminder_task",
+                "driving_checkin",
+            ]
+
+            if not hasattr(mem, "add_task_memory"):
+                return {"ok": False, "result": None, "error": "task_memory_write_not_supported"}
+
+            memory_id = mem.add_task_memory(
+                task_text,
+                due_at=due_at,
+                tags=tags,
+                status="pending",
+            )
+
+            return {
+                "ok": memory_id is not None,
+                "result": {
+                    "memory_id": memory_id,
+                    "repeat_seconds": int(safe_repeat),
+                    "due_at": float(due_at),
+                    "reset_count": removed,
+                    "text": task_text,
+                    "tags": tags,
+                },
+                "error": None if memory_id is not None else "task_memory_write_failed",
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"ok": False, "result": None, "error": str(e)}
+
     def _validate_required_tool_routes(self) -> None:
         """
         Fail fast if critical intent routes are missing.
@@ -2263,16 +2435,30 @@ class MK1Core:
             if len(assistant_mem) > 1800:
                 assistant_mem = self._compress_multiline(assistant_mem, max_lines=24, max_chars=1800)
 
+            user_tags = ["short_term", "user_turn"]
+            correction_patterns = [
+                r"\bthat was (?:a|an) .{2,60} request\b",
+                r"\bi meant (?:to|that|a|an)\b",
+                r"\byou should have (?:used|called|treated|routed)\b",
+                r"\bnot .{1,40}, (?:use|do|create|run|search|read|write)\b",
+            ]
+            if any(re.search(pattern, user_mem, re.IGNORECASE) is not None for pattern in correction_patterns):
+                user_tags.extend(["user_memory", "routing_correction"])
+
+            assistant_tags = ["short_term", "assistant_turn"]
+            if is_failed_decision_text(assistant_mem):
+                assistant_tags.append("failed_decision")
+
             self.memory.add_memory(
                 user_mem,
                 kind="interaction",
-                tags=["short_term", "user_turn"],
+                tags=user_tags,
             )
 
             self.memory.add_memory(
                 assistant_mem,
                 kind="interaction",
-                tags=["short_term", "assistant_turn"],
+                tags=assistant_tags,
             )
 
             # Promote repeated short-term interaction fragments into long-term facts.
@@ -2648,6 +2834,9 @@ class MK1Core:
             return formatted
 
         if tool_name == "__task_memory_write__":
+            return formatted
+
+        if tool_name == "__driving_checkin_start__":
             return formatted
 
         if tool_name == "__driving_checkin_stop__":
@@ -3937,6 +4126,489 @@ class MK1Core:
     def _projects_root(self) -> str:
         return os.path.join(self.workspace_root, "projects")
 
+    def _autonomy_root(self) -> str:
+        return os.path.join(self.workspace_root, "autonomy")
+
+    def _autonomy_audit_path(self) -> str:
+        return os.path.join(self._autonomy_root(), "audit.jsonl")
+
+    def _watchdog_root(self) -> str:
+        configured = self.config.get(
+            "curiosity",
+            "watchdog_dir",
+            os.path.join(self.workspace_root, "mina_watchdog"),
+        )
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(str(configured))))
+
+    def _watchdog_candidate_path(self) -> str:
+        return os.path.join(self._watchdog_root(), "candidate.json")
+
+    def _write_watchdog_candidate(self, candidate: Dict[str, Any]) -> None:
+        root = self._watchdog_root()
+        os.makedirs(root, exist_ok=True)
+        path = self._watchdog_candidate_path()
+        temporary = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        payload = dict(candidate)
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+
+    def _active_watchdog_candidate(self) -> Optional[Dict[str, Any]]:
+        try:
+            with open(self._watchdog_candidate_path(), "r", encoding="utf-8") as handle:
+                candidate = json.load(handle)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(candidate, dict):
+            return None
+        if str(candidate.get("phase") or "") in {
+            "applying",
+            "pending_restart",
+            "restarting",
+            "validating",
+            "rolling_back",
+            "manual_intervention",
+        }:
+            return candidate
+        return None
+
+    @staticmethod
+    def _autonomous_path_within(path: str, root: str) -> bool:
+        candidate = os.path.normcase(os.path.abspath(str(path or "")))
+        boundary = os.path.normcase(os.path.abspath(str(root or "")))
+        if not candidate or not boundary:
+            return False
+        try:
+            return os.path.commonpath([candidate, boundary]) == boundary
+        except ValueError:
+            return False
+
+    def _autonomous_project_roots(self) -> List[str]:
+        configured = self.config.get("curiosity", "project_roots", [os.path.dirname(os.path.dirname(__file__))])
+        if not isinstance(configured, list):
+            configured = [configured]
+        roots: List[str] = []
+        for raw in configured:
+            value = str(raw or "").strip()
+            if not value:
+                continue
+            path = os.path.abspath(os.path.expandvars(os.path.expanduser(value)))
+            if path and os.path.isdir(path) and path not in roots:
+                roots.append(path)
+        return roots
+
+    def _completed_autonomy_keys(self) -> set:
+        path = self._autonomy_audit_path()
+        completed = set()
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if bool(row.get("ok")) and str(row.get("task_key") or "").strip():
+                        completed.add(str(row.get("task_key")).strip())
+        except FileNotFoundError:
+            pass
+        return completed
+
+    def _autonomous_work_candidates(self) -> List[Dict[str, Any]]:
+        completed = self._completed_autonomy_keys()
+        candidates: List[Dict[str, Any]] = []
+        todo_paths = self.config.get(
+            "curiosity",
+            "todo_paths",
+            [os.path.join(os.path.dirname(os.path.dirname(__file__)), "TODO.md")],
+        )
+        if not isinstance(todo_paths, list):
+            todo_paths = [todo_paths]
+
+        for raw_path in todo_paths:
+            path = os.path.abspath(os.path.expandvars(os.path.expanduser(str(raw_path or "").strip())))
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    lines = handle.readlines()
+            except Exception:
+                continue
+            for index, line in enumerate(lines):
+                match = re.match(r"^\s*- \[ \]\s+(.+?)\s*$", line)
+                if not match:
+                    continue
+                title = match.group(1).strip().rstrip(":")
+                details: List[str] = []
+                for following in lines[index + 1:index + 12]:
+                    if re.match(r"^\s*- \[[ xX]\]\s+", following) or following.startswith("### "):
+                        break
+                    detail_match = re.match(r"^\s{2,}-\s+(.+?)\s*$", following)
+                    if detail_match:
+                        details.append(detail_match.group(1).strip())
+                key = "todo:" + hashlib.sha1(f"{path}:{title}".encode("utf-8")).hexdigest()[:16]
+                if key not in completed:
+                    candidates.append({
+                        "key": key,
+                        "title": title,
+                        "details": details,
+                        "source": "todo",
+                        "reference": path,
+                        "project_root": next(
+                            (root for root in self._autonomous_project_roots() if self._autonomous_path_within(path, root)),
+                            "",
+                        ),
+                    })
+
+        tracker = self._load_project_tracker()
+        for project in self._projects_to_complete(tracker):
+            project_name = str(project.get("name") or "project").strip()
+            project_root = str(project.get("path") or "").strip()
+            for step in project.get("next_steps", []) if isinstance(project.get("next_steps"), list) else []:
+                title = str(step or "").strip()
+                if not title:
+                    continue
+                key = "tracker:" + hashlib.sha1(f"{project_name}:{title}".encode("utf-8")).hexdigest()[:16]
+                if key not in completed:
+                    candidates.append({
+                        "key": key,
+                        "title": title,
+                        "details": [f"Project: {project_name}"],
+                        "source": "project_tracker",
+                        "reference": self._project_tracker_path(),
+                        "project_root": project_root,
+                    })
+        return candidates
+
+    def _autonomous_context_files(self, task: Dict[str, Any], project_root: str) -> List[Dict[str, str]]:
+        task_text = " ".join([
+            str(task.get("title") or ""),
+            " ".join(task.get("details", []) if isinstance(task.get("details"), list) else []),
+        ]).lower()
+        tokens = {
+            token for token in re.findall(r"[a-z][a-z0-9_]{3,}", task_text)
+            if token not in TOPIC_STOP_WORDS
+        }
+        scored: List[Tuple[int, str]] = []
+        skipped_dirs = {".git", ".gradle", ".venv", "__pycache__", "build", "node_modules", "logs", "tmp"}
+        allowed_exts = {".py", ".ps1", ".kt", ".kts", ".json", ".md", ".js", ".jsx", ".ts", ".tsx"}
+        scanned = 0
+        for current, dirs, files in os.walk(project_root):
+            dirs[:] = [name for name in dirs if name.lower() not in skipped_dirs]
+            for name in files:
+                scanned += 1
+                if scanned > 1500:
+                    break
+                path = os.path.join(current, name)
+                if os.path.splitext(name)[1].lower() not in allowed_exts:
+                    continue
+                relative = os.path.relpath(path, project_root).lower()
+                score = sum(2 if token in os.path.basename(relative) else 1 for token in tokens if token in relative)
+                if score:
+                    scored.append((score, path))
+            if scanned > 1500:
+                break
+        reference = str(task.get("reference") or "")
+        if os.path.isfile(reference):
+            scored.append((100, reference))
+        context: List[Dict[str, str]] = []
+        seen = set()
+        for _score, path in sorted(scored, key=lambda item: (-item[0], item[1])):
+            normalized = os.path.normcase(os.path.abspath(path))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            inspected = inspect_file(path, max_chars=5000)
+            result = inspected.get("result") if isinstance(inspected, dict) else None
+            content = str(result.get("content") or "") if isinstance(result, dict) else ""
+            if content:
+                context.append({"path": path, "content": content})
+            if len(context) >= 6:
+                break
+        return context
+
+    def _parse_autonomous_model_result(self, text: str) -> Dict[str, Any]:
+        cleaned = str(text or "").strip()
+        fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned, re.IGNORECASE)
+        candidate = fenced.group(1).strip() if fenced else cleaned
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(candidate[start:end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return {"summary": cleaned[:4000], "confidence": 0.0, "patch": ""}
+
+    def _validate_autonomous_patch_paths(self, patch: str, project_root: str) -> Tuple[bool, List[str], str]:
+        paths = re.findall(r"^\+\+\+\s+(?:b/)?(.+?)\s*$", patch, flags=re.MULTILINE)
+        relative_paths = [path.strip() for path in paths if path.strip() != "/dev/null"]
+        if not relative_paths:
+            return False, [], "patch_has_no_files"
+        if re.search(r"^(?:deleted file mode|rename from|rename to|Binary files)", patch, re.MULTILINE):
+            return False, [], "destructive_or_binary_patch_not_allowed"
+        allowed_exts = {".py", ".ps1", ".kt", ".kts", ".json", ".md", ".js", ".jsx", ".ts", ".tsx"}
+        protected_paths = {
+            "config/mk1_config.json",
+            "mina_watchdog.ps1",
+            "start_mk1_api.ps1",
+            "stop_mk1_api.ps1",
+        }
+        for relative in relative_paths:
+            normalized_relative = relative.replace("\\", "/").lstrip("./").lower()
+            if (
+                normalized_relative in protected_paths
+                or normalized_relative.startswith("restore/")
+                or normalized_relative.startswith("watchdog/")
+            ):
+                return False, [], f"patch_path_is_recovery_infrastructure:{relative}"
+            target = os.path.abspath(os.path.join(project_root, relative))
+            try:
+                if not self._autonomous_path_within(target, project_root):
+                    return False, [], "patch_path_outside_project"
+            except ValueError:
+                return False, [], "patch_path_outside_project"
+            if os.path.splitext(target)[1].lower() not in allowed_exts or os.path.basename(target).lower() in {".env", ".npmrc"}:
+                return False, [], "patch_file_type_not_allowed"
+            status = subprocess.run(
+                ["git", "-C", project_root, "status", "--porcelain", "--", relative],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if status.stdout.strip():
+                return False, [], f"patch_target_has_existing_changes:{relative}"
+        return True, relative_paths, ""
+
+    def _apply_autonomous_patch(self, patch: str, project_root: str) -> Dict[str, Any]:
+        active_candidate = self._active_watchdog_candidate()
+        if active_candidate is not None:
+            return {
+                "ok": False,
+                "applied": False,
+                "error": "watchdog_candidate_already_active",
+                "candidate_id": active_candidate.get("candidate_id"),
+                "files": [],
+            }
+        allowed, relative_paths, error = self._validate_autonomous_patch_paths(patch, project_root)
+        if not allowed:
+            return {"ok": False, "applied": False, "error": error, "files": relative_paths}
+        created_files = [
+            relative for relative in relative_paths
+            if not os.path.exists(os.path.join(project_root, relative))
+        ]
+        os.makedirs(self._autonomy_root(), exist_ok=True)
+        patch_path = os.path.join(self._autonomy_root(), f"patch_{int(time.time())}_{threading.get_ident()}.diff")
+        with open(patch_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(patch)
+        try:
+            check = subprocess.run(
+                ["git", "-C", project_root, "apply", "--check", patch_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if check.returncode != 0:
+                return {"ok": False, "applied": False, "error": check.stderr.strip() or "git_apply_check_failed", "files": relative_paths}
+
+            from restore.code_backup import create_code_snapshot
+
+            backup_dir = Path(str(self.config.get(
+                "curiosity",
+                "code_backup_dir",
+                os.path.join(self.workspace_root, "mina_code_backups"),
+            )))
+            safety_snapshot = create_code_snapshot(
+                reason=f"pre_autonomous_patch:{','.join(relative_paths)}",
+                project_root=Path(project_root),
+                backup_dir=backup_dir,
+            )
+            if not safety_snapshot.get("ok"):
+                return {
+                    "ok": False,
+                    "applied": False,
+                    "error": f"pre_patch_snapshot_failed:{safety_snapshot.get('error')}",
+                    "files": relative_paths,
+                }
+            candidate_id = hashlib.sha256(
+                f"{time.time_ns()}:{patch}:{project_root}".encode("utf-8")
+            ).hexdigest()[:24]
+            candidate = {
+                "schema": 1,
+                "candidate_id": candidate_id,
+                "phase": "applying",
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "project_root": os.path.abspath(project_root),
+                "snapshot": str(safety_snapshot.get("path") or ""),
+                "files": relative_paths,
+                "created_files": created_files,
+                "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+            }
+            self._write_watchdog_candidate(candidate)
+            applied = subprocess.run(
+                ["git", "-C", project_root, "apply", patch_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if applied.returncode != 0:
+                candidate["phase"] = "apply_failed"
+                candidate["error"] = applied.stderr.strip() or "git_apply_failed"
+                self._write_watchdog_candidate(candidate)
+                return {"ok": False, "applied": False, "error": candidate["error"], "files": relative_paths, "safety_snapshot": safety_snapshot.get("path"), "candidate_id": candidate_id}
+
+            validations = []
+            diff_check = subprocess.run(
+                ["git", "-C", project_root, "diff", "--check", "--", *relative_paths],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            validations.append({"name": "git_diff_check", "ok": diff_check.returncode == 0, "output": (diff_check.stdout + diff_check.stderr).strip()[:2000]})
+            python_files = [os.path.join(project_root, path) for path in relative_paths if path.lower().endswith(".py")]
+            if python_files:
+                syntax_script = (
+                    "import ast, pathlib, sys; "
+                    "[ast.parse(pathlib.Path(p).read_text(encoding='utf-8'), filename=p) for p in sys.argv[1:]]"
+                )
+                compile_check = subprocess.run(
+                    [sys.executable, "-c", syntax_script, *python_files],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                validations.append({"name": "python_ast", "ok": compile_check.returncode == 0, "output": (compile_check.stdout + compile_check.stderr).strip()[:2000]})
+            changed_tests = [path for path in relative_paths if path.lower().endswith(".py") and os.path.basename(path).lower().startswith("test_")]
+            if changed_tests:
+                test_check = subprocess.run(
+                    [sys.executable, "-m", "pytest", "-q", *changed_tests],
+                    cwd=project_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                validations.append({"name": "pytest_changed", "ok": test_check.returncode == 0, "output": (test_check.stdout + test_check.stderr).strip()[-4000:]})
+            if not all(item["ok"] for item in validations):
+                subprocess.run(["git", "-C", project_root, "apply", "-R", patch_path], capture_output=True, timeout=30)
+                candidate["phase"] = "validation_failed_reverted"
+                candidate["validations"] = validations
+                self._write_watchdog_candidate(candidate)
+                return {"ok": False, "applied": False, "error": "validation_failed_patch_reverted", "files": relative_paths, "validations": validations, "safety_snapshot": safety_snapshot.get("path"), "candidate_id": candidate_id}
+            candidate["phase"] = "pending_restart"
+            candidate["validations"] = validations
+            self._write_watchdog_candidate(candidate)
+            return {"ok": True, "applied": True, "files": relative_paths, "validations": validations, "patch_path": patch_path, "safety_snapshot": safety_snapshot.get("path"), "candidate_id": candidate_id, "watchdog_phase": "pending_restart"}
+        finally:
+            if os.path.exists(patch_path) and not self.config.get("curiosity", "keep_patch_files", True):
+                os.remove(patch_path)
+
+    def _write_autonomy_audit(self, row: Dict[str, Any]) -> None:
+        os.makedirs(self._autonomy_root(), exist_ok=True)
+        with open(self._autonomy_audit_path(), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
+
+    def _autonomous_tool_status(self) -> Dict[str, Any]:
+        allowed = ["web_search"]
+        loaded = getattr(getattr(self, "tools", None), "tools", {})
+        available = [name for name in allowed if name in loaded]
+        return {
+            "allowed": allowed,
+            "available": available,
+            "ready": available == allowed,
+            "blocked_categories": [
+                "code_execution",
+                "file_mutation",
+                "media_control",
+                "messaging",
+                "deployment",
+                "system_control",
+            ],
+        }
+
+    def _run_autonomous_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        if name != "web_search":
+            return {"ok": False, "result": None, "error": f"autonomous_tool_not_allowed:{name}"}
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return {"ok": False, "result": None, "error": "autonomous_web_search_query_required"}
+        safe_args = {
+            "query": query[:500],
+            "max_results": max(1, min(3, int(args.get("max_results") or 3))),
+            "timeout": max(1, min(20, int(args.get("timeout") or 15))),
+            "include_content": False,
+        }
+        return self.tools.run("web_search", safe_args)
+
+    def _run_autonomous_work_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        started_at = time.time()
+        project_root = os.path.abspath(str(task.get("project_root") or "").strip())
+        allowed_roots = self._autonomous_project_roots()
+        if not project_root or not any(
+            self._autonomous_path_within(project_root, root) for root in allowed_roots
+        ):
+            result = {"ok": False, "summary": "Task has no approved project root.", "error": "project_root_not_approved"}
+            self._write_autonomy_audit({"ts": time.time(), "task_key": task.get("key"), **result})
+            return result
+
+        context_files = self._autonomous_context_files(task, project_root)
+        context_text = "\n\n".join(
+            f"FILE: {item['path']}\n{item['content']}" for item in context_files
+        )
+        research_text = ""
+        title = str(task.get("title") or "").strip()
+        if any(word in title.lower() for word in ["research", "latest", "current", "news"]):
+            research = self._run_autonomous_tool("web_search", {"query": title, "max_results": 3, "timeout": 15})
+            research_text = str(research)[:5000]
+
+        prompt = (
+            "You are Mina doing one bounded autonomous maintenance task while the user is away. "
+            "Use only the supplied evidence. Return one JSON object with keys summary (string), confidence (0 to 1), "
+            "evidence (array of strings), next_step (string), and patch (a unified git diff string or empty string). "
+            "A patch must be narrowly scoped, must not delete or rename files, and must not alter credentials, deployment, accounts, messaging, purchases, or system settings. "
+            "Prefer a useful investigation report over a speculative patch.\n\n"
+            f"TASK: {title}\nDETAILS: {json.dumps(task.get('details', []))}\nPROJECT: {project_root}\n\n"
+            f"SOURCE CONTEXT:\n{context_text[:30000]}\n\nWEB RESEARCH:\n{research_text}"
+        )
+        reply = self.model.chat([{"role": "user", "content": prompt}], temperature=0.2, tools=None)
+        model_text = self._extract_text(reply)
+        if model_text.strip().lower().startswith("(lm studio error:"):
+            result = {"ok": False, "summary": model_text.strip()[:1000], "error": "model_unavailable"}
+            self._write_autonomy_audit({"ts": time.time(), "task_key": task.get("key"), "task": task, **result})
+            return result
+        parsed = self._parse_autonomous_model_result(model_text)
+        summary = str(parsed.get("summary") or "No useful result produced.").strip()[:4000]
+        patch = str(parsed.get("patch") or "").strip()
+        patch_result: Dict[str, Any] = {"ok": True, "applied": False, "reason": "no_patch_proposed"}
+        if patch and bool(self.config.get("curiosity", "allow_source_edits", False)):
+            patch_result = self._apply_autonomous_patch(patch, project_root)
+        elif patch:
+            patch_result = {"ok": True, "applied": False, "reason": "source_edits_disabled"}
+
+        result = {
+            "ok": bool(summary) and bool(patch_result.get("ok")),
+            "summary": summary,
+            "confidence": parsed.get("confidence"),
+            "evidence": parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else [],
+            "next_step": str(parsed.get("next_step") or "").strip(),
+            "patch": patch_result,
+            "context_files": [item["path"] for item in context_files],
+            "duration_seconds": round(time.time() - started_at, 3),
+        }
+        self._write_autonomy_audit({
+            "ts": time.time(),
+            "task_key": task.get("key"),
+            "task": task,
+            **result,
+        })
+        return result
+
     def _project_tracker_path(self) -> str:
         return os.path.join(self._projects_root(), ".mina_project_tracker.json")
 
@@ -4351,6 +5023,10 @@ class MK1Core:
                     self._advance_turn_clock()
                     self._refresh_idle_checkin_state()
                     self._save_runtime_state(reason="heartbeat")
+                    idle_seconds = max(0.0, time.monotonic() - float(self._last_user_activity_monotonic))
+                    curiosity = getattr(self, "curiosity", None)
+                    if curiosity is not None:
+                        curiosity.maybe_start(idle_seconds)
                 except Exception:
                     traceback.print_exc()
 
@@ -4361,21 +5037,32 @@ class MK1Core:
         )
         self._turn_clock_thread.start()
 
-    def close(self) -> None:
+    def close(self) -> Dict[str, Any]:
         self._turn_clock_stop_event.set()
         thread = self._turn_clock_thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=1.0)
         self._save_runtime_state(reason="shutdown")
+        memory_result: Dict[str, Any] = {"ok": True, "result": None, "error": None}
         try:
             mem = getattr(self, "memory", None)
             if mem is not None:
                 if hasattr(mem, "close"):
-                    mem.close(flush_rounds=4, flush_batch_size=200)
+                    close_result = mem.close(flush_rounds=4, flush_batch_size=200)
+                    if isinstance(close_result, dict):
+                        memory_result = close_result
                 elif hasattr(mem, "flush_pending_memories"):
-                    mem.flush_pending_memories(max_items=200)
-        except Exception:
+                    flush_result = mem.flush_pending_memories(max_items=200)
+                    if isinstance(flush_result, dict):
+                        memory_result = flush_result
+        except Exception as e:
             traceback.print_exc()
+            memory_result = {"ok": False, "result": None, "error": str(e)}
+        return {
+            "ok": bool(memory_result.get("ok", False)),
+            "result": {"memory": memory_result.get("result")},
+            "error": memory_result.get("error"),
+        }
 
     def _prepare_safe_shutdown(
         self,
@@ -4406,9 +5093,41 @@ class MK1Core:
         attempts = 0
         last_pending: Optional[int] = None
         last_flush: Dict[str, Any] = {"flushed": 0, "failed": 0}
+        activity: Dict[str, Any] = {}
+
+        if hasattr(mem, "begin_shutdown_quiesce"):
+            try:
+                quiesce_result = mem.begin_shutdown_quiesce()
+                if isinstance(quiesce_result, dict):
+                    activity = quiesce_result
+            except Exception as e:
+                return {"ok": False, "result": None, "error": f"memory_quiesce_failed: {e}"}
 
         while True:
             attempts += 1
+
+            active_operations = 0
+            if hasattr(mem, "memory_activity_status"):
+                try:
+                    current_activity = mem.memory_activity_status()
+                    if isinstance(current_activity, dict):
+                        activity = current_activity
+                        active_operations = int(activity.get("active_operations") or 0)
+                except Exception:
+                    traceback.print_exc()
+
+            if active_operations > 0:
+                if time.monotonic() >= deadline:
+                    break
+                remaining = max(0.0, deadline - time.monotonic())
+                if hasattr(mem, "wait_for_memory_idle"):
+                    try:
+                        mem.wait_for_memory_idle(timeout_seconds=min(float(poll_s), remaining))
+                    except Exception:
+                        traceback.print_exc()
+                else:
+                    time.sleep(min(float(poll_s), remaining))
+                continue
 
             if hasattr(mem, "flush_pending_memories"):
                 try:
@@ -4433,13 +5152,26 @@ class MK1Core:
                     traceback.print_exc()
 
             last_pending = pending
-            if pending <= 0:
+            if hasattr(mem, "memory_activity_status"):
+                try:
+                    current_activity = mem.memory_activity_status()
+                    if isinstance(current_activity, dict):
+                        activity = current_activity
+                except Exception:
+                    traceback.print_exc()
+
+            active_operations = int(activity.get("active_operations") or 0)
+            if pending <= 0 and active_operations <= 0:
                 waited = max(0.0, time.monotonic() - started)
                 return {
                     "ok": True,
                     "result": {
                         "buffer_clear": True,
+                        "memory_idle": True,
                         "pending": 0,
+                        "active_operations": 0,
+                        "active_by_name": {},
+                        "quiescing": bool(activity.get("quiescing", False)),
                         "forced": False,
                         "attempts": attempts,
                         "waited_seconds": round(waited, 2),
@@ -4454,12 +5186,39 @@ class MK1Core:
             time.sleep(float(poll_s))
 
         waited = max(0.0, time.monotonic() - started)
+        active_operations = int(activity.get("active_operations") or 0)
+        if active_operations > 0:
+            if hasattr(mem, "resume_memory_operations"):
+                try:
+                    mem.resume_memory_operations()
+                except Exception:
+                    traceback.print_exc()
+            return {
+                "ok": False,
+                "result": {
+                    "buffer_clear": int(last_pending or 0) <= 0,
+                    "memory_idle": False,
+                    "pending": int(last_pending or 0),
+                    "active_operations": active_operations,
+                    "active_by_name": activity.get("active_by_name", {}),
+                    "forced": False,
+                    "attempts": attempts,
+                    "waited_seconds": round(waited, 2),
+                    "last_flush": last_flush,
+                },
+                "error": "active_memory_operations_not_complete",
+            }
+
         if force:
             return {
                 "ok": True,
                 "result": {
                     "buffer_clear": False,
+                    "memory_idle": True,
                     "pending": int(last_pending or 0),
+                    "active_operations": 0,
+                    "active_by_name": {},
+                    "quiescing": bool(activity.get("quiescing", False)),
                     "forced": True,
                     "attempts": attempts,
                     "waited_seconds": round(waited, 2),
@@ -4468,11 +5227,19 @@ class MK1Core:
                 "error": None,
             }
 
+        if hasattr(mem, "resume_memory_operations"):
+            try:
+                mem.resume_memory_operations()
+            except Exception:
+                traceback.print_exc()
         return {
             "ok": False,
             "result": {
                 "buffer_clear": False,
+                "memory_idle": True,
                 "pending": int(last_pending or 0),
+                "active_operations": 0,
+                "active_by_name": {},
                 "forced": False,
                 "attempts": attempts,
                 "waited_seconds": round(waited, 2),
@@ -4590,6 +5357,7 @@ class MK1Core:
             pending = 0
             warning = False
             last_flush_result: Dict[str, Any] = {}
+            activity: Dict[str, Any] = {}
             if hasattr(mem, "buffer_status"):
                 bs = mem.buffer_status()
                 if isinstance(bs, dict):
@@ -4598,11 +5366,17 @@ class MK1Core:
                     warning = bool(br.get("warning", False))
                     last_flush_result = br.get("last_flush_result", {}) if isinstance(br.get("last_flush_result"), dict) else {}
 
-            ready = pending <= 0
+            if hasattr(mem, "memory_activity_status"):
+                current_activity = mem.memory_activity_status()
+                if isinstance(current_activity, dict):
+                    activity = current_activity
+
+            active_operations = int(activity.get("active_operations") or 0)
+            ready = pending <= 0 and active_operations <= 0
             recommendation = (
-                "Buffer clear. Safe shutdown can proceed now."
+                "Memory is idle and the buffer is clear. Safe shutdown can proceed now."
                 if ready
-                else "Buffer still processing. Wait for clear or use force override if needed."
+                else "Memory is still active or buffered. Wait for all operations to complete."
             )
 
             return {
@@ -4610,7 +5384,12 @@ class MK1Core:
                 "result": {
                     "buffer_available": True,
                     "buffer_ready": ready,
+                    "memory_idle": active_operations <= 0,
                     "pending": int(pending),
+                    "active_operations": active_operations,
+                    "active_by_name": activity.get("active_by_name", {}),
+                    "quiescing": bool(activity.get("quiescing", False)),
+                    "closing": bool(activity.get("closing", False)),
                     "warning": warning,
                     "last_flush_result": last_flush_result,
                     "wait_recommendation": recommendation,
@@ -6249,6 +7028,8 @@ class MK1Core:
 
         try:
 
+            user_input = self._correct_contextual_transcript(user_input)
+
             print("\n========================================")
             print("MK1 PROCESS START")
             print("========================================")
@@ -6271,7 +7052,11 @@ class MK1Core:
             fast_command_skip_context = bool(getattr(self, "fast_command_skip_context", True))
 
             command_like = fast_command_mode and self._is_command_like_query(user_input)
-            if command_like and fast_command_skip_context:
+            ostranauts_context = build_ostranauts_context()
+            live_ostranauts_query = bool(
+                ostranauts_context and is_ostranauts_query(user_input)
+            )
+            if (command_like and fast_command_skip_context) or live_ostranauts_query:
                 context = ""
             else:
                 context = self.build_context(user_input)
@@ -6383,6 +7168,12 @@ class MK1Core:
             # =================================================
             # NORMAL MODEL FLOW
             # =================================================
+
+            if ostranauts_context:
+                messages.append({
+                    "role": "system",
+                    "content": ostranauts_context,
+                })
 
             image_meta: Optional[Dict[str, Any]] = None
             if isinstance(image_attachment, dict):
@@ -6564,7 +7355,11 @@ class MK1Core:
             self._maybe_run_maintenance_tick()
 
             command_like = self.fast_command_mode and self._is_command_like_query(user_input)
-            if command_like and self.fast_command_skip_context:
+            ostranauts_context = build_ostranauts_context()
+            live_ostranauts_query = bool(
+                ostranauts_context and is_ostranauts_query(user_input)
+            )
+            if (command_like and self.fast_command_skip_context) or live_ostranauts_query:
                 context = ""
             else:
                 context = self.build_context(user_input)
@@ -6653,6 +7448,12 @@ class MK1Core:
                 for chunk in self._iter_text_chunks(final_text):
                     yield chunk
                 return
+
+            if ostranauts_context:
+                messages.append({
+                    "role": "system",
+                    "content": ostranauts_context,
+                })
 
             image_meta: Optional[Dict[str, Any]] = None
             if isinstance(image_attachment, dict):
@@ -7565,6 +8366,29 @@ class MK1Core:
                 return "No active driving check-ins were found."
             return f"Stopped {stopped} driving check-in reminder(s)."
 
+        if tool_name == "__driving_checkin_start__":
+            if not result.get("ok"):
+                return f"Driving check-in start failed: {result.get('error')}"
+            payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+            repeat_seconds = int(payload.get("repeat_seconds") or 1200)
+            repeat_minutes = max(1, int(round(float(repeat_seconds) / 60.0)))
+            reset_count = int(payload.get("reset_count") or 0)
+            due_at = payload.get("due_at")
+
+            due_text = "soon"
+            if due_at is not None:
+                try:
+                    due_text = datetime.fromtimestamp(float(due_at)).strftime("%a %b %d %I:%M %p")
+                except Exception:
+                    due_text = str(due_at)
+
+            if reset_count > 0:
+                return (
+                    f"Driving check-ins started every {repeat_minutes} minutes. "
+                    f"Next due at {due_text}. Reset {reset_count} older driving reminder(s)."
+                )
+            return f"Driving check-ins started every {repeat_minutes} minutes. Next due at {due_text}."
+
         if tool_name == "__mina_shutdown_status__":
             if not result.get("ok"):
                 return f"Shutdown status check failed: {result.get('error')}"
@@ -8136,6 +8960,10 @@ class MK1Core:
             result = self._set_web_search_mode(str(tool_args.get("mode") or ""))
         elif tool_name == "__search_mode_get__":
             result = self._get_web_search_mode()
+        elif tool_name == "__driving_checkin_start__":
+            result = self._start_driving_checkins(
+                repeat_seconds=int(tool_args.get("repeat_seconds") or 1200),
+            )
         elif tool_name == "__driving_checkin_stop__":
             result = self._stop_driving_checkins()
         elif tool_name == "__mina_shutdown_status__":
@@ -8674,9 +9502,11 @@ IMPORTANT RULES:
         if ambiguity_prompt:
             return "__clarify_intent__", {"question": ambiguity_prompt}
 
+        recipient_pattern = r"(?:him|her|them|my\s+(?:brother|sister|mom|dad|friend|contact)|(?:brother|sister|mom|dad|friend|contact))"
         external_message_intent = (
-            re.search(r"\b(send|text|sms|message|call|phone)\b", t) is not None
-            and re.search(r"\b(to|my|him|her|them|brother|sister|mom|dad|friend|contact)\b", t) is not None
+            re.search(rf"\b(?:text|sms|call|phone|message)\s+(?:to\s+)?{recipient_pattern}\b", t) is not None
+            or re.search(rf"\bsend\b[^.?!\n]{{0,100}}\b(?:text|sms|message)\b[^.?!\n]{{0,100}}\b(?:to\s+)?{recipient_pattern}\b", t) is not None
+            or re.search(rf"\bsend\s+{recipient_pattern}\b[^.?!\n]{{0,100}}\b(?:text|sms|message)\b", t) is not None
         )
         if external_message_intent:
             tool_names = set(getattr(self.tools, "tools", {}).keys())
@@ -8856,6 +9686,24 @@ IMPORTANT RULES:
             track_words = re.search(r"\b(tracks?|songs?)\b", t_spotify) is not None
 
             # Create playlist intent, optionally seeded with one or more track queries.
+            conversational_create_playlist_match = re.search(
+                r"\b(?:we\s+need|i\s+(?:want|need)|make)\s+(?:an?\s+)?(.+?)\s+play\s*list\s*,?\s*"
+                r"(?:can|could|would)\s+you\s+create\s+(?:one|it)(?:\s+with\s+(.+?))?\s*[?.!]*$",
+                raw_text,
+                re.IGNORECASE,
+            )
+            if conversational_create_playlist_match:
+                playlist_name = str(conversational_create_playlist_match.group(1) or "").strip(" ,:;.-\"'")
+                seed_query = str(conversational_create_playlist_match.group(2) or "").strip(" ,:;.-\"'")
+                if playlist_name:
+                    args: Dict[str, Any] = {
+                        "action": "create_playlist",
+                        "playlist_name": playlist_name,
+                    }
+                    if seed_query:
+                        args["track_queries"] = seed_query
+                    return "spotify_link", args
+
             create_playlist_match = re.search(
                 r"\bcreate\s+(?:a\s+)?(?:new\s+)?(?:spotify\s+)?playlist\s+(?:called|named)?\s*[\"']?([^\"'.,]+?)[\"']?(?:\s+(?:and|then)\s+add\s+(?:song|track)\s+(.+))?$",
                 raw_text,
@@ -8872,6 +9720,25 @@ IMPORTANT RULES:
                     if seed_query:
                         args["track_queries"] = seed_query
                     return "spotify_link", args
+
+            # Add a requested number of search results to an existing playlist.
+            add_tracks_match = re.search(
+                r"\badd\s+(\d{1,2})\s+(.+?)\s+tracks?\s+to\s+(?:my\s+)?(?:spotify\s+)?"
+                r"[\"']?(.+?)\s+play\s*list[\"']?\s*[?.!]*$",
+                raw_text,
+                re.IGNORECASE,
+            )
+            if add_tracks_match:
+                limit = max(1, min(50, int(add_tracks_match.group(1))))
+                track_query = str(add_tracks_match.group(2) or "").strip(" ,:;.-\"'")
+                playlist_name = str(add_tracks_match.group(3) or "").strip(" ,:;.-\"'")
+                if track_query and playlist_name:
+                    return "spotify_link", {
+                        "action": "add_tracks_to_playlist",
+                        "playlist_name": playlist_name,
+                        "track_query": track_query,
+                        "limit": limit,
+                    }
 
             # Add track to existing playlist by name.
             add_track_match = re.search(
@@ -9206,8 +10073,8 @@ IMPORTANT RULES:
                 ]
 
                 alarm_relative_patterns = [
-                    r"^(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)\s+(?:to\s+)?(?:go\s+off\s+)?(?:in|for)\s+(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)(?:\s*(?:from\s+now)?)?(?:\s*(?:for|about|to)\s+(?P<task>.+))?$",
-                    r"^in\s+(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)\s+(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)(?:\s*(?:for|about|to)\s+(?P<task>.+))?$",
+                    r"^(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)\s+(?:to\s+)?(?:go\s+off\s+)?(?:in|for)\s+(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)(?:\s+from\s+now)?(?:\s+(?:(?:for|about|to|called|named|labelled|labeled)\s+)?(?P<task>.+))?$",
+                    r"^in\s+(?P<num>\d+)\s*(?P<unit>seconds?|minutes?|hours?)\s+(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)(?:\s+(?:(?:for|about|to|called|named|labelled|labeled)\s+)?(?P<task>.+))?$",
                 ]
 
                 for parse_text in parse_inputs:
@@ -9552,16 +10419,8 @@ IMPORTANT RULES:
             repeat_seconds = amount * 60 if unit_text.startswith("minute") else amount * 3600
             repeat_seconds = max(300, min(6 * 3600, repeat_seconds))
 
-            task_text = (
-                "Driving check-in: ask how I'm doing, remind me to hydrate, "
-                "check focus level, and keep me company for a minute."
-            )
-
-            return "__task_memory_write__", {
-                "text": task_text,
-                "due_at": time.time() + float(repeat_seconds),
-                "tags": ["user_memory", "recurring_task", f"repeat_{int(repeat_seconds)}s", "reminder_task", "driving_checkin"],
-                "status": "pending",
+            return "__driving_checkin_start__", {
+                "repeat_seconds": int(repeat_seconds),
             }
 
         shutdown_phrase = re.search(r"\b(?:shutdown|shut\s*down|power\s*down|go\s+offline|safe\s+shutdown|stop)\b", t)

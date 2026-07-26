@@ -103,6 +103,16 @@ if (-not (Test-Path $src)) {
     throw "Source directory not found: $src"
 }
 
+$excludedSourceDirs = @(
+    (Join-Path $src '.git'),
+    (Join-Path $src '.gradle'),
+    (Join-Path $src '.artifacts'),
+    (Join-Path $src '.kotlin'),
+    (Join-Path $src '.idea'),
+    (Join-Path $src 'build'),
+    (Join-Path $src 'app\build')
+)
+
 $dst = Join-Path $root $WorkDir
 if (Test-Path $dst) {
     if (-not $Force) {
@@ -114,7 +124,7 @@ if (Test-Path $dst) {
 New-Item -Path $dst -ItemType Directory | Out-Null
 
 # Copy Android app project only. Exclude common local/build folders.
-$null = robocopy $src $dst /E /NFL /NDL /NJH /NJS /NP /XD .git .gradle .artifacts build app\build .idea /XF local.properties *.keystore *.jks *.p12 *.pem *.key .env .env.local google-services.json
+$null = robocopy $src $dst /E /NFL /NDL /NJH /NJS /NP /XD $excludedSourceDirs /XF local.properties *.keystore *.jks *.p12 *.pem *.key .env .env.local google-services.json
 if ($LASTEXITCODE -ge 8) {
     throw "robocopy failed with exit code $LASTEXITCODE"
 }
@@ -125,6 +135,7 @@ Remove-SensitiveFiles -Path $dst
 $gitignore = @(
     '.gradle/'
     '.artifacts/'
+    '.kotlin/'
     'build/'
     'app/build/'
     'local.properties'

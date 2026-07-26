@@ -114,7 +114,7 @@ if (Test-Path $dst) {
 New-Item -Path $dst -ItemType Directory | Out-Null
 
 # Copy Android app project only. Exclude common local/build folders.
-$null = robocopy $src $dst /E /NFL /NDL /NJH /NJS /NP /XD .git .gradle build app\build .idea /XF local.properties *.keystore *.jks *.p12 *.pem *.key .env .env.local google-services.json
+$null = robocopy $src $dst /E /NFL /NDL /NJH /NJS /NP /XD .git .gradle .artifacts build app\build .idea /XF local.properties *.keystore *.jks *.p12 *.pem *.key .env .env.local google-services.json
 if ($LASTEXITCODE -ge 8) {
     throw "robocopy failed with exit code $LASTEXITCODE"
 }
@@ -124,6 +124,7 @@ Remove-SensitiveFiles -Path $dst
 # Add a focused gitignore for Android builds.
 $gitignore = @(
     '.gradle/'
+    '.artifacts/'
     'build/'
     'app/build/'
     'local.properties'

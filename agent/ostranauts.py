@@ -4,7 +4,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 APP_ID = "1022980"
@@ -12,12 +12,179 @@ MAX_TELEMETRY_BYTES = 1024 * 1024
 FRESH_SECONDS = 10.0
 
 
+_CALIBRATION_CATEGORIES = (
+    "skills",
+    "training",
+    "traits",
+    "needs_mood",
+    "injuries_health",
+    "identity_flags",
+    "plot_flags",
+    "hidden_internal",
+    "unknown",
+)
+
+
+def _normalize_condition_name(name: Any) -> str:
+    return str(name or "").strip()
+
+
+def _classify_condition(condition: Dict[str, Any]) -> str:
+    name = _normalize_condition_name(condition.get("name"))
+    lowered = name.lower()
+    friendly = str(condition.get("friendly_name") or "").strip()
+    description = str(condition.get("description") or "").strip()
+    negative = bool(condition.get("negative"))
+    fatal = bool(condition.get("fatal"))
+    knockout = bool(condition.get("knockout"))
+
+    if lowered.startswith("plot_"):
+        return "plot_flags"
+    if lowered.startswith("skill"):
+        return "skills"
+    if lowered.startswith("dctraining") or lowered.startswith("stattraining"):
+        return "training"
+    if "trait" in lowered:
+        return "traits"
+
+    if negative or fatal or knockout:
+        return "injuries_health"
+
+    need_tokens = (
+        "hygiene",
+        "hydration",
+        "fatigue",
+        "food",
+        "heat",
+        "blood",
+        "infection",
+        "pain",
+        "stress",
+        "morale",
+        "hunger",
+        "thirst",
+        "oxygen",
+        "toxic",
+        "rad",
+        "injur",
+        "wound",
+    )
+    if any(token in lowered for token in need_tokens):
+        return "needs_mood" if ("rate" in lowered or "coeff" in lowered) else "injuries_health"
+
+    if lowered.startswith("is"):
+        if friendly or description:
+            return "identity_flags"
+        return "hidden_internal"
+
+    if lowered.startswith("stat"):
+        # Stats with no display metadata are often internal mechanics.
+        if not (friendly or description):
+            return "hidden_internal"
+        return "needs_mood"
+
+    return "unknown"
+
+
+def _calibrate_character_conditions(character: Dict[str, Any], max_examples: int = 6) -> Dict[str, Any]:
+    rows = character.get("conditions") if isinstance(character.get("conditions"), list) else []
+    counts: Dict[str, int] = {k: 0 for k in _CALIBRATION_CATEGORIES}
+    examples: Dict[str, List[str]] = {k: [] for k in _CALIBRATION_CATEGORIES}
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        category = _classify_condition(row)
+        if category not in counts:
+            category = "unknown"
+        counts[category] += 1
+        name = _normalize_condition_name(row.get("name"))
+        if name and len(examples[category]) < max_examples and name not in examples[category]:
+            examples[category].append(name)
+
+    nonzero = {
+        key: value for key, value in counts.items() if int(value) > 0
+    }
+    nonzero_examples = {
+        key: value for key, value in examples.items() if value
+    }
+    return {
+        "condition_total": sum(counts.values()),
+        "counts": nonzero,
+        "examples": nonzero_examples,
+    }
+
+
+def _build_condition_calibration(telemetry: Dict[str, Any], max_crew: int = 6) -> Dict[str, Any]:
+    entities: List[Dict[str, Any]] = []
+
+    player = telemetry.get("player")
+    if isinstance(player, dict):
+        entities.append(
+            {
+                "entity": str(player.get("name") or "player").strip() or "player",
+                "life_state": _character_life_state(player),
+                **_calibrate_character_conditions(player),
+            }
+        )
+
+    crew = telemetry.get("crew")
+    if isinstance(crew, list):
+        for member in crew[: max(1, int(max_crew))]:
+            if not isinstance(member, dict):
+                continue
+            entities.append(
+                {
+                    "entity": str(member.get("name") or "crew").strip() or "crew",
+                    "life_state": _character_life_state(member),
+                    **_calibrate_character_conditions(member),
+                }
+            )
+
+    return {
+        "schema_version": telemetry.get("schema_version"),
+        "entity_count": len(entities),
+        "entities": entities,
+        "note": (
+            "Preliminary condition calibration based on condition names plus available metadata. "
+            "Use as read-only guidance; unknown/internal items remain unclassified until schema 4 metadata is live."
+        ),
+    }
+
+
 def is_ostranauts_query(text: str) -> bool:
     normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return False
+
+    direct_name_signals = (
+        "ostranauts",
+        "ostranaut",
+        "ostanauts",
+        "ostanaut",
+        "ostronauts",
+        "ostronaut",
+        "ostranaughts",
+        "ostranaught",
+    )
+    if any(phrase in normalized for phrase in direct_name_signals):
+        return True
+
+    game_context = (
+        "steam",
+        "game",
+        "objective",
+        "crew",
+        "ship",
+        "bepinex",
+        "telemetry",
+    )
+    if "astronauts" in normalized and any(token in normalized for token in game_context):
+        return True
+
     return any(
         phrase in normalized
         for phrase in (
-            "ostranauts",
             "active objective",
             "game objective",
             "game state",
@@ -75,18 +242,42 @@ def get_ostranauts_status(
     resolved_game = Path(game_dir).resolve() if game_dir is not None else discover_ostranauts_dir()
     resolved_telemetry = Path(telemetry_path).resolve() if telemetry_path is not None else _telemetry_path(resolved_game)
     current_time = float(now if now is not None else time.time())
+    telemetry_exists = bool(resolved_telemetry and resolved_telemetry.is_file())
+    telemetry_size_bytes: Optional[int] = None
+    telemetry_written_at_unix: Optional[float] = None
+
+    game_installed = bool(resolved_game and (resolved_game / "Ostranauts.exe").is_file())
+    bepinex_installed = bool(resolved_game and (resolved_game / "BepInEx" / "core" / "BepInEx.dll").is_file())
+    plugin_installed = bool(resolved_game and (resolved_game / "BepInEx" / "plugins" / "MinaOstranauts.dll").is_file())
 
     payload: Dict[str, Any] = {
         "ok": True,
-        "installed": bool(resolved_game and (resolved_game / "Ostranauts.exe").is_file()),
+        "installed": game_installed,
         "game_dir": str(resolved_game) if resolved_game else None,
-        "bepinex_installed": bool(resolved_game and (resolved_game / "BepInEx" / "core" / "BepInEx.dll").is_file()),
-        "plugin_installed": bool(resolved_game and (resolved_game / "BepInEx" / "plugins" / "MinaOstranauts.dll").is_file()),
+        "bepinex_installed": bepinex_installed,
+        "plugin_installed": plugin_installed,
         "telemetry_path": str(resolved_telemetry) if resolved_telemetry else None,
         "telemetry_online": False,
         "telemetry_age_seconds": None,
         "telemetry": None,
+        "condition_calibration": None,
         "error": None,
+        "source_freshness": {
+            "evaluated_at_unix": current_time,
+            "fresh_seconds_threshold": FRESH_SECONDS,
+            "telemetry": {
+                "exists": telemetry_exists,
+                "size_bytes": telemetry_size_bytes,
+                "written_at_unix": telemetry_written_at_unix,
+                "age_seconds": None,
+                "online": False,
+            },
+            "sources": {
+                "game_exe": game_installed,
+                "bepinex_core": bepinex_installed,
+                "mina_plugin": plugin_installed,
+            },
+        },
     }
 
     if resolved_telemetry is None or not resolved_telemetry.is_file():
@@ -94,6 +285,8 @@ def get_ostranauts_status(
 
     try:
         size = resolved_telemetry.stat().st_size
+        telemetry_size_bytes = int(size)
+        payload["source_freshness"]["telemetry"]["size_bytes"] = telemetry_size_bytes
         if size <= 0 or size > MAX_TELEMETRY_BYTES:
             payload["error"] = "telemetry_size_invalid"
             return payload
@@ -104,14 +297,34 @@ def get_ostranauts_status(
             return payload
 
         written_at = float(parsed.get("written_at_unix") or resolved_telemetry.stat().st_mtime)
+        telemetry_written_at_unix = written_at
         age = max(0.0, current_time - written_at)
         payload["telemetry"] = parsed
+        payload["condition_calibration"] = _build_condition_calibration(parsed)
         payload["telemetry_age_seconds"] = round(age, 2)
         payload["telemetry_online"] = age <= FRESH_SECONDS
+        payload["source_freshness"]["telemetry"]["written_at_unix"] = telemetry_written_at_unix
+        payload["source_freshness"]["telemetry"]["age_seconds"] = payload["telemetry_age_seconds"]
+        payload["source_freshness"]["telemetry"]["online"] = payload["telemetry_online"]
         return payload
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         payload["error"] = f"telemetry_read_failed: {exc}"
         return payload
+
+
+def _character_life_state(character: Dict[str, Any]) -> str:
+    if character.get("destroyed") is True:
+        return "destroyed"
+    if character.get("alive") is True:
+        return "living"
+    if character.get("alive") is False:
+        return "deceased/remains"
+    return "unknown"
+
+
+def _format_character(character: Dict[str, Any]) -> str:
+    name = str(character.get("name") or "unknown").strip()
+    return f"{name} ({_character_life_state(character)})"
 
 
 def format_ostranauts_context(status: Dict[str, Any], max_objectives: int = 20) -> str:
@@ -128,15 +341,19 @@ def format_ostranauts_context(status: Dict[str, Any], max_objectives: int = 20) 
         f"- Game focused: {bool(telemetry.get('game_focused'))}",
     ]
 
+    player = telemetry.get("player")
+    if isinstance(player, dict):
+        lines.append(f"- Player: {_format_character(player)}")
+
     crew = telemetry.get("crew")
     if isinstance(crew, list) and crew:
-        crew_names = [
-            str(member.get("name") or "unknown").strip()
+        crew_entries = [
+            _format_character(member)
             for member in crew
             if isinstance(member, dict)
         ]
-        if crew_names:
-            lines.append(f"- Crew: {', '.join(crew_names[:8])}")
+        if crew_entries:
+            lines.append(f"- Crew collection: {', '.join(crew_entries[:8])}")
 
     objectives = telemetry.get("objectives")
     active_objectives = []
@@ -168,6 +385,18 @@ def format_ostranauts_context(status: Dict[str, Any], max_objectives: int = 20) 
     diagnostics = telemetry.get("diagnostics")
     if isinstance(diagnostics, list) and diagnostics:
         lines.append(f"- Unavailable data: {', '.join(str(item) for item in diagnostics[:8])}")
+
+    calibration = status.get("condition_calibration")
+    if isinstance(calibration, dict):
+        entities = calibration.get("entities") if isinstance(calibration.get("entities"), list) else []
+        if entities:
+            primary = entities[0] if isinstance(entities[0], dict) else {}
+            primary_name = str(primary.get("entity") or "player")
+            counts = primary.get("counts") if isinstance(primary.get("counts"), dict) else {}
+            if counts:
+                top = sorted(counts.items(), key=lambda item: (-int(item[1]), str(item[0])))[:4]
+                summary = ", ".join(f"{k}={v}" for k, v in top)
+                lines.append(f"- Condition calibration ({primary_name}): {summary}")
 
     lines.append(
         "For Ostranauts questions, use only these observed facts; do not add names or details "

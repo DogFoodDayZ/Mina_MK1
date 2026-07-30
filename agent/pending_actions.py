@@ -50,7 +50,10 @@ def is_write_authorization_confirmation(text: str) -> bool:
         return False
     if low in {"yes", "y", "yep", "yeah", "ok", "okay", "do it", "proceed", "continue", "allow", "authorize", "authorise"}:
         return True
-    return re.search(r"\b(authorize|authorise|approve|approved|allow|proceed|continue|go\s+ahead)\b", low) is not None
+    return re.search(
+        r"\b(authorize|authorise|approve|approved|allow|proceed|continue|go\s+ahead|run\s+(?:the\s+)?command|execute\s+(?:the\s+)?command|run\s+it|execute\s+it)\b",
+        low,
+    ) is not None
 
 
 def is_write_authorization_cancel(text: str) -> bool:

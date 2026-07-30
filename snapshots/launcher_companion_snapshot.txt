@@ -1,0 +1,6 @@
+﻿ Write-Output '--- tray launcher registry ---'; reg query 
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v MinaTrayLauncher; 
+Write-Output '--- launcher batch ---'; Get-Content .\Start Mina Tray.cmd; 
+Write-Output '--- tray deps ---'; .\.venv\Scripts\python.exe -c "import 
+pystray, PIL; print('tray deps ok')"; Write-Output '--- companion build ---'; 
+Set-Location -LiteralPath 'C:\dev\mina-gui'; npm run build --silent 

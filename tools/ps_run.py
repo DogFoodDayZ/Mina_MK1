@@ -28,6 +28,29 @@ def _normalize_command(script: str) -> str:
     elif lowered.startswith("ps:"):
         text = text.split(":", 1)[1].strip()
 
+    text = re.sub(
+        r"^(?:yes|yeah|yep|ok|okay|sure|please|let'?s|lets)\b(?:\s+let'?s\b)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Drop conversational prefixes so natural chat prompts can still execute.
+    text = re.sub(
+        r"^(?:[a-z0-9_]+\s+)?(?:hey|hi|hello|yo|sup)\b[\s,.:!-]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    text = re.sub(
+        r"^(?:mina|travis|assistant|buddy|hottie)\b[\s,.:!-]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    lowered = text.lower().strip()
+
     if lowered in {"hardware info", "list hardware", "list the current hardware"}:
         return "Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsHardwareAbstractionLayer"
 
@@ -35,6 +58,9 @@ def _normalize_command(script: str) -> str:
         return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
 
     if lowered in {"cpu info", "processor info"}:
+        return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
+
+    if lowered in {"get-processor", "get processor", "get cpu", "get-cpu"}:
         return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
 
     if lowered in {"memory info", "ram info"}:
@@ -48,6 +74,32 @@ def _normalize_command(script: str) -> str:
 
     if lowered in {"what date is it", "current date", "today's date", "todays date"}:
         return "Get-Date -Format \"yyyy-MM-dd\""
+
+    if re.search(r"\bcpu\b", lowered) and re.search(r"\bgpu\b", lowered):
+        return (
+            "$cpu = Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed; "
+            "$gpu = Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM; "
+            "Write-Output 'CPU:'; $cpu; Write-Output ''; Write-Output 'GPU:'; $gpu"
+        )
+
+    if re.search(r"\b(cpu|processor)\b", lowered) and re.search(r"\b(speed|clock|ghz|cores?|usage|use\s*%|percent|load|ping)\b", lowered):
+        return (
+            "$cpu = Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed; "
+            "$load = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average; "
+            "$cpu | Select-Object Name, NumberOfCores, MaxClockSpeed, @{Name='LoadPercent';Expression={[math]::Round($load,1)}}"
+        )
+
+    if re.search(r"\btell\s+me\s+about\b", lowered) and re.search(r"\b(cpu|gpu|processor|graphics)\b", lowered):
+        if re.search(r"\bcpu\b", lowered) and re.search(r"\bgpu\b", lowered):
+            return (
+                "$cpu = Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed; "
+                "$gpu = Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM; "
+                "Write-Output 'CPU:'; $cpu; Write-Output ''; Write-Output 'GPU:'; $gpu"
+            )
+        if re.search(r"\bcpu\b|\bprocessor\b", lowered):
+            return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
+        if re.search(r"\bgpu\b|\bgraphics\b", lowered):
+            return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
 
     if re.search(r"\bwhat\b.*\bcpu\b", lowered):
         return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
@@ -66,6 +118,9 @@ def _normalize_command(script: str) -> str:
 
     if re.search(r"\b(what|current)\b.*\bdate\b", lowered):
         return "Get-Date -Format \"yyyy-MM-dd\""
+
+    if re.search(r"\b(probe|check|inspect|query|scan)\b.*\b(cpu|processor)\b", lowered) or re.search(r"\b(cpu|processor)\b.*\b(probe|check|inspect|query|scan)\b", lowered):
+        return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
 
     if re.search(r"\b(run|execute|show|list|get)\b", lowered):
         if "powershell" in lowered or "ps" in lowered:

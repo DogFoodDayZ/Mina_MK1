@@ -1287,6 +1287,10 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     in_args = args if isinstance(args, dict) else {}
     action = str(in_args.get("action") or "").strip().lower()
 
+    # Compatibility aliases for common model/tool-call variants.
+    if action in {"now_playing", "currently_playing", "what_is_playing", "current_song"}:
+        action = "current_playback"
+
     # Some models emit shorthand calls such as:
     # call:spotify_link{library:'true', track_selection:'random'}
     # Infer the intended action instead of hard-failing.

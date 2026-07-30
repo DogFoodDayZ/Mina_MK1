@@ -157,7 +157,11 @@ def test_autonomous_patch_refuses_recovery_infrastructure(tmp_path):
 
 
 class FakeModel:
+    def __init__(self):
+        self.chat_kwargs = None
+
     def chat(self, _messages, **_kwargs):
+        self.chat_kwargs = _kwargs
         return {
             "choices": [{
                 "message": {
@@ -229,6 +233,8 @@ def test_autonomous_executor_writes_structured_audit(tmp_path):
 
     assert result["ok"] is True
     assert result["summary"] == "Found a bounded improvement."
+    assert core.model.chat_kwargs["allow_fallback"] is False
+    assert core.model.chat_kwargs["allow_model_load"] is False
     audit_rows = [json.loads(line) for line in Path(core._autonomy_audit_path()).read_text(encoding="utf-8").splitlines()]
     assert audit_rows[0]["task_key"] == "todo:improve-worker"
     assert audit_rows[0]["evidence"] == ["sample.py contains the relevant implementation"]

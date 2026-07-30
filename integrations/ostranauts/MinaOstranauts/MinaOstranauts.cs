@@ -13,7 +13,7 @@ namespace Mina.Ostranauts
     {
         public const string PluginGuid = "com.mina.ostranauts.bridge";
         public const string PluginName = "Mina Ostranauts Bridge";
-        public const string PluginVersion = "0.3.0";
+        public const string PluginVersion = "0.6.0";
 
         private string telemetryDirectory;
         private string telemetryPath;
@@ -35,7 +35,7 @@ namespace Mina.Ostranauts
                 return;
             }
 
-            nextWriteAt = Time.realtimeSinceStartup + 2f;
+            nextWriteAt = Time.realtimeSinceStartup + 5f;
             WriteSnapshot("online");
         }
 
@@ -51,7 +51,7 @@ namespace Mina.Ostranauts
                 var scene = SceneManager.GetActiveScene();
                 var snapshot = new JObject
                 {
-                    ["schema_version"] = 3,
+                    ["schema_version"] = 6,
                     ["written_at_unix"] = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds,
                     ["bridge"] = bridgeState,
                     ["read_only"] = true,

@@ -183,6 +183,11 @@ def detect_file_directory_intent(core: Any, text: str, raw_text: str, t: str) ->
                 m = re.search(r'\brename\s+[A-Za-z]:\\[^\s,]+\s+to\s+([^\s,]+)', text, re.IGNORECASE)
             if m:
                 dst = m.group(1).strip()
+        # Guard against false positives from generic phrasing such as
+        # "create and save a program to rename files..." where no concrete
+        # source/destination paths are present.
+        if not src or not dst:
+            return None
         if src and dst and not os.path.isabs(dst):
             dst = os.path.join(os.path.dirname(src), dst)
         return "file_move", {"src": src, "dst": dst}

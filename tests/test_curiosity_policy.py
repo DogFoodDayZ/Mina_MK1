@@ -39,6 +39,21 @@ class FakeMemory:
         return len(self.writes)
 
 
+class FakeTools:
+    def __init__(self, rows):
+        self.tools = {"web_search": object()}
+        self._rows = rows
+        self.queries = []
+
+    def run(self, name, args):
+        self.queries.append((name, dict(args or {})))
+        return {
+            "ok": True,
+            "result": {"results": list(self._rows)},
+            "error": None,
+        }
+
+
 def test_useful_work_runs_without_conversation_topics_and_is_deduplicated():
     memory = FakeMemory()
     executions = []
@@ -74,3 +89,41 @@ def test_failed_useful_work_stops_after_retry_limit():
         curiosity._run_cycle(do_local=False, do_news=False, do_work=True)
 
     assert len(executions) == 2
+
+
+def test_news_scan_accepts_ostranauts_wiki_results_and_stores_memory():
+    memory = FakeMemory()
+    tools = FakeTools([
+        {
+            "title": "Ostranauts Wiki - Medical Bay",
+            "url": "https://ostranauts.wiki.gg/wiki/Medical_Bay",
+            "snippet": "Ship module details and gameplay notes.",
+        }
+    ])
+    curiosity = AutonomousCuriosity(memory=memory, tools=tools, approved_roots=ROOTS)
+
+    curiosity._scan_news(["unrelatedtopic"])
+
+    assert len(memory.writes) == 1
+    assert memory.writes[0]["tags"] == ["autonomous_curiosity", "relevant_discovery", "news"]
+    assert "ostranauts.wiki.gg" in memory.writes[0]["text"].lower()
+    assert tools.queries
+
+
+def test_news_scan_accepts_coding_reference_results_and_stores_memory():
+    memory = FakeMemory()
+    tools = FakeTools([
+        {
+            "title": "Python docs - sqlite3 module",
+            "url": "https://docs.python.org/3/library/sqlite3.html",
+            "snippet": "sqlite3 is a DB-API 2.0 interface for SQLite databases.",
+        }
+    ])
+    curiosity = AutonomousCuriosity(memory=memory, tools=tools, approved_roots=ROOTS)
+
+    curiosity._scan_news(["unrelatedtopic"])
+
+    assert len(memory.writes) == 1
+    assert memory.writes[0]["tags"] == ["autonomous_curiosity", "relevant_discovery", "news"]
+    assert "docs.python.org" in memory.writes[0]["text"].lower()
+    assert tools.queries

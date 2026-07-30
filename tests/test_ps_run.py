@@ -48,7 +48,7 @@ def test_core_detects_system_queries_for_ps_run():
     core = MK1Core()
     name, args = core.detect_tool_intent('what system am i running on?')
     assert name == 'ps_run'
-    assert args['script'] == 'what system am i running on?'
+    assert 'Get-ComputerInfo' in args['script']
 
 
 def test_ps_run_rejects_unapproved_directory_paths():
@@ -57,8 +57,55 @@ def test_ps_run_rejects_unapproved_directory_paths():
     assert 'approved' in result['error'].lower()
 
 
+def test_core_formats_failed_powershell_with_stderr():
+    core = MK1Core()
+    formatted = core._format_tool_result(
+        'ps_run',
+        {
+            'ok': False,
+            'error': "Get-Processor : The term 'Get-Processor' is not recognized",
+            'result': {
+                'stdout': '',
+                'stderr': "Get-Processor : The term 'Get-Processor' is not recognized",
+                'exit_code': 1,
+            },
+        },
+    )
+    assert 'STDERR:' in formatted
+    assert 'Get-Processor' in formatted
+
+
+def test_core_formats_generic_failed_tool_with_stderr():
+    core = MK1Core()
+    formatted = core._format_tool_result(
+        'mystery_tool',
+        {
+            'ok': False,
+            'error': 'command rejected',
+            'result': {
+                'stdout': '',
+                'stderr': 'permission denied',
+                'status': 'denied',
+            },
+        },
+    )
+    assert 'mystery_tool failed' in formatted
+    assert 'STDERR:' in formatted
+    assert 'permission denied' in formatted
+
+
 def test_normalize_command_maps_natural_cpu_question():
     cmd = ps_run._normalize_command("what cpu are you on?")
+    assert "Win32_Processor" in cmd
+
+
+def test_normalize_command_rewrites_invalid_get_processor_variant():
+    cmd = ps_run._normalize_command("Get-Processor")
+    assert "Win32_Processor" in cmd
+
+
+def test_normalize_command_rewrites_probe_cpu_request_with_filler_words():
+    cmd = ps_run._normalize_command("yes lets probe the CPU and see what comes up.")
     assert "Win32_Processor" in cmd
 
 

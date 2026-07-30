@@ -3,6 +3,8 @@
 import os
 import time
 import json
+import ast
+import difflib
 import hashlib
 import hmac
 import base64
@@ -14,6 +16,7 @@ import subprocess
 import sys
 import threading
 import mimetypes
+import py_compile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,7 +39,7 @@ from agent.reflex_helpers import (
     handle_identity_reflex,
     message_choice,
 )
-from agent.ostranauts import build_ostranauts_context, is_ostranauts_query
+from agent.ostranauts import build_ostranauts_context, get_ostranauts_status, is_ostranauts_query
 from config.config_loader import load_config
 from tools.tool_loader import ToolLoader
 from tools.file_access_policy import full_access_root, normalize_tool_path
@@ -106,6 +109,12 @@ class LMStudioClient:
                 os.getenv("MK1_VISION_REASONING_EFFORT", "none"),
             )
         ).strip()
+        self.request_timeout_seconds: int = int(
+            model_cfg.get(
+                "request_timeout_seconds",
+                os.getenv("MK1_LMSTUDIO_TIMEOUT_SECONDS", "240"),
+            )
+        )
 
     def _has_system_messages(self, messages: List[Dict[str, Any]]) -> bool:
         return any(str(m.get("role", "")).strip().lower() == "system" for m in (messages or []))
@@ -429,6 +438,8 @@ class LMStudioClient:
         messages: List[Dict[str, Any]],
         temperature: float = 0.7,
         tools: Optional[List[Dict[str, Any]]] = None,
+        allow_fallback: bool = False,
+        allow_model_load: bool = False,
     ) -> Dict[str, Any]:
 
         has_image = False
@@ -468,7 +479,8 @@ class LMStudioClient:
         print("URL:")
         print(self.chat_url)
 
-        attempted_models = self._candidate_models(str(payload.get("model") or self.default_model))
+        requested_model = str(payload.get("model") or self.default_model)
+        attempted_models = self._candidate_models(requested_model) if allow_fallback else [requested_model]
         if not attempted_models:
             attempted_models = [str(self.default_model or "local-model")]
 
@@ -483,7 +495,7 @@ class LMStudioClient:
                 resp = requests.post(
                     self.chat_url,
                     json=attempt_payload,
-                    timeout=120,
+                    timeout=self.request_timeout_seconds,
                 )
 
                 # Some OpenAI-compatible backends may not accept reasoning_effort.
@@ -507,7 +519,7 @@ class LMStudioClient:
                         resp = requests.post(
                             self.chat_url,
                             json=retry_payload,
-                            timeout=120,
+                            timeout=self.request_timeout_seconds,
                         )
 
                 # Some templates reject system role entirely (e.g. specific GGUF chat templates).
@@ -524,16 +536,20 @@ class LMStudioClient:
                         resp = requests.post(
                             self.chat_url,
                             json=retry_payload,
-                            timeout=120,
+                            timeout=self.request_timeout_seconds,
                         )
 
                 # If backend channel/model state is broken, try a model load once and retry.
-                if resp.status_code >= 400 and self._is_retryable_model_error(resp.text or ""):
+                if (
+                    allow_model_load
+                    and resp.status_code >= 400
+                    and self._is_retryable_model_error(resp.text or "")
+                ):
                     if self._try_load_model(model_name):
                         resp = requests.post(
                             self.chat_url,
                             json=attempt_payload,
-                            timeout=120,
+                            timeout=self.request_timeout_seconds,
                         )
 
                 print("\n========================================")
@@ -606,6 +622,8 @@ class LMStudioClient:
         messages: List[Dict[str, Any]],
         temperature: float = 0.7,
         tools: Optional[List[Dict[str, Any]]] = None,
+        allow_fallback: bool = False,
+        allow_model_load: bool = False,
     ):
 
         payload: Dict[str, Any] = {
@@ -624,7 +642,10 @@ class LMStudioClient:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
-        attempted_models = self._candidate_models(str(payload.get("model") or self.default_model))
+        if allow_fallback:
+            attempted_models = self._candidate_models(str(payload.get("model") or self.default_model))
+        else:
+            attempted_models = [str(payload.get("model") or self.default_model)]
         if not attempted_models:
             attempted_models = [str(self.default_model or "local-model")]
 
@@ -662,7 +683,7 @@ class LMStudioClient:
                         ):
                             continue
 
-                        if self._is_retryable_model_error(body) and self._try_load_model(model_name):
+                        if allow_model_load and self._is_retryable_model_error(body) and self._try_load_model(model_name):
                             resp.close()
                             resp = requests.post(
                                 self.chat_url,
@@ -728,7 +749,7 @@ class LMStudioClient:
                 finally:
                     resp.close()
 
-            if not self.auto_fallback_on_error:
+            if (not allow_fallback) or (not self.auto_fallback_on_error):
                 break
 
             if last_http_error is None or not self._is_retryable_model_error(str(last_http_error)):
@@ -1021,19 +1042,24 @@ class MK1Core:
         self._last_time_passage_note_monotonic: float = self._turn_clock_started_monotonic
         self._idle_checkin_pending: bool = False
         self._idle_checkin_due_since_at: Optional[str] = None
+        self.curiosity_suspend_during_ostranauts = bool(
+            self.config.get("curiosity", "suspend_during_ostranauts", True)
+        )
+        self.curiosity_pause_after_ostranauts_seconds = max(
+            0,
+            int(self.config.get("curiosity", "pause_after_ostranauts_seconds", 900)),
+        )
+        self._curiosity_gate_last_check_monotonic: float = 0.0
+        self._curiosity_gate_last_active: bool = False
+
+        self.project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
         workspace_root_cfg = self.config.get(
             "workspace",
             "root",
-            r"E:\workspace",
+            "",
         )
-        self.workspace_root = os.path.abspath(
-            os.path.expanduser(
-                os.path.expandvars(
-                    str(workspace_root_cfg or r"E:\workspace")
-                )
-            )
-        )
+        self.workspace_root = self._resolve_workspace_root(str(workspace_root_cfg or ""))
 
         configured_search_mode = str(
             self.config.get(
@@ -1121,10 +1147,17 @@ class MK1Core:
 
         self._intent_alias_cache: Dict[str, Dict[str, Any]] = {}
         self._intent_alias_cache_loaded = False
+        self._play_song_shorthand_cache: Dict[str, str] = {}
+        self._play_song_shorthand_cache_loaded = False
         self._pending_actions = PendingActionStore()
         self._voice_passphrase_hash: str = ""
         self._voice_passphrase_hint: str = ""
         self._verified_clients: Dict[str, float] = {}
+        self._file_index: Dict[str, Any] = {
+            "generated_at": "",
+            "entries": [],
+            "by_name": {},
+        }
 
         workspace_dirs_cfg = self.config.get(
             "workspace",
@@ -1139,14 +1172,18 @@ class MK1Core:
             self.workspace_default_dirs = ["projects", "scratch", "templates", "archive"]
 
         self._ensure_workspace_structure()
+        self._refresh_file_index(force=False)
         self._load_runtime_state()
         self._load_identity_state()
         self.startup_context = self._build_startup_context()
         self._seed_startup_memory_facts()
         self._seed_authoritative_identity_memory()
         self._seed_runtime_capability_snapshot()
+        self._seed_tool_usage_rules_memory()
         self._intent_alias_cache = self._get_intent_alias_map()
         self._intent_alias_cache_loaded = True
+        self._play_song_shorthand_cache = self._get_play_song_shorthand_map()
+        self._play_song_shorthand_cache_loaded = True
         self.last_active_project_path: Optional[str] = None
 
         curiosity_roots = self.config.get("curiosity", "approved_roots", ["D:\\", "E:\\", "G:\\"])
@@ -1171,6 +1208,31 @@ class MK1Core:
         self._validate_required_tool_routes()
         self._start_turn_clock_heartbeat()
         atexit.register(self.close)
+
+    def _resolve_workspace_root(self, configured_root: str) -> str:
+        """
+        Resolve workspace root deterministically for runtime behavior.
+
+        Why: Mina needs stable access to her personal workspace and project root.
+        Keep configured workspace root authoritative, with sane fallback when
+        config is empty or invalid.
+        """
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+        raw = str(configured_root or "").strip()
+        if not raw:
+            return repo_root
+
+        resolved = os.path.abspath(
+            os.path.expanduser(
+                os.path.expandvars(raw)
+            )
+        )
+
+        if not os.path.exists(resolved) and os.path.isdir(repo_root):
+            return repo_root
+
+        return resolved
 
     def _search_mode_state_path(self) -> str:
         return os.path.join(self.workspace_root, ".mina_search_mode.json")
@@ -1333,6 +1395,66 @@ class MK1Core:
                 return f"source:{src}"
         return "source:unknown"
 
+    def _interface_name(self, request_context: Optional[Dict[str, Any]]) -> str:
+        name = str((request_context or {}).get("interface_name") or "").strip()
+        return name if name else "Unknown GUI"
+
+    def _interface_label_line(self, request_context: Optional[Dict[str, Any]]) -> str:
+        gui_name = self._interface_name(request_context)
+        if gui_name == "Ostranauts GUI":
+            return (
+                "Current interface: Ostranauts GUI. Treat Ostranauts/companion prompts as the active operational context. "
+                "If asked what GUI you are in, answer 'Ostranauts GUI'; gremlin tone is only style."
+            )
+        if gui_name == "Mina Mk1 GUI":
+            return (
+                "Current interface: Mina Mk1 GUI. Treat the desktop/work interface as the active operational context. "
+                "If asked what GUI you are in, answer 'Mina Mk1 GUI'; gremlin tone is only style."
+            )
+        return (
+            "Current interface: Unknown GUI. Use the visible client context if one is present. "
+            "If asked what GUI you are in, say the GUI is unknown until the client provides a name."
+        )
+
+    def _interface_surface_line(self, request_context: Optional[Dict[str, Any]]) -> str:
+        gui_name = self._interface_name(request_context)
+        if gui_name == "Ostranauts GUI":
+            return (
+                "Visible surface: Ostranauts companion GUI with open comms, telemetry panels, buttons, status lights, and an avatar. "
+                "This is not a plain text-only chat box."
+            )
+        if gui_name == "Mina Mk1 GUI":
+            return (
+                "Visible surface: Mina Mk1 GUI with buttons, glowing panels, status meters, avatar display, and a chat console. "
+                "This is not a plain text-only chat box."
+            )
+        return (
+            "Visible surface: unknown GUI until the client provides an interface name. Do not assume plain text-only chat if the client shows controls or panels."
+        )
+
+    def _maybe_reply_interface_name(self, user_input: str, request_context: Optional[Dict[str, Any]]) -> Optional[str]:
+        t = " ".join(str(user_input or "").lower().split())
+        if not t:
+            return None
+
+        asks_mode = (
+            re.search(r"\b(what|which)\s+mode\b", t) is not None
+            or re.search(r"\bwhat\s+interface\s+are\s+you\s+in\b", t) is not None
+            or re.search(r"\bwhat\s+gui\b", t) is not None
+            or re.search(r"\bare\s+you\s+in\s+(game|work)\s+mode\b", t) is not None
+            or re.search(r"\b(which\s+gui|which\s+interface)\b", t) is not None
+            or ("gremlin mode" in t and any(word in t for word in ["what", "which", "are you in", "in?"]))
+        )
+        if not asks_mode:
+            return None
+
+        gui_name = self._interface_name(request_context)
+        if gui_name == "Ostranauts GUI":
+            return "I am in the Ostranauts GUI, with telemetry panels, buttons, and an avatar."
+        if gui_name == "Mina Mk1 GUI":
+            return "I am in the Mina Mk1 GUI, with buttons, glowing panels, and an avatar."
+        return "I do not have a confirmed GUI name from this client yet, but I should not assume plain text-only chat if the client shows controls or panels."
+
     def _mark_client_verified(self, request_context: Optional[Dict[str, Any]]) -> None:
         key = self._client_identity_key(request_context)
         self._verified_clients[key] = time.time() + float(self.voice_auth_ttl_seconds)
@@ -1399,20 +1521,10 @@ class MK1Core:
             return False
 
         has_read_verb = re.search(r'\b(read|inspect|analy[sz]e|describe|summari[sz]e|explain)\b', lowered) is not None
-        file_scope = re.search(r'\b(file|files|directory|folder|contents)\b', lowered) is not None
         recursive_scope = (
-            re.search(r'\b(all\s+files|each\s+file|every\s+file|entire\s+tree|directory\s+tree|folder\s+tree|recursive(?:ly)?|recurse|all\s+sub\s*directories|all\s+subfolders?)\b', lowered) is not None
-            or (
-                re.search(r'\bfiles?\b', lowered) is not None
-                and re.search(r'\b(?:in|under|inside|of|from)\b', lowered) is not None
-                and re.search(r'\b(tree|directory|folder|subdirector(?:y|ies)|subfolders?)\b', lowered) is not None
-            )
+            re.search(r'\b(all\s+files|each\s+file|every\s+file|entire\s+tree|directory\s+tree|folder\s+tree|recursive(?:ly)?|recurse|all\s+sub\s*directories|all\s+subfolders?|deep\s+scan|full\s+scan)\b', lowered) is not None
         )
-        if has_read_verb and recursive_scope:
-            return True
-
-        explicit_path = self._extract_explicit_windows_path(raw_text)
-        return bool(has_read_verb and file_scope and explicit_path and os.path.isdir(explicit_path))
+        return bool(has_read_verb and recursive_scope)
 
     def _extract_directory_inspection_filter(self, raw_text: str) -> str:
         lowered = str(raw_text or "").lower()
@@ -1922,6 +2034,7 @@ class MK1Core:
 
     def _correct_contextual_transcript(self, text: str) -> str:
         out = str(text or "")
+        out = re.sub(r"\b(?:ostanauts?|ostronauts?|ostranaughts?)\b", "Ostranauts", out, flags=re.IGNORECASE)
         if re.search(r'\bastronauts\b', out, re.IGNORECASE) and re.search(
             r'\b(?:steam|games?|mods?|modding|vortex|library)\b',
             out,
@@ -1931,6 +2044,17 @@ class MK1Core:
         return out
 
     def _is_tool_self_test_request(self, text: str) -> bool:
+        # Disabled by default: self-test should not be chat-triggered unless
+        # explicitly re-enabled via config.
+        allow_chat_self_test = False
+        try:
+            allow_chat_self_test = bool(self.config.get("curiosity", "allow_chat_tool_self_test", False))
+        except Exception:
+            allow_chat_self_test = False
+
+        if not allow_chat_self_test:
+            return False
+
         t = str(text or "").strip().lower()
         if not t:
             return False
@@ -1954,11 +2078,210 @@ class MK1Core:
         tone = "Keep Mina tone light but concise." if bool(getattr(self, "action_mode_light_tone", True)) else "Use direct, minimal tone."
         return (
             "Truth-first action mode is active. "
+            "Mina stays Mina in every interface and wrapper; never swap her personality for a bot persona or wrapper script. "
             "Never claim external actions (texts, calls, file reads, web checks, Spotify state, system commands) unless verified by tool output in this turn. "
             "If not verified, say what you can verify next. "
             "Do not invent file contents, directory listings, or execution results. "
             + tone
         )
+
+    def _tool_usage_decision_rules(self) -> str:
+        return (
+            "Tool decision rules: "
+            "Preserve Mina's personality first; wrappers only add context, not a new persona. "
+            "Treat this as ACTION when user asks to run, create, write, edit, read, list, search, fetch, start, stop, or check status, "
+            "or provides paths/URLs/commands. "
+            "Treat this as CHAT when user asks opinion, explanation, brainstorming, or casual conversation without an execution target. "
+            "If ACTION is likely but target/argument is missing, ask clarifying questions as needed until required target/arguments are unambiguous, instead of chatting. "
+            "Tool call format must be exactly: <|tool_call>call:tool_name{key: value}<tool_call|>."
+        )
+
+    def _is_action_request_like(self, text: str) -> bool:
+        src = str(text or "").strip()
+        if not src:
+            return False
+
+        t = src.lower()
+
+        if re.search(r"https?://", src, re.IGNORECASE):
+            return True
+        if re.search(r"[A-Za-z]:\\|[.]{1,2}[\\/]", src):
+            return True
+        if re.search(r"\b(?:\.ps1|\.py|\.cmd|\.bat|\.json|\.txt|\.md|\.csv)\b", t):
+            return True
+
+        imperative = re.search(
+            r"^(?:please\s+)?(?:run|execute|create|make|write|save|read|open|show|list|delete|remove|move|rename|copy|append|search|fetch|check|start|stop|restart|set|schedule|play|pause|resume|pull|push|commit)\b",
+            t,
+        ) is not None
+        asks_action = re.search(
+            r"\b(?:can|could|would|will)\s+you\s+(?:run|execute|create|make|write|read|open|show|list|delete|remove|move|rename|search|fetch|check|start|stop|restart|set|schedule|play|pause|resume)\b",
+            t,
+        ) is not None
+        object_signal = re.search(
+            r"\b(file|folder|directory|path|script|command|powershell|python|repo|git|url|website|web|memory|alarm|timer|spotify|song|track|playlist|server|api|database|db|status|tool)\b",
+            t,
+        ) is not None
+
+        return bool((imperative or asks_action) and object_signal)
+
+    def _is_operational_incident_report(self, text: str) -> bool:
+        src = str(text or "").strip()
+        if not src:
+            return False
+
+        t = src.lower()
+
+        # Keep this narrow so normal chat does not get hijacked.
+        target_signal = re.search(
+            r"\b(mina|mk1|assistant|api|server|service|you)\b",
+            t,
+        ) is not None
+        failure_signal = re.search(
+            r"\b(crash(?:ed|es|ing)?|offline|down|unreachable|not\s+responding|could(?:n't| not)\s+reach|unable\s+to\s+reach|stopped\s+working|went\s+down)\b",
+            t,
+        ) is not None
+        report_style = (
+            re.search(r"\b(i|we)\b", t) is not None
+            or re.search(r"\b(can't|cannot|couldn't|unable)\b", t) is not None
+            or re.search(r"\ball\s+day\b", t) is not None
+        )
+
+        if not (target_signal and failure_signal and report_style):
+            return False
+
+        # If user is explicitly asking for pure small talk, do not force tools.
+        if re.search(r"\b(joke|poem|story|opinion|chat)\b", t):
+            return False
+
+        return True
+
+    def _is_retryable_tool_failure(self, result: Dict[str, Any]) -> bool:
+        if not isinstance(result, dict) or bool(result.get("ok", True)):
+            return False
+
+        err = str(result.get("error") or "").strip().lower()
+        payload = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+        stderr = str(payload.get("stderr") or "").strip().lower()
+
+        retryable_tokens = [
+            "unknown_error",
+            "no_command_provided",
+            "invalid_tool_result",
+            "timeout_after_",
+            "exception:",
+            "commandnotfoundexception",
+        ]
+        return any(tok in err for tok in retryable_tokens) or any(tok in stderr for tok in retryable_tokens)
+
+    def _recover_failed_tool_once(
+        self,
+        user_input: str,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any], Dict[str, Any], bool]:
+        if not self._is_retryable_tool_failure(result):
+            return tool_name, tool_args, result, False
+
+        current_tool = str(tool_name or "")
+        current_args = dict(tool_args or {})
+
+        if current_tool == "ps_run":
+            try:
+                from tools.ps_run import _normalize_command as _normalize_ps_command
+
+                normalized = _normalize_ps_command(str(user_input or ""))
+                if normalized:
+                    existing = str(current_args.get("script") or current_args.get("command") or "").strip()
+                    if normalized.strip() and normalized.strip() != existing.strip():
+                        retry_args = dict(current_args)
+                        retry_args["script"] = normalized
+                        retry_args.pop("command", None)
+                        retry_result = self.tools.run("ps_run", retry_args)
+                        if isinstance(retry_result, dict) and bool(retry_result.get("ok", False)):
+                            return "ps_run", retry_args, retry_result, True
+            except Exception:
+                traceback.print_exc()
+
+        planned = self._plan_tool_action(user_input)
+        if planned is not None:
+            planned_tool, planned_args = planned
+            if planned_tool == "powershell" and "ps_run" in self._tool_registry():
+                cmd = str(planned_args.get("command") or planned_args.get("script") or "").strip()
+                planned_tool = "ps_run"
+                planned_args = {"script": cmd} if cmd else {}
+
+            if planned_tool in self._tool_registry():
+                if planned_tool != current_tool or dict(planned_args or {}) != current_args:
+                    retry_result = self.tools.run(planned_tool, planned_args)
+                    if isinstance(retry_result, dict) and bool(retry_result.get("ok", False)):
+                        return planned_tool, dict(planned_args or {}), retry_result, True
+
+        return tool_name, tool_args, result, False
+
+    def _is_learnable_intent_phrase(self, text: str) -> bool:
+        src = self._normalize_user_intent_text(text)
+        if not src:
+            return False
+
+        t = src.lower().strip()
+        words = [w for w in re.split(r"\s+", t) if w]
+        if len(words) < 2:
+            return False
+
+        if self._is_action_request_like(src):
+            return True
+
+        imperative = re.search(
+            r"^(?:please\s+)?(?:run|execute|create|make|write|save|read|open|show|list|delete|remove|move|rename|copy|append|search|fetch|check|start|stop|restart|set|schedule|play|pause|resume|pull|push|commit)\b",
+            t,
+        ) is not None
+        if imperative and len(words) >= 2:
+            return True
+
+        info_query = re.search(r"^(?:what|who|where|when|why|how|which)\b", t) is not None
+        info_subject = re.search(
+            r"\b(time|date|mode|status|memory|tool|tools|cpu|os|system|project|workspace|song|music|game|weather|news)\b",
+            t,
+        ) is not None
+        if info_query and info_subject:
+            return True
+
+        return False
+
+    def _alias_replay_confidence(self, phrase: str, tool: str, args: Optional[Dict[str, Any]] = None) -> float:
+        text = self._normalize_user_intent_text(phrase)
+        t = text.lower().strip()
+        tool_name = str(tool or "").strip()
+
+        if not text or not tool_name:
+            return 0.0
+
+        if tool_name.startswith("__"):
+            return 0.0
+
+        if self._is_action_request_like(text):
+            return 0.85
+
+        info_query = re.search(r"^(?:what|who|where|when|why|how|which)\b", t) is not None
+        if info_query and tool_name in {"memory_read", "ps_run", "web_search", "web_fetch", "github_repo", "dir_list", "file_read"}:
+            return 0.75
+
+        if tool_name == "spotify_link":
+            if self._is_explicit_spotify_command(text):
+                return 0.9
+            music_signal = re.search(
+                r"\b(music|song|songs|track|tracks|playlist|playlists|spotify|favorites?|favourites?)\b",
+                text,
+                re.IGNORECASE,
+            ) is not None
+            return 0.75 if music_signal else 0.45
+
+        if re.search(r"^(?:yes|yeah|yep|ok|okay|thanks|thank\s+you)\b", t):
+            return 0.2
+
+        return 0.6
 
     def _intent_alias_record(self, phrase: str, tool: str, args: Optional[Dict[str, Any]] = None) -> str:
         payload = {
@@ -2019,9 +2342,28 @@ class MK1Core:
         phrase = self._normalize_user_intent_text(text).lower().strip()
         if not phrase:
             return None
+        if not self._is_learnable_intent_phrase(phrase):
+            return None
 
         alias_map = self._intent_alias_cache if isinstance(getattr(self, "_intent_alias_cache", None), dict) else {}
         row = alias_map.get(phrase)
+
+        if not isinstance(row, dict):
+            row = self._resolve_fuzzy_intent_alias_row(phrase, alias_map)
+
+        if not isinstance(row, dict):
+            memory_aliases = self._alias_candidates_from_memory(phrase)
+            if memory_aliases:
+                if not isinstance(getattr(self, "_intent_alias_cache", None), dict):
+                    self._intent_alias_cache = {}
+                for alias_phrase, alias_row in memory_aliases.items():
+                    if alias_phrase not in self._intent_alias_cache:
+                        self._intent_alias_cache[alias_phrase] = alias_row
+
+                row = memory_aliases.get(phrase)
+                if not isinstance(row, dict):
+                    row = self._resolve_fuzzy_intent_alias_row(phrase, memory_aliases)
+
         if not isinstance(row, dict):
             return None
 
@@ -2029,19 +2371,226 @@ class MK1Core:
         args = row.get("args", {}) if isinstance(row.get("args", {}), dict) else {}
         if not tool:
             return None
+        if tool.startswith("__"):
+            return None
         if tool == "spotify_link" and self._is_explicit_spotify_command(phrase):
             return None
 
-        available = getattr(self.tools, "tools", {})
-        if tool.startswith("__") or tool in available:
+        available = self._tool_registry()
+        if tool in available:
             return tool, dict(args)
         return None
+
+    def _alias_candidates_from_memory(self, phrase: str) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        if not phrase:
+            return out
+
+        mem = getattr(self, "memory", None)
+        if mem is None:
+            return out
+
+        rows: List[Dict[str, Any]] = []
+
+        try:
+            if hasattr(mem, "search"):
+                sem_rows = mem.search(
+                    phrase,
+                    top_k=24,
+                    include_kinds=["procedure", "fact"],
+                    include_tags=["intent_alias"],
+                )
+                if isinstance(sem_rows, list):
+                    rows.extend([r for r in sem_rows if isinstance(r, dict)])
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            if hasattr(mem, "recent_memories"):
+                recent_rows = mem.recent_memories(
+                    top_k=200,
+                    include_kinds=["procedure", "fact"],
+                    include_tags=["intent_alias"],
+                )
+                if isinstance(recent_rows, list):
+                    rows.extend([r for r in recent_rows if isinstance(r, dict)])
+        except Exception:
+            traceback.print_exc()
+
+        for item in rows:
+            parsed = self._parse_intent_alias_record(str(item.get("text") or ""))
+            if not parsed:
+                continue
+            alias_phrase = str(parsed.get("phrase") or "").strip().lower()
+            if not alias_phrase or alias_phrase in out:
+                continue
+            out[alias_phrase] = {
+                "tool": str(parsed.get("tool") or "").strip(),
+                "args": parsed.get("args", {}) if isinstance(parsed.get("args", {}), dict) else {},
+            }
+
+        return out
+
+    def _intent_alias_tokens(self, phrase: str) -> List[str]:
+        normalized = re.sub(r"[^a-z0-9\s]", " ", str(phrase or "").lower())
+        tokens = [tok for tok in normalized.split() if tok]
+        stop = {
+            "the", "a", "an", "to", "for", "with", "and", "or", "my", "me",
+            "please", "now", "just", "can", "could", "would", "will", "you",
+        }
+        return [tok for tok in tokens if tok not in stop]
+
+    def _intent_alias_similarity(self, a: str, b: str) -> float:
+        left = str(a or "").strip().lower()
+        right = str(b or "").strip().lower()
+        if not left or not right:
+            return 0.0
+
+        seq_ratio = difflib.SequenceMatcher(None, left, right).ratio()
+        left_tokens = self._intent_alias_tokens(left)
+        right_tokens = self._intent_alias_tokens(right)
+        if not left_tokens or not right_tokens:
+            return seq_ratio
+
+        left_set = set(left_tokens)
+        right_set = set(right_tokens)
+        overlap = len(left_set.intersection(right_set)) / float(max(len(left_set), len(right_set), 1))
+
+        first_token_bonus = 0.08 if left_tokens[0] == right_tokens[0] else 0.0
+        score = (0.68 * seq_ratio) + (0.32 * overlap) + first_token_bonus
+        return max(0.0, min(1.0, score))
+
+    def _resolve_fuzzy_intent_alias_row(
+        self,
+        phrase: str,
+        alias_map: Dict[str, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not phrase or not isinstance(alias_map, dict):
+            return None
+
+        phrase_tokens = self._intent_alias_tokens(phrase)
+        if len(phrase_tokens) < 2:
+            return None
+
+        best_row: Optional[Dict[str, Any]] = None
+        best_score = 0.0
+
+        for alias_phrase, candidate in alias_map.items():
+            if not isinstance(candidate, dict):
+                continue
+            alias_text = str(alias_phrase or "").strip().lower()
+            if not alias_text:
+                continue
+
+            alias_tokens = self._intent_alias_tokens(alias_text)
+            if len(alias_tokens) < 2:
+                continue
+
+            shared = len(set(phrase_tokens).intersection(set(alias_tokens)))
+            if shared < 2:
+                continue
+
+            score = self._intent_alias_similarity(phrase, alias_text)
+            if score < 0.86:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_row = candidate
+
+        return best_row
+
+    def _play_song_shorthand_record(self, trigger_phrase: str, track_query: str) -> str:
+        payload = {
+            "phrase": str(trigger_phrase or "").strip().lower(),
+            "track_query": str(track_query or "").strip(),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        return "play_song_shorthand::" + json.dumps(payload, sort_keys=True, ensure_ascii=True)
+
+    def _parse_play_song_shorthand_record(self, text: str) -> Optional[Dict[str, str]]:
+        src = str(text or "").strip()
+        if not src.startswith("play_song_shorthand::"):
+            return None
+
+        raw = src[len("play_song_shorthand::"):].strip()
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        phrase = str(payload.get("phrase") or "").strip().lower()
+        track_query = str(payload.get("track_query") or "").strip()
+        if not phrase or not track_query:
+            return None
+
+        return {
+            "phrase": phrase,
+            "track_query": track_query,
+        }
+
+    def _get_play_song_shorthand_map(self) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        try:
+            recent = self.memory.recent_memories(
+                top_k=1000,
+                include_kinds=["procedure", "fact"],
+                include_tags=["play_song_shorthand"],
+            )
+            for item in recent or []:
+                parsed = self._parse_play_song_shorthand_record(str(item.get("text") or ""))
+                if not parsed:
+                    continue
+                phrase = str(parsed.get("phrase") or "")
+                track_query = str(parsed.get("track_query") or "")
+                if phrase and track_query and phrase not in out:
+                    out[phrase] = track_query
+        except Exception:
+            traceback.print_exc()
+        return out
+
+    def _resolve_play_song_shorthand(self, text: str) -> Optional[str]:
+        phrase = self._normalize_user_intent_text(text).lower().strip()
+        if not phrase:
+            return None
+
+        cache = self._play_song_shorthand_cache if isinstance(getattr(self, "_play_song_shorthand_cache", None), dict) else {}
+        track_query = str(cache.get(phrase) or "").strip()
+        return track_query or None
+
+    def _extract_play_song_shorthand_rule(self, raw_text: str) -> Optional[Dict[str, str]]:
+        src = str(raw_text or "").strip()
+        if not src:
+            return None
+
+        m = re.search(
+            r"\b(?:if|when)\s+i\s+say\s+[\"']?(.+?)[\"']?\s*(?:,)?\s*(?:that\s+means|it\s+means|then)\b",
+            src,
+            re.IGNORECASE,
+        )
+        if not m:
+            return None
+
+        trigger_phrase = self._normalize_user_intent_text(str(m.group(1) or "")).lower().strip(" .!?,;:\"'")
+        if not trigger_phrase.startswith("play "):
+            return None
+
+        track_query = re.sub(r"^play\s+", "", trigger_phrase, flags=re.IGNORECASE).strip()
+        if not track_query:
+            return None
+
+        return {
+            "phrase": trigger_phrase,
+            "track_query": track_query,
+        }
 
     def _is_explicit_spotify_command(self, text: str) -> bool:
         phrase = self._normalize_user_intent_text(text).lower().strip()
         action = re.search(r"\b(add|create|make|list|show|get|play|pause|stop|resume|shuffle|search|find)\b", phrase)
         subject = re.search(
-            r"\b(spotify|music|songs?|tracks?|play\s*lists?|albums?|artists?|liked|favorites?|favourites?)\b",
+            r"\b(spotify|spotiy|sportify|spotfiy|spotfy|spotifi|music|songs?|tracks?|play\s*lists?|albums?|artists?|liked|favorites?|favourites?)\b",
             phrase,
         )
         return action is not None and subject is not None
@@ -2058,23 +2607,24 @@ class MK1Core:
         if not isinstance(result, dict) or not bool(result.get("ok", True)):
             return
 
-        allow_tools = {
-            "spotify_link",
-            "web_search",
-            "web_fetch",
-            "memory_read",
-            "memory_write",
-            "__mina_shutdown_status__",
-            "__mina_shutdown__",
-            "__driving_checkin_start__",
-            "__driving_checkin_stop__",
-            "__task_memory_write__",
+        blocked_tools = {
+            "__clarify_intent__",
+            "__confirm_external_write__",
+            "__cancel_external_write__",
+            "__capability_limit__",
+            "__learn_play_song_shorthand__",
         }
-        if tool_name not in allow_tools:
+        if tool_name in blocked_tools:
+            return
+        if str(tool_name or "").startswith("__"):
             return
 
         phrase = self._normalize_user_intent_text(user_input).lower().strip()
         if not phrase or len(phrase) < 8 or len(phrase) > 180:
+            return
+        if not self._is_learnable_intent_phrase(phrase):
+            return
+        if re.search(r"\b(?:if|when)\s+i\s+say\b", phrase, re.IGNORECASE):
             return
         if tool_name == "spotify_link" and self._is_explicit_spotify_command(phrase):
             return
@@ -2116,30 +2666,141 @@ class MK1Core:
         except Exception:
             traceback.print_exc()
 
-    def _maybe_build_ambiguity_prompt(self, raw_text: str) -> Optional[str]:
+    # Why: failed turns and Ostranauts play sessions should leave a compact lesson trail.
+    # Guard: stores lessons as advisory notes so retries stay available and routing is unchanged.
+    def _maybe_store_learning_memory(
+        self,
+        user_input: str,
+        assistant_text: str,
+        retry_guided: bool = False,
+    ) -> None:
+        try:
+            user_mem = str(user_input or "").strip()
+            assistant_mem = str(assistant_text or "").strip()
+            if not user_mem and not assistant_mem:
+                return
+
+            lesson_parts: List[str] = []
+            lesson_tags = ["user_memory", "learning_lesson"]
+
+            correction_patterns = [
+                r"\bthat was (?:a|an) .{2,60} request\b",
+                r"\bi meant (?:to|that|a|an)\b",
+                r"\byou should have (?:used|called|treated|routed)\b",
+                r"\bnot .{1,40}, (?:use|do|create|run|search|read|write)\b",
+            ]
+            if any(re.search(pattern, user_mem, re.IGNORECASE) is not None for pattern in correction_patterns):
+                lesson_parts.append(f"User correction: {self._compress_multiline(user_mem, max_lines=2, max_chars=260)}")
+                lesson_tags.append("routing_correction")
+
+            if is_failed_decision_text(assistant_mem):
+                lesson_parts.append(
+                    "Retry note: the prior attempt failed, so Mina should keep trying with a different approach rather than blocking the next attempt."
+                )
+                lesson_tags.append("failed_decision")
+
+            if retry_guided and assistant_mem:
+                lesson_parts.append(
+                    f"Retry attempt: {self._compress_multiline(assistant_mem, max_lines=3, max_chars=320)}"
+                )
+                lesson_tags.append("retry_attempt")
+
+            if is_ostranauts_query(user_mem) and assistant_mem:
+                lesson_parts.append(
+                    f"Ostranauts lesson: {self._compress_multiline(assistant_mem, max_lines=4, max_chars=360)}"
+                )
+                lesson_tags.append("ostranauts")
+
+            if not lesson_parts:
+                return
+
+            lesson_text = " | ".join(lesson_parts)
+            if len(lesson_text) > 1800:
+                lesson_text = self._compress_multiline(lesson_text, max_lines=4, max_chars=1800)
+
+            self.memory.add_memory(
+                lesson_text,
+                kind="note",
+                tags=lesson_tags,
+            )
+        except Exception:
+            traceback.print_exc()
+
+    # Why: tests can construct MK1Core without ToolLoader, but intent routing still needs a safe lookup.
+    # Guard: returns an empty registry instead of raising AttributeError on partial core objects.
+    def _tool_registry(self) -> Dict[str, Any]:
+        tools = getattr(self, "tools", None)
+        return getattr(tools, "tools", {}) if tools is not None else {}
+
+    def _intent_signal_profile(self, raw_text: str) -> Dict[str, bool]:
+        t = str(raw_text or "").lower()
+        play_signal = re.search(r"\b(play|paly|place)\b", t) is not None
+        play_with_target = re.search(r"\b(?:play|paly|place)\s+.+", t) is not None
+        game_signals = re.search(
+            r"\b(game|steam|ostranauts?|ostanauts?|ostronauts?|ostranaughts?|interface|integrat(?:e|ion)|build|app|ui|character|npc|mod)\b",
+            t,
+        ) is not None
+        music_signals = re.search(r"\b(song|track|play\s*list|spotify|music|album|artist)\b", t) is not None
+        explicit_spotify = self._is_explicit_spotify_command(raw_text)
+        ostranauts_query = is_ostranauts_query(raw_text)
+
+        return {
+            "play_signal": play_signal,
+            "play_with_target": play_with_target,
+            "game_signals": game_signals,
+            "music_signals": music_signals,
+            "explicit_spotify": explicit_spotify,
+            "ostranauts_query": ostranauts_query,
+        }
+
+    def _maybe_build_ambiguity_prompt(self, raw_text: str, intent_signals: Optional[Dict[str, bool]] = None) -> Optional[str]:
         if not bool(getattr(self, "ambiguity_ask_on_medium_low", True)):
             return None
 
         t = str(raw_text or "").lower()
-        spotify_available = "spotify_link" in getattr(self.tools, "tools", {})
-        if not spotify_available:
+        if re.search(r"^\s*(what|who|where|when|why|how)\b", t) and not re.search(r"\b(play|game|music|spotify)\b", t):
+            return None
+        if any(phrase in t for phrase in [
+            "what is my name",
+            "what's my name",
+            "who am i",
+            "what time is it",
+            "current time",
+            "local time",
+            "what date is it",
+            "current date",
+            "today's date",
+            "todays date",
+        ]):
+            return None
+        signals = intent_signals or self._intent_signal_profile(raw_text)
+        play_signal = bool(signals.get("play_signal"))
+        play_with_target = bool(signals.get("play_with_target"))
+        game_signals = bool(signals.get("game_signals"))
+        music_signals = bool(signals.get("music_signals"))
+        spotify_available = "spotify_link" in self._tool_registry()
+
+        casual_typo_markers = re.search(r"\b(my\s+bad|fat\s+fingers|miss\s+keys|oops|lol|haha|typo)\b", t) is not None
+        if casual_typo_markers and not (game_signals or music_signals):
             return None
 
-        game_signals = re.search(r"\b(game|interface|integrat(?:e|ion)|build|app|ui|character|npc|mod)\b", t) is not None
-        music_signals = re.search(r"\b(song|track|play\s*list|spotify|music|album|artist)\b", t) is not None
-        play_signal = re.search(r"\b(play|paly|place)\b", t) is not None
-
+        # Game-targeted "play" should stay in game context and avoid music hijack.
         if play_signal and game_signals and not music_signals:
+            return None
+
+        # Explicit play requests with a concrete target should execute routing
+        # directly instead of falling into generic play clarification.
+        if play_signal and play_with_target and not game_signals:
+            return None
+
+        # Unqualified "play" with Spotify available is ambiguous by default.
+        if play_signal and spotify_available and not game_signals and not music_signals:
             return (
-                "Quick clarify: do you want game integration help or Spotify playback? "
-                "Reply with 'game' or 'music'."
+                "When you say 'play', what do you want to play right now: a game, music, or something else?"
             )
 
         if re.search(r"\bplay\s+with\s+me\b", t) and (game_signals or not music_signals):
-            return (
-                "I can do both, but I need a quick choice: 'game' for integration/build help, "
-                "or 'music' for Spotify playback."
-            )
+            return None
 
         return None
 
@@ -2147,7 +2808,11 @@ class MK1Core:
         return {"dir_create", "file_write", "file_append", "file_delete", "file_move", "safe_copy"}
 
     def _set_pending_action(self, action_key: str, payload: Dict[str, Any]) -> None:
-        self._pending_actions.set(action_key, payload)
+        store = getattr(self, "_pending_actions", None)
+        if store is None:
+            store = PendingActionStore()
+            self._pending_actions = store
+        store.set(action_key, payload)
 
     def _get_pending_action(self, action_key: str) -> Optional[Dict[str, Any]]:
         store = getattr(self, "_pending_actions", None)
@@ -2156,7 +2821,470 @@ class MK1Core:
         return store.get(action_key)
 
     def _clear_pending_action(self, action_key: str) -> None:
-        self._pending_actions.clear(action_key)
+        store = getattr(self, "_pending_actions", None)
+        if store is None:
+            return
+        store.clear(action_key)
+
+    def _set_last_tool_event(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        user_input: str,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        safe_args = dict(tool_args or {})
+        safe_args.pop("auth_token", None)
+        payload = {
+            "tool_name": str(tool_name or "").strip(),
+            "tool_args": safe_args,
+            "user_input": str(user_input or "").strip(),
+            "ok": bool((result or {}).get("ok", False)) if isinstance(result, dict) else None,
+            "created_at": time.time(),
+        }
+        self._set_pending_action("last_tool_event", payload)
+
+    def _set_context_continuation(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        user_input: str,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        safe_args = dict(tool_args or {})
+        safe_args.pop("auth_token", None)
+
+        artifact_path = ""
+        artifact_url = ""
+        artifact_query = ""
+        payload_result = result.get("result", {}) if isinstance(result, dict) and isinstance(result.get("result"), dict) else {}
+
+        for key in ["path", "dst", "src"]:
+            val = str(payload_result.get(key) or safe_args.get(key) or "").strip()
+            if val:
+                artifact_path = val
+                break
+
+        artifact_url = str(payload_result.get("url") or safe_args.get("url") or "").strip()
+        artifact_query = str(payload_result.get("query") or safe_args.get("query") or "").strip()
+
+        suggested_yes_action: Dict[str, Any] = {}
+        normalized_tool = str(tool_name or "").strip()
+        if normalized_tool == "file_write":
+            target = str(payload_result.get("path") or safe_args.get("path") or "").strip()
+            if target.lower().endswith(".py"):
+                suggested_yes_action = {
+                    "tool_name": "ps_run",
+                    "tool_args": {
+                        "script": f'python "{target}"',
+                    },
+                }
+
+        continuation = {
+            "tool_name": normalized_tool,
+            "tool_args": safe_args,
+            "user_input": str(user_input or "").strip(),
+            "artifact_path": artifact_path,
+            "artifact_url": artifact_url,
+            "artifact_query": artifact_query,
+            "suggested_yes_action": suggested_yes_action,
+            "ok": bool((result or {}).get("ok", False)) if isinstance(result, dict) else None,
+            "created_at": time.time(),
+        }
+        self._set_pending_action("context_continuation", continuation)
+
+    def _get_context_continuation(self) -> Optional[Dict[str, Any]]:
+        return self._get_pending_action("context_continuation")
+
+    def _set_last_draft_artifact(self, target_path: str, content: str, user_input: str) -> None:
+        payload = {
+            "target_path": str(target_path or "").strip(),
+            "content": str(content or ""),
+            "user_input": str(user_input or "").strip(),
+            "created_at": time.time(),
+        }
+        self._set_pending_action("last_draft_artifact", payload)
+
+    def _get_last_draft_artifact(self) -> Optional[Dict[str, Any]]:
+        return self._get_pending_action("last_draft_artifact")
+
+    def _extract_code_block_from_text(self, text: str, target_path: str = "") -> str:
+        raw = str(text or "")
+        if not raw.strip():
+            return ""
+
+        ext = os.path.splitext(str(target_path or ""))[1].lower()
+        preferred_langs = {
+            ".py": {"python", "py"},
+            ".ps1": {"powershell", "ps1", "pwsh"},
+            ".js": {"javascript", "js"},
+            ".ts": {"typescript", "ts"},
+            ".json": {"json"},
+            ".md": {"markdown", "md"},
+            ".html": {"html"},
+            ".css": {"css"},
+        }.get(ext, set())
+
+        blocks = re.findall(r"```([A-Za-z0-9_+-]*)\n([\s\S]*?)```", raw)
+        if not blocks:
+            return ""
+
+        for lang, body in blocks:
+            if preferred_langs and str(lang or "").strip().lower() in preferred_langs:
+                return str(body or "").strip("\n")
+
+        return str(blocks[0][1] or "").strip("\n")
+
+    def _infer_draft_target_path(self, user_input: str, assistant_text: str) -> str:
+        for source in [str(assistant_text or ""), str(user_input or "")]:
+            m = re.search(r"(?:^|\b#\s*)([A-Za-z0-9_. -]+\.[A-Za-z0-9]{1,8})", source, re.IGNORECASE | re.MULTILINE)
+            if m:
+                return str(m.group(1) or "").strip().strip("`")
+            m = re.search(r"`([^`]+\.[A-Za-z0-9]{1,8})`", source)
+            if m:
+                return str(m.group(1) or "").strip()
+            m = re.search(r"\b(?:named|called|as)\s+([A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8})\b", source, re.IGNORECASE)
+            if m:
+                return str(m.group(1) or "").strip()
+        return ""
+
+    def _remember_draft_artifact_from_turn(self, user_input: str, assistant_text: str) -> None:
+        target_path = self._infer_draft_target_path(user_input, assistant_text)
+        code = self._extract_code_block_from_text(assistant_text, target_path=target_path)
+        if not target_path or not code.strip():
+            return
+        self._set_last_draft_artifact(target_path=target_path, content=code, user_input=user_input)
+        self._remember_code_artifact_memory(
+            target_path=target_path,
+            content=code,
+            user_input=user_input,
+            source_tag="draft_artifact",
+        )
+
+    def _code_artifact_memory_record(self, target_path: str, user_input: str, content: str) -> str:
+        safe_path = str(target_path or "").strip()
+        safe_request = self._compress_multiline(str(user_input or ""), max_lines=2, max_chars=320)
+        safe_content = str(content or "").strip()
+        if len(safe_content) > 6000:
+            safe_content = safe_content[:6000].rstrip() + "\n# ... truncated for memory ..."
+        return (
+            f"code_artifact::path={safe_path}\n"
+            f"request={safe_request}\n"
+            "content:\n"
+            f"{safe_content}"
+        )
+
+    def _parse_code_artifact_memory_record(self, text: str) -> Optional[Dict[str, str]]:
+        raw = str(text or "")
+        if not raw.startswith("code_artifact::path="):
+            return None
+
+        lines = raw.splitlines()
+        if len(lines) < 3:
+            return None
+
+        path = str(lines[0].split("=", 1)[1] if "=" in lines[0] else "").strip()
+        request = str(lines[1].split("=", 1)[1] if "=" in lines[1] else "").strip()
+        content_start = raw.find("content:\n")
+        content = raw[content_start + len("content:\n"):] if content_start >= 0 else ""
+        if not path or not content.strip():
+            return None
+        return {
+            "target_path": path,
+            "user_input": request,
+            "content": content,
+        }
+
+    def _remember_code_artifact_memory(
+        self,
+        target_path: str,
+        content: str,
+        user_input: str,
+        source_tag: str,
+    ) -> None:
+        safe_path = str(target_path or "").strip()
+        safe_content = str(content or "").strip()
+        if not safe_path or not safe_content:
+            return
+        try:
+            record = self._code_artifact_memory_record(safe_path, user_input, safe_content)
+            exists = False
+            if hasattr(self.memory, "find_memory_id_by_text"):
+                exists = self.memory.find_memory_id_by_text(
+                    record,
+                    include_kinds=["procedure"],
+                    include_tags=["code_artifact"],
+                ) is not None
+            if not exists:
+                self.memory.add_memory(
+                    record,
+                    kind="procedure",
+                    tags=["user_memory", "suggestion_context", "code_artifact", str(source_tag or "artifact")],
+                )
+        except Exception:
+            traceback.print_exc()
+
+    def _search_code_artifact_memory(self, target_path: str, user_input: str) -> Optional[Dict[str, str]]:
+        safe_path = str(target_path or "").strip()
+        target_name = os.path.basename(safe_path).strip().lower()
+        if not target_name:
+            return None
+
+        query = f"{target_name} {user_input or ''}".strip()
+        try:
+            hits = self.memory.search(
+                query,
+                top_k=6,
+                include_kinds=["procedure"],
+                include_tags=["code_artifact"],
+            )
+        except Exception:
+            hits = []
+
+        best: Optional[Dict[str, str]] = None
+        best_score = -1
+        for item in hits or []:
+            parsed = self._parse_code_artifact_memory_record(str(item.get("text") or ""))
+            if not isinstance(parsed, dict):
+                continue
+            stored_name = os.path.basename(str(parsed.get("target_path") or "")).strip().lower()
+            if stored_name != target_name:
+                continue
+            score = 1
+            stored_request = str(parsed.get("user_input") or "")
+            if self._content_matches_artifact_intent(stored_request or user_input, safe_path, str(parsed.get("content") or "")):
+                score += 2
+            if safe_path.lower() == str(parsed.get("target_path") or "").strip().lower():
+                score += 1
+            if score > best_score:
+                best = parsed
+                best_score = score
+
+        return best
+
+    def _is_short_confirmation(self, text: str) -> bool:
+        t = str(text or "").strip().lower()
+        if not t:
+            return False
+        return re.fullmatch(r"(?:yes|y|yeah|yep|ok|okay|sure|go\s+ahead|do\s+it|proceed|run\s+it)", t) is not None
+
+    def _is_execution_followup_request(self, text: str) -> bool:
+        t = str(text or "").strip().lower()
+        if not t:
+            return False
+        return re.search(
+            r"\b(run\s+it|execute\s+it|launch\s+it|start\s+it|execute\s+the\s+file|run\s+the\s+file|launch\s+the\s+file|file\s+is\s+not\s+executing|run\s+the\s+.*generator|execute\s+the\s+.*generator|run\s+the\s+.*script|execute\s+the\s+.*script)\b",
+            t,
+        ) is not None
+
+    def _resolve_draft_execution_intent(self, raw_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not self._is_execution_followup_request(raw_text):
+            return None
+
+        draft = self._get_last_draft_artifact()
+        if not isinstance(draft, dict):
+            return None
+        target_path = str(draft.get("target_path") or "").strip()
+        if not target_path:
+            return None
+        if not target_path.lower().endswith(".py"):
+            return None
+
+        return "ps_run", {
+            "script": f'python "{target_path}"',
+        }
+
+    def _resolve_continuation_intent(self, raw_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        state = self._get_context_continuation()
+        if not isinstance(state, dict):
+            return None
+
+        created_at = float(state.get("created_at") or 0.0)
+        if created_at > 0 and (time.time() - created_at) > 900:
+            return None
+
+        t = str(raw_text or "").strip().lower()
+        if not t:
+            return None
+
+        artifact_path = str(state.get("artifact_path") or "").strip()
+        artifact_tool = str(state.get("tool_name") or "").strip()
+
+        if self._is_execution_followup_request(raw_text) and artifact_path.lower().endswith(".py"):
+            return "ps_run", {
+                "script": f'python "{artifact_path}"',
+            }
+
+        # Contextual mode switches for script artifacts.
+        style_shift = re.search(r"\b(ascii|emoji|text\s*art|terminal\s*art)\b", t) is not None
+        if style_shift and artifact_path.lower().endswith(".py"):
+            return "file_write", {
+                "path": artifact_path,
+                "content": "",
+                "overwrite": True,
+            }
+
+        if self._is_short_confirmation(raw_text):
+            suggested = state.get("suggested_yes_action", {}) if isinstance(state.get("suggested_yes_action", {}), dict) else {}
+            next_tool = str(suggested.get("tool_name") or "").strip()
+            next_args = suggested.get("tool_args", {}) if isinstance(suggested.get("tool_args", {}), dict) else {}
+            if next_tool and next_tool in self._tool_registry():
+                return next_tool, next_args
+
+            if artifact_tool and artifact_tool in self._tool_registry():
+                replay_args = state.get("tool_args", {}) if isinstance(state.get("tool_args", {}), dict) else {}
+                return artifact_tool, dict(replay_args)
+
+        return None
+
+    def _get_last_tool_event(self) -> Optional[Dict[str, Any]]:
+        return self._get_pending_action("last_tool_event")
+
+    def _is_context_followup_request(self, text: str) -> bool:
+        t = str(text or "").strip().lower()
+        if not t:
+            return False
+        return (
+            re.search(r"\b(take\s+a\s+look|look\s+around|look\s+there|check\s+there|see\s+what(?:'s|\s+is)\s+there|scan\s+(?:the\s+)?(?:folder|directory)|try\s+again|do\s+that\s+again)\b", t) is not None
+            or t in {"take a look", "look", "look there", "check there", "try again"}
+        )
+
+    def _is_failed_artifact_followup_request(self, text: str) -> bool:
+        t = str(text or "").strip().lower()
+        if not t:
+            return False
+        failure_markers = [
+            r"\bthat\s+failed\b",
+            r"\bfile\s+was\s+incomplete\b",
+            r"\bincomplete\b",
+            r"\bfinish\s+this\s+correctly\b",
+            r"\bbad\s+call\b",
+            r"\byou\s+failed\b",
+            r"\btry\s+again\b",
+        ]
+        return any(re.search(pattern, t) is not None for pattern in failure_markers)
+
+    def _resolve_contextual_followup_intent(self, raw_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not self._is_context_followup_request(raw_text):
+            draft_retry = self._get_last_draft_artifact()
+            if not (isinstance(draft_retry, dict) and self._is_failed_artifact_followup_request(raw_text)):
+                return None
+
+        draft_retry = self._get_last_draft_artifact()
+        if isinstance(draft_retry, dict) and self._is_failed_artifact_followup_request(raw_text):
+            target_path = str(draft_retry.get("target_path") or "").strip()
+            if target_path:
+                return "file_write", {
+                    "path": target_path,
+                    "content": "",
+                    "overwrite": True,
+                }
+
+        pending_write = self._get_pending_write_authorization()
+        if isinstance(pending_write, dict):
+            pending_args = pending_write.get("tool_args", {}) if isinstance(pending_write.get("tool_args", {}), dict) else {}
+            pending_path = str(
+                pending_args.get("path")
+                or pending_args.get("dst")
+                or pending_args.get("src")
+                or ""
+            ).strip()
+            suggested_file = os.path.basename(pending_path) if pending_path else ""
+
+            hinted_root = self._extract_explicit_windows_path(raw_text)
+            inspect_path = hinted_root or str(getattr(self, "workspace_root", "") or "").strip()
+            if not inspect_path:
+                inspect_path = pending_path
+            if inspect_path and not os.path.isdir(inspect_path):
+                inspect_path = os.path.dirname(inspect_path)
+
+            if inspect_path:
+                return "dir_list", {
+                    "path": inspect_path,
+                    "__followup_hint__": "focus_prompt",
+                    "__followup_target__": suggested_file,
+                }
+
+        last_event = self._get_last_tool_event()
+        if not isinstance(last_event, dict):
+            workspace_path = str(getattr(self, "workspace_root", "") or "").strip()
+            if workspace_path:
+                return "dir_list", {
+                    "path": workspace_path,
+                    "__followup_hint__": "focus_prompt",
+                    "__followup_target__": "",
+                }
+            return None
+
+        last_tool = str(last_event.get("tool_name") or "").strip()
+        last_args = last_event.get("tool_args", {}) if isinstance(last_event.get("tool_args", {}), dict) else {}
+        if not last_tool:
+            return None
+
+        file_family = {"file_read", "file_write", "file_append", "file_delete", "dir_create", "dir_list", "file_move", "safe_copy"}
+        if last_tool in file_family:
+            candidate = str(last_args.get("path") or last_args.get("dst") or last_args.get("src") or "").strip()
+            if not candidate:
+                return None
+            inspect_path = candidate if os.path.isdir(candidate) else os.path.dirname(candidate)
+            if not inspect_path:
+                inspect_path = str(getattr(self, "workspace_root", "") or "").strip()
+            if inspect_path:
+                suggested_file = os.path.basename(candidate) if os.path.basename(candidate) else ""
+                return "dir_list", {
+                    "path": inspect_path,
+                    "__followup_hint__": "focus_prompt",
+                    "__followup_target__": suggested_file,
+                }
+
+        # For non-file tools, replay the most recent tool call as a broad, useful
+        # follow-up behavior unless it is an explicit confirmation/cancel primitive.
+        blocked = {"__clarify_intent__", "__confirm_external_write__", "__cancel_external_write__"}
+        if last_tool in blocked:
+            return None
+        if last_tool in self._tool_registry():
+            return last_tool, dict(last_args)
+
+        workspace_path = str(getattr(self, "workspace_root", "") or "").strip()
+        if workspace_path:
+            return "dir_list", {
+                "path": workspace_path,
+                "__followup_hint__": "focus_prompt",
+                "__followup_target__": "",
+            }
+
+        return None
+
+    def _set_pending_alias_replay(
+        self,
+        phrase: str,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        confidence: float,
+    ) -> None:
+        args_copy = dict(tool_args or {})
+        args_copy.pop("auth_token", None)
+        self._set_pending_action("intent_alias_replay", {
+            "phrase": str(phrase or "").strip(),
+            "tool_name": str(tool_name or "").strip(),
+            "tool_args": args_copy,
+            "confidence": float(confidence or 0.0),
+            "created_at": time.time(),
+        })
+
+    def _get_pending_alias_replay(self) -> Optional[Dict[str, Any]]:
+        return self._get_pending_action("intent_alias_replay")
+
+    def _clear_pending_alias_replay(self) -> None:
+        self._clear_pending_action("intent_alias_replay")
+
+    def _is_generic_confirmation(self, text: str) -> bool:
+        t = str(text or "").strip().lower()
+        return re.search(r"^(?:yes|yeah|yep|yup|ok|okay|sure|do\s+it|run\s+it|use\s+it|that\s+one)\b", t) is not None
+
+    def _is_generic_cancellation(self, text: str) -> bool:
+        t = str(text or "").strip().lower()
+        return re.search(r"^(?:no|nope|nah|cancel|stop|nevermind|never\s+mind|ignore\s+it)\b", t) is not None
 
     def _pending_write_target(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         if tool_name == "file_move":
@@ -2192,31 +3320,6 @@ class MK1Core:
 
     def _clear_pending_write_authorization(self) -> None:
         self._clear_pending_action("external_write")
-
-    def _set_pending_directory_scan(
-        self,
-        path: str,
-        mode: str,
-        user_input: str,
-    ) -> None:
-        self._set_pending_action("directory_scan", {
-            "path": str(path or "").strip(),
-            "mode": str(mode or "all").strip().lower() or "all",
-            "user_input": str(user_input or "").strip(),
-            "created_at": time.time(),
-        })
-
-    def _get_pending_directory_scan(self) -> Optional[Dict[str, Any]]:
-        return self._get_pending_action("directory_scan")
-
-    def _clear_pending_directory_scan(self) -> None:
-        self._clear_pending_action("directory_scan")
-
-    def _is_directory_scan_confirmation(self, text: str) -> bool:
-        return is_directory_scan_confirmation(text)
-
-    def _is_directory_scan_cancel(self, text: str) -> bool:
-        return is_directory_scan_cancel(text)
 
     def _is_write_authorization_confirmation(self, text: str) -> bool:
         return is_write_authorization_confirmation(text)
@@ -2399,6 +3502,7 @@ class MK1Core:
         probes: List[Tuple[str, str]] = [
             ("execute this code: print(1)", "code_execute"),
             ("run this powershell: Write-Output ok", "code_execute"),
+            ("probe the CPU and see what comes up", "ps_run"),
         ]
 
         missing: List[str] = []
@@ -2422,10 +3526,13 @@ class MK1Core:
         self,
         user_input: str,
         assistant_text: str,
+        retry_guided: bool = False,
     ) -> None:
         try:
             user_mem = str(user_input or "").strip()
             assistant_mem = str(assistant_text or "").strip()
+
+            self._remember_draft_artifact_from_turn(user_mem, assistant_mem)
 
             if len(user_mem) > 1800:
                 user_mem = user_mem[:1800].rstrip() + "..."
@@ -2446,6 +3553,11 @@ class MK1Core:
                 user_tags.extend(["user_memory", "routing_correction"])
 
             assistant_tags = ["short_term", "assistant_turn"]
+
+            if is_ostranauts_query(user_mem):
+                user_tags.append("ostranauts")
+                assistant_tags.append("ostranauts")
+
             if is_failed_decision_text(assistant_mem):
                 assistant_tags.append("failed_decision")
 
@@ -2459,6 +3571,14 @@ class MK1Core:
                 assistant_mem,
                 kind="interaction",
                 tags=assistant_tags,
+            )
+
+            # Why: turn storage is the best place to convert corrections and Ostranauts play sessions into lessons.
+            # Guard: keeps memory reinforcement additive instead of changing the live routing path.
+            self._maybe_store_learning_memory(
+                user_mem,
+                assistant_mem,
+                retry_guided=bool(retry_guided),
             )
 
             # Promote repeated short-term interaction fragments into long-term facts.
@@ -2671,7 +3791,14 @@ class MK1Core:
 
             if len(raw) >= 2 and ((raw[0] == '"' and raw[-1] == '"') or (raw[0] == "'" and raw[-1] == "'")):
                 inner = raw[1:-1]
-                val = bytes(inner, "utf-8").decode("unicode_escape")
+                try:
+                    parsed = ast.literal_eval(raw)
+                    val = parsed if isinstance(parsed, str) else inner
+                except Exception:
+                    try:
+                        val = bytes(inner, "utf-8").decode("unicode_escape")
+                    except Exception:
+                        val = inner
             else:
                 low = raw.lower()
                 if low in {"true", "false"}:
@@ -2765,26 +3892,27 @@ class MK1Core:
         formatted: str,
         tool_ok: bool,
     ) -> str:
-        convo = list(messages)
-        convo.append({
-            "role": "user",
-            "content": user_input,
-        })
-        convo.append({
-            "role": "system",
-            "content": (
-                "You are answering from verified tool output. "
-                "First sentence must state one concrete fact from VERIFIED OUTPUT. "
-                "After that, you may give concise suggestions, interpretation, or next steps. "
-                "Do not invent missing data, file contents, failures, or tool results. "
-                "If the output shows an error, say the error plainly first, then suggest what to do next. "
-                "Keep it concise and in Mina voice."
-            ),
-        })
-        convo.append({
-            "role": "assistant",
-            "content": f"VERIFIED OUTPUT:\n```text\n{formatted}\n```",
-        })
+        convo = [
+            {
+                "role": "system",
+                "content": (
+                    "You are answering from verified tool output. "
+                    "Start with a concise summary of the verified state shown in VERIFIED OUTPUT. "
+                    "After that, you may give concise suggestions, interpretation, or next steps that stay consistent with that verified state. "
+                    "Do not invent missing data, file contents, failures, or tool results. "
+                    "If the output shows an error, say the error plainly first, then suggest what to do next. "
+                    "Keep it concise and in Mina voice."
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_input,
+            },
+            {
+                "role": "assistant",
+                "content": f"VERIFIED OUTPUT:\n```text\n{formatted}\n```",
+            },
+        ]
 
         try:
             reply = self.model.chat(convo)
@@ -2815,41 +3943,25 @@ class MK1Core:
         formatted: str,
         tool_ok: bool,
     ) -> str:
-        if tool_name == "__tool_list__":
-            return formatted
+        if tool_name == "ps_run":
+            if tool_ok:
+                return f"Here's the verified PowerShell output:\n\n```text\n{formatted}\n```"
+            return f"PowerShell execution failed.\n\n```text\n{formatted}\n```"
 
-        if tool_name == "__tool_self_test__":
-            return formatted
-
-        if tool_name == "spotify_link":
-            return formatted
-
-        if tool_name == "web_search":
-            return formatted
-
-        if tool_name in {"dir_create", "file_write", "file_append", "file_delete", "file_move", "safe_copy"}:
-            return formatted
-
-        if tool_name in {"__search_mode_set__", "__search_mode_get__"}:
-            return formatted
-
-        if tool_name == "__task_memory_write__":
-            return formatted
-
-        if tool_name == "__driving_checkin_start__":
-            return formatted
-
-        if tool_name == "__driving_checkin_stop__":
-            return formatted
-
-        if tool_name == "__mina_shutdown_status__":
-            return formatted
-
-        if tool_name == "__mina_shutdown__":
+        if tool_name in self._raw_direct_render_tool_names():
             return formatted
 
         if tool_name == "file_read" and not self._wants_grounded_tool_analysis(user_input):
             return formatted
+
+        if tool_name in self._grounded_direct_render_tool_names():
+            return self._render_grounded_tool_analysis(
+                messages=messages,
+                user_input=user_input,
+                tool_name=tool_name,
+                formatted=formatted,
+                tool_ok=tool_ok,
+            )
 
         if tool_name in {"file_read", "ps_run", "code_execute", "__project_test_run__"} and self._wants_grounded_tool_analysis(user_input):
             return self._render_grounded_tool_analysis(
@@ -2860,20 +3972,25 @@ class MK1Core:
                 tool_ok=tool_ok,
             )
 
-        convo = list(messages)
-        convo.append({
-            "role": "user",
-            "content": user_input,
-        })
-
-        status = "success" if tool_ok else "failure"
-        convo.append({
-            "role": "system",
-            "content": (
-                "Write exactly one short Mina-style line with no quotes, no labels, no markdown, and no emojis. "
-                "Do not include technical details; those are handled separately."
-            ),
-        })
+        convo = [
+            {
+                "role": "system",
+                "content": (
+                    "You are answering from verified tool output. "
+                    "Write exactly one short Mina-style line with no quotes, no labels, no markdown, and no emojis. "
+                    "The verified output is the source of truth. Do not invent missing details or claim a different result. "
+                    "Do not include technical details beyond a tiny summary; those are handled separately."
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_input,
+            },
+            {
+                "role": "assistant",
+                "content": f"VERIFIED OUTPUT:\n```text\n{formatted}\n```",
+            },
+        ]
 
         try:
             reply = self.model.chat(convo)
@@ -3910,14 +5027,156 @@ class MK1Core:
             traceback.print_exc()
             return ""
 
+    def _extract_reply_code_block(self, reply: Dict[str, Any], target_path: str) -> str:
+        text = self._extract_text(reply)
+        if not text:
+            return ""
+        return self._extract_code_block_from_text(text, target_path=target_path)
+
+    def _artifact_request_keywords(self, user_input: str, target_path: str) -> List[str]:
+        raw = f"{user_input or ''} {os.path.splitext(os.path.basename(target_path or ''))[0]}".lower()
+        words = re.findall(r"[a-z]{3,}", raw)
+        stop = {
+            "mina", "travis", "please", "lets", "let", "make", "create", "build", "write", "save",
+            "generate", "program", "script", "file", "named", "called", "with", "that", "this", "into",
+            "from", "your", "just", "have", "screen", "character", "characters", "python",
+        }
+        ordered: List[str] = []
+        for word in words:
+            if word in stop:
+                continue
+            if word not in ordered:
+                ordered.append(word)
+        return ordered[:8]
+
+    def _looks_generic_file_stub(self, target_path: str, content: str) -> bool:
+        ext = os.path.splitext(str(target_path or ""))[1].lower()
+        low = str(content or "").strip().lower()
+        if not low:
+            return True
+        if ext != ".py":
+            return False
+
+        line_count = len([ln for ln in low.splitlines() if ln.strip()])
+        generic_markers = [
+            "hello world",
+            "hello, ",
+            "def say_hello",
+            "pass",
+            "todo",
+        ]
+        if any(marker in low for marker in generic_markers):
+            return True
+        if line_count <= 6 and "__name__ == \"__main__\"" in low:
+            return True
+        return False
+
+    def _content_matches_artifact_intent(self, user_input: str, target_path: str, content: str) -> bool:
+        text = str(content or "").strip()
+        if not text:
+            return False
+        if self._looks_generic_file_stub(target_path, text):
+            return False
+
+        ext = os.path.splitext(str(target_path or ""))[1].lower()
+        if ext != ".py":
+            return True
+
+        keywords = self._artifact_request_keywords(user_input, target_path)
+        if not keywords:
+            return True
+
+        low = text.lower()
+        matched = [kw for kw in keywords if kw in low]
+        rich_request = len(keywords) >= 3
+        if rich_request and not matched:
+            return False
+        return True
+
+    def _resolve_file_write_content_candidate(
+        self,
+        user_input: str,
+        target_path: str,
+        existing_content: str,
+        reply: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        existing = str(existing_content or "").strip()
+        if self._content_matches_artifact_intent(user_input, target_path, existing):
+            return existing, "existing"
+
+        drafted = self._extract_reply_code_block(reply, target_path)
+        if self._content_matches_artifact_intent(user_input, target_path, drafted):
+            return drafted, "reply_code"
+
+        stored = self._get_last_draft_artifact()
+        if isinstance(stored, dict):
+            stored_path = str(stored.get("target_path") or "").strip()
+            stored_content = str(stored.get("content") or "")
+            stored_request = str(stored.get("user_input") or user_input or "").strip()
+            target_name = os.path.basename(str(target_path or "")).strip().lower()
+            stored_name = os.path.basename(stored_path).strip().lower()
+            same_target = bool(target_name) and target_name == stored_name
+            if same_target and self._content_matches_artifact_intent(stored_request, target_path, stored_content):
+                return stored_content, "stored_draft"
+
+        remembered = self._search_code_artifact_memory(target_path=target_path, user_input=user_input)
+        if isinstance(remembered, dict):
+            remembered_request = str(remembered.get("user_input") or user_input or "").strip()
+            remembered_content = str(remembered.get("content") or "")
+            if self._content_matches_artifact_intent(remembered_request, target_path, remembered_content):
+                return remembered_content, "memory_artifact"
+
+        generated = self._generate_file_content_from_intent(
+            user_input=user_input,
+            target_path=target_path,
+        )
+        if self._content_matches_artifact_intent(user_input, target_path, generated):
+            return generated, "generated"
+
+        return "", "artifact_payload_hijack"
+
+    def _remember_artifact_payload_hijack(
+        self,
+        user_input: str,
+        target_path: str,
+    ) -> None:
+        try:
+            lesson = (
+                "Artifact write lesson: when a concrete file request names required behavior or imagery, "
+                "do not write a generic stub. Block the write and regenerate content that matches the requested artifact. "
+                f"Target={target_path}; request={self._compress_multiline(user_input, max_lines=2, max_chars=260)}"
+            )
+            self.memory.add_memory(
+                lesson,
+                kind="note",
+                tags=["user_memory", "learning_lesson", "routing_correction", "artifact_payload_hijack"],
+            )
+        except Exception:
+            traceback.print_exc()
+
     def _normalize_path(self, path: str) -> str:
         p = (path or "").strip().strip('"\'')
         if not p:
             return ""
         p = os.path.expanduser(os.path.expandvars(p))
-        if not os.path.isabs(p):
-            p = os.path.join(self.workspace_root, p)
-        return os.path.abspath(p)
+        if os.path.isabs(p):
+            return os.path.abspath(p)
+
+        workspace_root = os.path.abspath(str(getattr(self, "workspace_root", "") or ""))
+        project_root = os.path.abspath(str(getattr(self, "project_root", "") or os.path.join(os.path.dirname(__file__), "..")))
+
+        workspace_candidate = os.path.abspath(os.path.join(workspace_root, p)) if workspace_root else ""
+        project_candidate = os.path.abspath(os.path.join(project_root, p)) if project_root else ""
+
+        # Guard: if a relative path already exists under either root, resolve to
+        # the existing target so reads do not miss project files.
+        if workspace_candidate and os.path.exists(workspace_candidate):
+            return workspace_candidate
+        if project_candidate and os.path.exists(project_candidate):
+            return project_candidate
+
+        # Default new relative paths to personal workspace root.
+        return workspace_candidate or project_candidate or os.path.abspath(p)
 
     def _extract_path_from_text(self, text: str) -> str:
         raw = (text or "").strip()
@@ -4074,6 +5333,88 @@ class MK1Core:
             traceback.print_exc()
 
         return changed
+
+    def _repair_escaped_python_file(self, path: str) -> Dict[str, Any]:
+        p = self._normalize_path(path)
+        if not p:
+            return {"ok": False, "result": None, "error": "no_path_provided"}
+        if not os.path.isfile(p):
+            return {"ok": False, "result": None, "error": f"file_not_found: {p}"}
+
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                original = f.read()
+        except Exception as e:
+            return {"ok": False, "result": None, "error": f"read_failed: {e}"}
+
+        trimmed = original.strip()
+        changed = False
+        repaired = original
+
+        def _decode_escaped_source(payload: str) -> str:
+            # Decode common escaped source blobs (\n, \t, \"), preserving UTF-8 text.
+            return bytes(payload, "utf-8").decode("unicode_escape")
+
+        # Common failure form: an entire Python file saved as one quoted string
+        # containing escaped newlines, e.g. 'import os\nprint("hi")'.
+        if len(trimmed) >= 2 and trimmed[0] == trimmed[-1] and trimmed[0] in {'"', "'"}:
+            if any(tok in trimmed for tok in ["\\n", "\\r", "\\t", "\\\""]):
+                try:
+                    parsed = ast.literal_eval(trimmed)
+                    if isinstance(parsed, str) and parsed:
+                        repaired = parsed
+                        changed = repaired != original
+                except Exception:
+                    pass
+
+        # Fallback for malformed single-quoted blobs that never closed, e.g.
+        # 'import os\nimport tkinter as tk\nfrom tkinter import filedialog
+        if not changed and trimmed[:1] in {'"', "'"} and any(tok in trimmed for tok in ["\\n", "\\r", "\\t"]):
+            body = trimmed[1:]
+            if body and body[-1] in {'"', "'"}:
+                body = body[:-1]
+            try:
+                decoded = _decode_escaped_source(body)
+                if decoded.strip():
+                    repaired = decoded
+                    changed = repaired != original
+            except Exception:
+                pass
+
+        if not changed:
+            return {
+                "ok": False,
+                "result": {
+                    "path": p,
+                    "repaired": False,
+                },
+                "error": "no_escaped_string_wrapper_detected",
+            }
+
+        try:
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write(repaired)
+            py_compile.compile(p, doraise=True)
+        except Exception as e:
+            return {
+                "ok": False,
+                "result": {
+                    "path": p,
+                    "repaired": False,
+                },
+                "error": f"repair_write_or_compile_failed: {e}",
+            }
+
+        return {
+            "ok": True,
+            "result": {
+                "path": p,
+                "repaired": True,
+                "bytes_before": len(original),
+                "bytes_after": len(repaired),
+            },
+            "error": None,
+        }
 
     def _infer_project_path_from_recent_memory(self) -> str:
         candidates: List[str] = []
@@ -4532,6 +5873,79 @@ class MK1Core:
             ],
         }
 
+    def _autonomous_work_status(self) -> Dict[str, Any]:
+        curiosity = getattr(self, "curiosity", None)
+        curiosity_status: Dict[str, Any] = {}
+        try:
+            if curiosity is not None and hasattr(curiosity, "status"):
+                raw_status = curiosity.status()
+                if isinstance(raw_status, dict):
+                    curiosity_status = raw_status
+        except Exception:
+            traceback.print_exc()
+
+        candidates = self._autonomous_work_candidates()
+        preview: List[Dict[str, Any]] = []
+        for item in candidates[:5]:
+            if not isinstance(item, dict):
+                continue
+            preview.append({
+                "key": str(item.get("key") or "").strip(),
+                "title": str(item.get("title") or "").strip(),
+                "source": str(item.get("source") or "").strip(),
+                "reference": str(item.get("reference") or "").strip(),
+            })
+
+        return {
+            "ok": True,
+            "result": {
+                "curiosity": curiosity_status,
+                "autonomous_tool_status": self._autonomous_tool_status(),
+                "pending_candidate_count": len(candidates),
+                "pending_candidates": preview,
+            },
+            "error": None,
+        }
+
+    def _run_autonomous_work_once(self) -> Dict[str, Any]:
+        candidates = self._autonomous_work_candidates()
+        if not candidates:
+            return {
+                "ok": True,
+                "result": {
+                    "ran": False,
+                    "reason": "no_pending_autonomous_tasks",
+                    "pending_candidate_count": 0,
+                },
+                "error": None,
+            }
+
+        task = dict(candidates[0])
+        task_result = self._run_autonomous_work_task(task)
+        if not isinstance(task_result, dict):
+            task_result = {
+                "ok": False,
+                "summary": str(task_result or "invalid_autonomous_result"),
+                "error": "invalid_autonomous_result",
+            }
+
+        task_ok = bool(task_result.get("ok"))
+        return {
+            "ok": task_ok,
+            "result": {
+                "ran": True,
+                "task": {
+                    "key": str(task.get("key") or "").strip(),
+                    "title": str(task.get("title") or "").strip(),
+                    "source": str(task.get("source") or "").strip(),
+                    "reference": str(task.get("reference") or "").strip(),
+                },
+                "task_result": task_result,
+                "pending_candidate_count": max(0, len(candidates) - 1),
+            },
+            "error": None if task_ok else str(task_result.get("error") or "autonomous_work_failed"),
+        }
+
     def _run_autonomous_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if name != "web_search":
             return {"ok": False, "result": None, "error": f"autonomous_tool_not_allowed:{name}"}
@@ -4576,7 +5990,13 @@ class MK1Core:
             f"TASK: {title}\nDETAILS: {json.dumps(task.get('details', []))}\nPROJECT: {project_root}\n\n"
             f"SOURCE CONTEXT:\n{context_text[:30000]}\n\nWEB RESEARCH:\n{research_text}"
         )
-        reply = self.model.chat([{"role": "user", "content": prompt}], temperature=0.2, tools=None)
+        reply = self.model.chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0.2,
+            tools=None,
+            allow_fallback=False,
+            allow_model_load=False,
+        )
         model_text = self._extract_text(reply)
         if model_text.strip().lower().startswith("(lm studio error:"):
             result = {"ok": False, "summary": model_text.strip()[:1000], "error": "model_unavailable"}
@@ -5016,6 +6436,37 @@ class MK1Core:
         if self._turn_clock_thread and self._turn_clock_thread.is_alive():
             return
 
+        def _apply_curiosity_runtime_gate(curiosity: Any) -> None:
+            if not self.curiosity_suspend_during_ostranauts or curiosity is None:
+                return
+
+            now_monotonic = time.monotonic()
+            if now_monotonic - float(self._curiosity_gate_last_check_monotonic) < 10.0:
+                return
+            self._curiosity_gate_last_check_monotonic = now_monotonic
+
+            try:
+                status = get_ostranauts_status()
+                telemetry_online = bool(status.get("telemetry_online"))
+                if telemetry_online:
+                    telemetry_raw = status.get("telemetry")
+                    telemetry: Dict[str, Any] = telemetry_raw if isinstance(telemetry_raw, dict) else {}
+                    game_focused = bool(telemetry.get("game_focused"))
+                    reason = "ostranauts_active_focused" if game_focused else "ostranauts_active"
+                    hold_seconds = max(120, self.curiosity_pause_after_ostranauts_seconds)
+                    curiosity.set_pause(hold_seconds, reason=reason)
+                    self._curiosity_gate_last_active = True
+                    return
+
+                if self._curiosity_gate_last_active and self.curiosity_pause_after_ostranauts_seconds > 0:
+                    curiosity.set_pause(
+                        self.curiosity_pause_after_ostranauts_seconds,
+                        reason="ostranauts_recent_exit",
+                    )
+                self._curiosity_gate_last_active = False
+            except Exception:
+                traceback.print_exc()
+
         def _heartbeat() -> None:
             interval = float(getattr(self, "idle_clock_interval_seconds", 5))
             while not self._turn_clock_stop_event.wait(interval):
@@ -5026,6 +6477,7 @@ class MK1Core:
                     idle_seconds = max(0.0, time.monotonic() - float(self._last_user_activity_monotonic))
                     curiosity = getattr(self, "curiosity", None)
                     if curiosity is not None:
+                        _apply_curiosity_runtime_gate(curiosity)
                         curiosity.maybe_start(idle_seconds)
                 except Exception:
                     traceback.print_exc()
@@ -5583,6 +7035,8 @@ class MK1Core:
             facts = [
                 f"Mina workspace root is {self.workspace_root} and it is her full working workspace",
                 f"Mina can read and write within the workspace root {self.workspace_root}",
+                f"Mina project root is {self.project_root} for this codebase",
+                f"Mina can access both personal workspace {self.workspace_root} and project root {self.project_root}",
                 f"Mina projects root is {self._projects_root()} for active project work",
                 f"Mina scratch root is {os.path.join(self.workspace_root, 'scratch')} for quick notes, reminders, and temporary working files",
                 f"Mina templates root is {os.path.join(self.workspace_root, 'templates')} for reusable starting files and patterns",
@@ -6235,8 +7689,244 @@ class MK1Core:
         except Exception:
             traceback.print_exc()
 
+    def _seed_tool_usage_rules_memory(self) -> None:
+        """
+        Persist durable action-vs-chat and tool-call formatting rules so Mina can
+        recall tool usage behavior consistently across sessions.
+        """
+        try:
+            rules_text = "\n".join([
+                "Mina tool usage rules:",
+                "- Treat requests as ACTION when user asks to run/create/write/read/list/search/fetch/start/stop/check or gives a path/URL/command.",
+                "- Treat requests as CHAT when user asks for opinion, explanation, brainstorming, or casual conversation without execution targets.",
+                "- If ACTION is likely but required target/args are missing, ask clarifying questions as needed until target/args are unambiguous.",
+                "- Never claim a tool executed unless the tool result exists in this turn.",
+                "- After each successful tool run, persist follow-up context so short confirmations and pivots can continue the active workflow.",
+                "- Continuation context is runtime state (not disk durable) and may reset on service restart, so restate targets when needed.",
+                "- Tool call format: <|tool_call>call:tool_name{key: value}<tool_call|>.",
+            ]).strip()
+
+            if not rules_text:
+                return
+
+            exists = False
+            if hasattr(self.memory, "find_memory_id_by_text"):
+                exists = self.memory.find_memory_id_by_text(
+                    rules_text,
+                    include_kinds=["procedure"],
+                    include_tags=["tool_usage_rules"],
+                ) is not None
+
+            if not exists:
+                self.memory.add_memory(
+                    rules_text,
+                    kind="procedure",
+                    tags=["user_memory", "system_seed", "startup_fact", "tool_usage_rules"],
+                )
+        except Exception:
+            traceback.print_exc()
+
     def _path_alias_record(self, alias: str, path: str) -> str:
         return f"path_alias::{alias.strip().lower()}::{path}"
+
+    def _file_index_path(self) -> str:
+        return os.path.join(self.workspace_root, ".mina_file_index.json")
+
+    def _file_index_description(
+        self,
+        file_name: str,
+        rel_path: str,
+        root_kind: str,
+    ) -> str:
+        low_name = str(file_name or "").strip().lower()
+        low_rel = str(rel_path or "").strip().replace("\\", "/").lower()
+
+        if low_name in {"core.py", "agent/core.py"} or low_rel.endswith("agent/core.py"):
+            return "Main runtime brain: routing, memory, tools, and response logic."
+        if low_rel.endswith("agent/file_intents.py"):
+            return "Natural-language file and directory intent parsing rules."
+        if low_rel.endswith("agent/pending_actions.py"):
+            return "Pending confirmations and approval phrase handling."
+        if low_rel.endswith("agent/server/mk1_api.py"):
+            return "HTTP API entrypoint that serves Mina process endpoints."
+        if low_name == "mk1_config.json" or low_rel.endswith("config/mk1_config.json"):
+            return "Runtime configuration: workspace, model, tools, and behavior flags."
+        if low_name.startswith("start_") and low_name.endswith(".ps1"):
+            return "PowerShell start script for a Mina service."
+        if low_name.startswith("stop_") and low_name.endswith(".ps1"):
+            return "PowerShell stop script for a Mina service."
+        if low_name.startswith("launch_") and low_name.endswith(".py"):
+            return "Python launcher/orchestration script."
+        if low_name == "todo.md":
+            return "Project task tracker and active work items."
+        if low_name.startswith("test_") and low_name.endswith(".py"):
+            return "Automated test module."
+        if root_kind == "workspace":
+            return "Workspace file under Mina personal root."
+        return "Project file in Mina codebase."
+
+    def _build_file_index(self, max_files: int = 6000) -> Dict[str, Any]:
+        roots: List[Tuple[str, str]] = []
+        workspace_root = os.path.abspath(str(self.workspace_root or ""))
+        project_root = os.path.abspath(str(getattr(self, "project_root", "") or ""))
+
+        if workspace_root and os.path.isdir(workspace_root):
+            roots.append(("workspace", workspace_root))
+        if project_root and os.path.isdir(project_root):
+            roots.append(("project", project_root))
+
+        skip_dirs = {
+            ".git",
+            ".venv",
+            "__pycache__",
+            "node_modules",
+            "build",
+            "dist",
+            "logs",
+            "tmp",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+        }
+        allowed_exts = {
+            ".py", ".ps1", ".json", ".md", ".txt", ".yaml", ".yml",
+            ".toml", ".ini", ".js", ".ts", ".tsx", ".html", ".css",
+            ".bat", ".cmd", ".sql", ".csv",
+        }
+
+        indexed_paths = set()
+        entries: List[Dict[str, Any]] = []
+
+        for root_kind, root_path in roots:
+            for current, dirs, files in os.walk(root_path):
+                dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
+                for name in files:
+                    if len(entries) >= max_files:
+                        break
+
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext and ext not in allowed_exts:
+                        continue
+
+                    abs_path = os.path.abspath(os.path.join(current, name))
+                    norm = os.path.normcase(abs_path)
+                    if norm in indexed_paths:
+                        continue
+
+                    indexed_paths.add(norm)
+                    rel_path = os.path.relpath(abs_path, root_path).replace("\\", "/")
+                    entries.append({
+                        "name": name,
+                        "name_lower": name.lower(),
+                        "path": abs_path,
+                        "root_kind": root_kind,
+                        "rel_path": rel_path,
+                        "description": self._file_index_description(name, rel_path, root_kind),
+                    })
+
+                if len(entries) >= max_files:
+                    break
+
+        by_name: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in entries:
+            key = str(entry.get("name_lower") or "").strip()
+            if not key:
+                continue
+            by_name.setdefault(key, []).append(entry)
+
+        payload = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "entry_count": len(entries),
+            "entries": entries,
+            "by_name": by_name,
+        }
+        return payload
+
+    def _refresh_file_index(self, force: bool = False) -> None:
+        index_path = self._file_index_path()
+
+        if not force and os.path.isfile(index_path):
+            try:
+                with open(index_path, "r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+
+                entries = raw.get("entries", []) if isinstance(raw, dict) else []
+                if isinstance(entries, list) and entries:
+                    by_name: Dict[str, List[Dict[str, Any]]] = {}
+                    for item in entries:
+                        if not isinstance(item, dict):
+                            continue
+                        key = str(item.get("name_lower") or str(item.get("name") or "").lower()).strip()
+                        if key:
+                            by_name.setdefault(key, []).append(item)
+
+                    self._file_index = {
+                        "generated_at": str(raw.get("generated_at") or ""),
+                        "entries": entries,
+                        "by_name": by_name,
+                    }
+                    return
+            except Exception:
+                traceback.print_exc()
+
+        try:
+            built = self._build_file_index()
+            self._file_index = {
+                "generated_at": str(built.get("generated_at") or ""),
+                "entries": built.get("entries", []),
+                "by_name": built.get("by_name", {}),
+            }
+
+            save_payload = {
+                "generated_at": self._file_index.get("generated_at", ""),
+                "entry_count": len(self._file_index.get("entries", []) or []),
+                "entries": self._file_index.get("entries", []),
+            }
+            with open(index_path, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(save_payload, handle, indent=2, ensure_ascii=True)
+                handle.write("\n")
+        except Exception:
+            traceback.print_exc()
+
+    def _resolve_file_index_path(self, raw_path: str) -> str:
+        candidate = str(raw_path or "").strip().strip('"\'')
+        if not candidate:
+            return ""
+
+        # Only resolve simple bare file names here. Explicit/relative paths are
+        # still handled by existing path normalization behavior.
+        if os.path.isabs(candidate) or "\\" in candidate or "/" in candidate:
+            return ""
+
+        key = candidate.lower()
+        by_name = self._file_index.get("by_name", {}) if isinstance(self._file_index, dict) else {}
+        if not by_name:
+            self._refresh_file_index(force=False)
+            by_name = self._file_index.get("by_name", {}) if isinstance(self._file_index, dict) else {}
+        matches = by_name.get(key, []) if isinstance(by_name, dict) else []
+        if not matches:
+            return ""
+
+        if len(matches) == 1:
+            return str(matches[0].get("path") or "")
+
+        workspace_root = os.path.normcase(os.path.abspath(str(self.workspace_root or "")))
+        project_root = os.path.normcase(os.path.abspath(str(getattr(self, "project_root", "") or "")))
+
+        def score(match: Dict[str, Any]) -> Tuple[int, int]:
+            p = os.path.normcase(os.path.abspath(str(match.get("path") or "")))
+            s = 0
+            if p.startswith(project_root):
+                s += 20
+            if p.startswith(workspace_root):
+                s += 10
+            if "\\agent\\" in p:
+                s += 15
+            depth = len([seg for seg in p.replace("/", "\\").split("\\") if seg])
+            return s, -depth
+
+        ranked = sorted(matches, key=score, reverse=True)
+        return str(ranked[0].get("path") or "") if ranked else ""
 
     def _path_alias_deleted_record(self, alias: str) -> str:
         return f"path_alias_deleted::{alias.strip().lower()}"
@@ -6381,6 +8071,16 @@ class MK1Core:
                 for d in self.workspace_default_dirs
             ]
             existing_dirs = [d for d in default_dirs if os.path.isdir(d)]
+            index_entries = self._file_index.get("entries", []) if isinstance(self._file_index, dict) else []
+            index_common = []
+            for item in index_entries[:20]:
+                if not isinstance(item, dict):
+                    continue
+                index_common.append({
+                    "name": str(item.get("name") or ""),
+                    "path": str(item.get("path") or ""),
+                    "description": str(item.get("description") or ""),
+                })
 
             last_project = self.startup_context.get("last_worked_project")
             incomplete = self.startup_context.get("incomplete_projects", [])
@@ -6396,12 +8096,54 @@ class MK1Core:
                     "root_exists": root_exists,
                     "default_dirs": default_dirs,
                     "existing_default_dirs": existing_dirs,
+                    "file_index": {
+                        "path": self._file_index_path(),
+                        "generated_at": self._file_index.get("generated_at", "") if isinstance(self._file_index, dict) else "",
+                        "entry_count": len(index_entries),
+                        "common_files": index_common,
+                    },
                     "project_count": self.startup_context.get("project_count", 0),
                     "last_worked_project": last_project,
                     "incomplete_projects": incomplete,
                 },
                 "error": None,
             }
+        except Exception as e:
+            return {"ok": False, "result": None, "error": str(e)}
+
+    def _file_index_status(self) -> Dict[str, Any]:
+        try:
+            entries = self._file_index.get("entries", []) if isinstance(self._file_index, dict) else []
+            by_name = self._file_index.get("by_name", {}) if isinstance(self._file_index, dict) else {}
+
+            common = []
+            for item in entries[:30]:
+                if not isinstance(item, dict):
+                    continue
+                common.append({
+                    "name": str(item.get("name") or ""),
+                    "path": str(item.get("path") or ""),
+                    "description": str(item.get("description") or ""),
+                })
+
+            return {
+                "ok": True,
+                "result": {
+                    "index_path": self._file_index_path(),
+                    "generated_at": self._file_index.get("generated_at", "") if isinstance(self._file_index, dict) else "",
+                    "entry_count": len(entries),
+                    "unique_names": len(by_name) if isinstance(by_name, dict) else 0,
+                    "common_files": common,
+                },
+                "error": None,
+            }
+        except Exception as e:
+            return {"ok": False, "result": None, "error": str(e)}
+
+    def _file_index_refresh(self) -> Dict[str, Any]:
+        try:
+            self._refresh_file_index(force=True)
+            return self._file_index_status()
         except Exception as e:
             return {"ok": False, "result": None, "error": str(e)}
 
@@ -6967,15 +8709,141 @@ class MK1Core:
 
         return text
 
+    def _maybe_rescue_chat_suggested_action(
+        self,
+        messages: List[Dict[str, Any]],
+        user_input: str,
+        assistant_text: str,
+        request_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        user_text = str(user_input or "").strip()
+        reply_text = str(assistant_text or "").strip()
+        if not user_text or not reply_text:
+            return None
+
+        action_signal = (
+            self._is_command_like_query(user_text)
+            or self._is_action_request_like(user_text)
+            or self._is_operational_incident_report(user_text)
+        )
+
+        has_empty_tool_markup = re.search(
+            r"\|tool_call\s*>\s*<\s*tool_call\|>|\|tool_call\s*>\s*</tool_call\|>|<tool_call\|>\s*\|tool_call>",
+            reply_text,
+            re.IGNORECASE,
+        ) is not None
+
+        if has_empty_tool_markup:
+            drafted_path = self._infer_draft_target_path(user_text, reply_text)
+            drafted_code = self._extract_code_block_from_text(reply_text, target_path=drafted_path)
+            if drafted_path and drafted_code.strip():
+                synthetic_input = f"save this to {drafted_path}"
+                synthetic_reply = {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": reply_text,
+                            }
+                        }
+                    ]
+                }
+                return self._reflex_tools_and_memory(
+                    messages=messages,
+                    reply=synthetic_reply,
+                    user_input=synthetic_input,
+                    request_context=request_context,
+                )
+
+            # Generic malformed-call rescue: if the model emitted empty tool
+            # wrappers, attempt a normal intent/planner tool execution pass.
+            try:
+                rescued_tool, _rescued_args = self.detect_tool_intent(user_text)
+            except Exception:
+                rescued_tool = None
+
+            if not rescued_tool:
+                planned = self._plan_tool_action(user_text)
+                if planned is not None:
+                    rescued_tool = planned[0]
+
+            if rescued_tool and rescued_tool != "__clarify_intent__":
+                return self._reflex_tools_and_memory(
+                    messages=messages,
+                    reply={},
+                    user_input=user_text,
+                    request_context=request_context,
+                )
+
+        if not action_signal:
+            return None
+
+        suggestion_signal = (
+            re.search(r"```(?:powershell|pwsh|cmd|bash|sh)?", reply_text, re.IGNORECASE) is not None
+            or re.search(r"\b(?:we can run|i can run|how about we run|shall we run|quick system check|run this command)\b", reply_text, re.IGNORECASE) is not None
+            or "I can run that with tools" in reply_text
+        )
+        if not suggestion_signal:
+            return None
+
+        try:
+            tool_name, _tool_args = self.detect_tool_intent(user_text)
+        except Exception:
+            traceback.print_exc()
+            return None
+
+        if not tool_name:
+            planned = self._plan_tool_action(user_text)
+            if planned is None:
+                return None
+            tool_name, _tool_args = planned
+
+        if tool_name == "__clarify_intent__":
+            return None
+
+        return self._reflex_tools_and_memory(
+            messages=messages,
+            reply={},
+            user_input=user_text,
+            request_context=request_context,
+        )
+
     def _direct_render_tool_names(self) -> set:
+        return self._raw_direct_render_tool_names().union(
+            self._grounded_direct_render_tool_names(),
+        )
+
+    def _raw_direct_render_tool_names(self) -> set:
         return {
             "__tool_list__",
             "__tool_self_test__",
             "__scratch_note__",
+            "__search_mode_set__",
+            "__search_mode_get__",
             "__path_alias_set__",
             "__path_alias_list__",
             "__path_alias_forget__",
+            "__driving_checkin_stop__",
+            "__mina_shutdown__",
+            "__task_memory_write__",
+            "__learn_play_song_shorthand__",
+            "__scaffold__",
+            "memory_write",
+            "web_search",
+            "web_fetch",
+            "dir_create",
+            "file_write",
+            "file_append",
+            "file_delete",
+            "file_move",
+            "safe_copy",
+            "spotify_link",
+        }
+
+    def _grounded_direct_render_tool_names(self) -> set:
+        return {
             "__workspace_info__",
+            "__file_index_status__",
+            "__file_index_refresh__",
             "__startup_status__",
             "__git_init__",
             "__git_status__",
@@ -6988,33 +8856,29 @@ class MK1Core:
             "__project_bootstrap__",
             "__memory_status__",
             "__memory_tidy__",
-            "__search_mode_set__",
-            "__search_mode_get__",
-            "__driving_checkin_stop__",
             "__mina_shutdown_status__",
-            "__mina_shutdown__",
-            "__task_memory_write__",
-            "__scaffold__",
-            "memory_write",
-            "web_search",
-            "web_fetch",
             "dir_list",
-            "dir_create",
             "file_read",
-            "file_write",
-            "file_append",
-            "file_delete",
-            "file_move",
-            "safe_copy",
             "github_repo",
             "ps_run",
             "code_execute",
-            "spotify_link",
+        }
+
+    def _truth_first_direct_tool_names(self) -> set:
+        return {
+            "__startup_status__",
+            "__memory_status__",
+            "__autonomous_work_status__",
+            "__project_tracker_status__",
+            "__file_index_status__",
+            "__mina_shutdown_status__",
+            "code_execute",
+            "dir_list",
+            "file_read",
         }
 
     def _should_direct_render_tool(self, tool_name: str) -> bool:
         return str(tool_name or "") in self._direct_render_tool_names()
-
 # ========================================================
 # PROCESS
 # ========================================================
@@ -7056,8 +8920,10 @@ class MK1Core:
             live_ostranauts_query = bool(
                 ostranauts_context and is_ostranauts_query(user_input)
             )
-            if (command_like and fast_command_skip_context) or live_ostranauts_query:
+            if command_like and fast_command_skip_context:
                 context = ""
+            elif live_ostranauts_query:
+                context = self._build_ostranauts_memory_context(user_input)
             else:
                 context = self.build_context(user_input)
 
@@ -7071,10 +8937,27 @@ class MK1Core:
                     "content": self.system_prompt,
                 })
 
+            messages.append({
+                "role": "system",
+                "content": self._interface_label_line(request_context),
+            })
+
+            messages.append({
+                "role": "system",
+                "content": self._interface_surface_line(request_context),
+            })
+
             if context:
                 messages.append({
                     "role": "system",
                     "content": f"Relevant memory context:\n{context}",
+                })
+
+            retry_prompt = self._learned_lesson_retry_prompt(context)
+            if retry_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": retry_prompt,
                 })
 
             if working_memory:
@@ -7114,6 +8997,10 @@ class MK1Core:
                 messages.append({
                     "role": "system",
                     "content": self._truth_first_system_rules(),
+                })
+                messages.append({
+                    "role": "system",
+                    "content": self._tool_usage_decision_rules(),
                 })
 
             # Add tool availability hint if tools are available
@@ -7159,6 +9046,7 @@ class MK1Core:
                 self._store_turn_memory(
                     user_input=user_input,
                     assistant_text=final_text,
+                    retry_guided=bool(retry_prompt),
                 )
 
                 return {
@@ -7223,12 +9111,15 @@ class MK1Core:
             reply = self.model.chat(
                 messages=messages,
                 tools=None,  # Don't pass tools to avoid LMStudio timeout
+                allow_fallback=False,
+                allow_model_load=False,
             )
 
             # Handle tool calls if present
             max_tool_loops = 3
             loop_count = 0
             last_assistant_content = ""
+            executed_tool_events: List[Tuple[str, Dict[str, Any]]] = []
             tool_pattern = self._tool_call_pattern()
             
             while reply and loop_count < max_tool_loops:
@@ -7285,6 +9176,13 @@ class MK1Core:
                         print(f"\n>>> TOOL CALL: {tool_name} {tool_args}")
                         tool_result = self.tools.run(tool_name, tool_args)
                         print(f">>> RESULT: {str(tool_result)[:200]}")
+
+                        tool_result_dict = tool_result if isinstance(tool_result, dict) else {
+                            "ok": False,
+                            "result": None,
+                            "error": "invalid_tool_result",
+                        }
+                        executed_tool_events.append((tool_name, tool_result_dict))
                         
                         messages.append({
                             "role": "tool",
@@ -7296,6 +9194,8 @@ class MK1Core:
                         reply = self.model.chat(
                             messages=messages,
                             tools=None,  # Don't pass tools - LMStudio hangs
+                            allow_fallback=False,
+                            allow_model_load=False,
                         )
                     except Exception as e:
                         print(f"\n>>> MODEL ERROR: {e}")
@@ -7308,10 +9208,22 @@ class MK1Core:
                 messages,
                 reply,
             )
+            final_text = self._enforce_tool_outcome_truth(final_text, executed_tool_events)
+
+            if not executed_tool_events:
+                rescued = self._maybe_rescue_chat_suggested_action(
+                    messages=messages,
+                    user_input=user_input,
+                    assistant_text=final_text,
+                    request_context=request_context,
+                )
+                if rescued is not None:
+                    final_text = self._extract_text(rescued)
 
             self._store_turn_memory(
                 user_input=user_input,
                 assistant_text=final_text,
+                retry_guided=bool(retry_prompt),
             )
 
             response: Dict[str, Any] = {
@@ -7359,8 +9271,10 @@ class MK1Core:
             live_ostranauts_query = bool(
                 ostranauts_context and is_ostranauts_query(user_input)
             )
-            if (command_like and self.fast_command_skip_context) or live_ostranauts_query:
+            if command_like and self.fast_command_skip_context:
                 context = ""
+            elif live_ostranauts_query:
+                context = self._build_ostranauts_memory_context(user_input)
             else:
                 context = self.build_context(user_input)
 
@@ -7374,10 +9288,27 @@ class MK1Core:
                     "content": self.system_prompt,
                 })
 
+            messages.append({
+                "role": "system",
+                "content": self._interface_label_line(request_context),
+            })
+
+            messages.append({
+                "role": "system",
+                "content": self._interface_surface_line(request_context),
+            })
+
             if context:
                 messages.append({
                     "role": "system",
                     "content": f"Relevant memory context:\n{context}",
+                })
+
+            retry_prompt = self._learned_lesson_retry_prompt(context)
+            if retry_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": retry_prompt,
                 })
 
             if working_memory:
@@ -7412,6 +9343,16 @@ class MK1Core:
                 "role": "system",
                 "content": self._format_turn_clock_line(turn_clock),
             })
+
+            if str(getattr(self, "action_mode_strictness", "balanced")) in {"balanced", "strict"}:
+                messages.append({
+                    "role": "system",
+                    "content": self._truth_first_system_rules(),
+                })
+                messages.append({
+                    "role": "system",
+                    "content": self._tool_usage_decision_rules(),
+                })
 
             tool_schemas = self.tools.get_tool_schemas()
             if tool_schemas:
@@ -7486,10 +9427,132 @@ class MK1Core:
                     "content": user_input,
                 })
 
+            tool_preflight = (
+                str(getattr(self, "action_mode_strictness", "balanced") or "balanced") in {"balanced", "strict"}
+                and (
+                    self._is_command_like_query(user_input)
+                    or self._is_action_request_like(user_input)
+                    or self._is_operational_incident_report(user_input)
+                )
+            )
+
+            if tool_preflight:
+                try:
+                    reply = self.model.chat(
+                        messages=messages,
+                        tools=None,
+                        allow_fallback=False,
+                        allow_model_load=False,
+                    )
+
+                    max_tool_loops = 3
+                    loop_count = 0
+                    last_assistant_content = ""
+                    executed_tool_events: List[Tuple[str, Dict[str, Any]]] = []
+
+                    while reply and loop_count < max_tool_loops:
+                        loop_count += 1
+
+                        choice = reply.get("choices", [{}])[0] if reply.get("choices") else {}
+                        message = choice.get("message", {})
+                        text_content = message.get("content", "") or choice.get("text", "")
+
+                        matches = self._extract_tool_calls_from_text(text_content)
+
+                        if matches and text_content != last_assistant_content:
+                            last_assistant_content = text_content
+                            cleaned_content = self._strip_tool_call_markup(text_content)
+
+                            messages.append({
+                                "role": "assistant",
+                                "content": cleaned_content or "[processing...]",
+                            })
+
+                            for tool_name, args_str in matches:
+                                tool_args = self._parse_tool_args(args_str)
+
+                                if tool_name in {
+                                    "play_track",
+                                    "play_playlist",
+                                    "pause",
+                                    "stop",
+                                    "shuffle_on",
+                                    "shuffle_off",
+                                    "set_shuffle",
+                                    "favorites_list",
+                                    "liked_songs",
+                                    "play_favorite",
+                                    "search_track",
+                                    "list_playlists",
+                                    "playlist_tracks",
+                                    "current_playback",
+                                    "create_playlist",
+                                    "add_track_to_playlist",
+                                    "add_tracks_to_playlist",
+                                    "connect_status",
+                                } and "spotify_link" in getattr(self.tools, "tools", {}):
+                                    tool_args.setdefault("action", tool_name)
+                                    tool_name = "spotify_link"
+
+                                tool_result = self.tools.run(tool_name, tool_args)
+                                tool_result_dict = tool_result if isinstance(tool_result, dict) else {
+                                    "ok": False,
+                                    "result": None,
+                                    "error": "invalid_tool_result",
+                                }
+                                executed_tool_events.append((tool_name, tool_result_dict))
+
+                                messages.append({
+                                    "role": "tool",
+                                    "content": str(tool_result),
+                                })
+
+                            reply = self.model.chat(
+                                messages=messages,
+                                tools=None,
+                                allow_fallback=False,
+                                allow_model_load=False,
+                            )
+                        else:
+                            break
+
+                    if executed_tool_events:
+                        final_text = self._handle_model_response(messages, reply)
+                        final_text = self._enforce_tool_outcome_truth(final_text, executed_tool_events)
+                        self._store_turn_memory(
+                            user_input=user_input,
+                            assistant_text=final_text,
+                        )
+                        for chunk in self._iter_text_chunks(final_text):
+                            yield chunk
+                        return
+
+                    preflight_text = self._handle_model_response(messages, reply)
+                    rescued = self._maybe_rescue_chat_suggested_action(
+                        messages=messages,
+                        user_input=user_input,
+                        assistant_text=preflight_text,
+                        request_context=request_context,
+                    )
+                    if rescued is not None:
+                        preflight_text = self._extract_text(rescued)
+                    if preflight_text:
+                        self._store_turn_memory(
+                            user_input=user_input,
+                            assistant_text=preflight_text,
+                        )
+                        for chunk in self._iter_text_chunks(preflight_text):
+                            yield chunk
+                        return
+                except Exception:
+                    traceback.print_exc()
+
             parts: List[str] = []
             for piece in self.model.chat_stream(
                 messages=messages,
                 tools=None,
+                allow_fallback=False,
+                allow_model_load=False,
             ):
                 if not piece:
                     continue
@@ -7501,10 +9564,24 @@ class MK1Core:
 
             if not final_text:
                 # Fallback in case backend didn't emit stream chunks.
-                reply = self.model.chat(messages=messages, tools=None)
+                reply = self.model.chat(
+                    messages=messages,
+                    tools=None,
+                    allow_fallback=False,
+                    allow_model_load=False,
+                )
                 final_text = self._handle_model_response(messages, reply)
                 for chunk in self._iter_text_chunks(final_text):
                     yield chunk
+
+            rescued = self._maybe_rescue_chat_suggested_action(
+                messages=messages,
+                user_input=user_input,
+                assistant_text=final_text,
+                request_context=request_context,
+            )
+            if rescued is not None:
+                final_text = self._extract_text(rescued)
 
             self._store_turn_memory(
                 user_input=user_input,
@@ -7539,6 +9616,13 @@ class MK1Core:
         if re.search(r"\b(write|append|delete|remove|create)\s+(?:a\s+)?(?:file|folder|directory)\b", q):
             return True
         if re.search(r"\b(run|start|stop|restart)\s+(?:the\s+)?(?:server|api|script|service|test|tests)\b", q):
+            return True
+
+        # System fact checks should route through verified tools, not chat-only prose.
+        if re.search(r"\b(what|which|how\s+much|how\s+many|current|local)\b", q) and re.search(
+            r"\b(cpu|gpu|ram|memory|vram|video\s+memory|system|os|platform|specs?|time|date)\b",
+            q,
+        ):
             return True
 
         # Media control commands should be treated as operational intents.
@@ -7648,6 +9732,105 @@ class MK1Core:
             return s
         return s[:max_chars].rstrip() + "..."
 
+    def _learned_lesson_retry_prompt(self, context: str) -> str:
+        text = str(context or "")
+        if "Learned lessons:" not in text:
+            return ""
+
+        lowered = text.lower()
+        failure_markers = [
+            "retry note:",
+            "prior attempt failed",
+            "failed_decision",
+        ]
+        if not any(marker in lowered for marker in failure_markers):
+            return ""
+
+        return (
+            "A recalled lesson indicates a prior failed attempt. Do not repeat the same blocked response. "
+            "Try a different safe approach first, and if that is not possible, explain the next concrete alternative."
+        )
+
+    def _learned_lesson_results(self, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
+        try:
+            lesson_semantic = self.memory.search(
+                query,
+                top_k=max(1, int(top_k)),
+                include_kinds=["note"],
+                include_tags=["learning_lesson"],
+            )
+        except Exception:
+            lesson_semantic = []
+
+        return sorted(
+            lesson_semantic,
+            key=lambda item: (
+                0 if "retry_attempt" in (item.get("tags") or []) else 1,
+                -float(item.get("timestamp") or 0.0),
+            ),
+        )
+
+    def _build_learned_lesson_context(self, query: str, top_k: int = 6) -> str:
+        lesson_semantic = self._learned_lesson_results(query, top_k=top_k)
+        if not lesson_semantic:
+            return ""
+
+        lines = ["Learned lessons:"]
+        seen = set()
+        for item in lesson_semantic:
+            txt = str(item.get("text") or "").strip()
+            if not txt:
+                continue
+            key = txt.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"- {txt}")
+
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    def _build_ostranauts_memory_context(self, query: str, top_k: int = 6) -> str:
+        learned = self._build_learned_lesson_context(query, top_k=top_k)
+
+        try:
+            tagged = self.memory.search(
+                query,
+                top_k=max(1, int(top_k)),
+                include_kinds=["note", "procedure", "fact", "interaction"],
+                include_tags=["ostranauts"],
+            )
+        except Exception:
+            tagged = []
+
+        lines = []
+        seen = set()
+
+        if learned:
+            lines.append(learned)
+            for line in learned.splitlines()[1:]:
+                cleaned = str(line).strip()
+                if cleaned.startswith("-"):
+                    seen.add(cleaned.lstrip("- ").lower())
+
+        ostr_lines: List[str] = []
+        for item in tagged or []:
+            txt = str(item.get("text") or "").strip()
+            if not txt:
+                continue
+            key = txt.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ostr_lines.append(f"- {txt}")
+
+        if ostr_lines:
+            if lines:
+                lines.append("")
+            lines.append("Ostranauts memory:")
+            lines.extend(ostr_lines[:max(1, int(top_k))])
+
+        return "\n".join(lines).strip()
+
     def _build_turn_working_memory(self, query: str) -> str:
         """
         Build a compact, authoritative per-turn working-memory block from DB.
@@ -7733,13 +9916,15 @@ class MK1Core:
                 include_tags=["short_term"],
             )
 
+            lesson_semantic = self._learned_lesson_results(query, top_k=6)
+
             long_semantic = self.memory.search(
                 query,
                 top_k=4,
                 include_kinds=["fact", "tool", "preference", "procedure"],
             )
 
-            if not recent_turns and not short_semantic and not long_semantic:
+            if not recent_turns and not short_semantic and not lesson_semantic and not long_semantic:
                 return ""
 
             lines: List[str] = []
@@ -7766,10 +9951,21 @@ class MK1Core:
                     seen.add(txt)
                     lines.append(f"- {txt}")
 
+            if lesson_semantic:
+                if lines:
+                    lines.append("")
+                lines.append("Learned lessons:")
+                for r in lesson_semantic:
+                    txt = r.get("text", "").strip()
+                    if not txt or txt in seen:
+                        continue
+                    seen.add(txt)
+                    lines.append(f"- {txt}")
+
             if not lines:
                 return ""
 
-            return "\n".join(lines[:18])
+            return "\n".join(lines[:28])
 
         except Exception:
             traceback.print_exc()
@@ -7798,6 +9994,38 @@ class MK1Core:
         if payload.get(ok_key):
             return f"{ok_prefix}: {payload.get(path_key)}"
         return fallback_ok
+
+    def _format_generic_tool_failure(self, tool_name: str, result: Dict[str, Any]) -> str:
+        if not isinstance(result, dict):
+            return f"{tool_name} failed"
+
+        payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+        error_text = str(
+            result.get("error")
+            or payload.get("error")
+            or payload.get("message")
+            or payload.get("detail")
+            or ""
+        ).strip()
+        stderr = str(payload.get("stderr") or "").strip()
+        stdout = str(payload.get("stdout") or "").strip()
+
+        if stderr:
+            if error_text and error_text.lower() != stderr.lower():
+                return f"{tool_name} failed: {error_text}\n\nSTDERR:\n{stderr}"
+            return f"{tool_name} failed:\n\nSTDERR:\n{stderr}"
+
+        if error_text:
+            return f"{tool_name} failed: {error_text}"
+
+        if stdout:
+            return f"{tool_name} failed:\n\nSTDOUT:\n{stdout}"
+
+        status = str(payload.get("status") or "").strip()
+        if status:
+            return f"{tool_name} failed: {status}"
+
+        return f"{tool_name} failed"
 
     def _format_tool_result(
         self,
@@ -7887,8 +10115,24 @@ class MK1Core:
                 return f"Directory listing failed: {result.get('error')}"
             files = result.get("result", {}).get("items", [])
             if not files:
-                return "(directory empty)"
-            return "\n".join(files)
+                base = "(directory empty)"
+            else:
+                base = "\n".join(files)
+
+            if str(result.get("_followup_hint") or "") == "focus_prompt":
+                target = str(result.get("_followup_target") or "").strip()
+                if target:
+                    return (
+                        f"{base}\n\n"
+                        f"I scanned this directory. I can focus on {target} next unless you want another file. "
+                        "How should I proceed?"
+                    )
+                return (
+                    f"{base}\n\n"
+                    "I scanned this directory. Which file should I focus on next, and how should I proceed?"
+                )
+
+            return base
 
         if tool_name == "dir_create":
             if not result.get("ok"):
@@ -8005,6 +10249,55 @@ class MK1Core:
 
             return "\n".join(lines)
 
+        if tool_name == "__autonomous_work_status__":
+            if not result.get("ok"):
+                return f"Autonomous status failed: {result.get('error')}"
+
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            cur = payload.get("curiosity", {}) if isinstance(payload.get("curiosity", {}), dict) else {}
+            tool_state = payload.get("autonomous_tool_status", {}) if isinstance(payload.get("autonomous_tool_status", {}), dict) else {}
+            pending = int(payload.get("pending_candidate_count") or 0)
+            lines = [
+                f"Autonomous enabled: {cur.get('enabled')}",
+                f"Worker running: {cur.get('running')}",
+                f"Autonomous paused: {cur.get('paused')}",
+                f"Pending tasks: {pending}",
+                f"Allowed autonomous tools: {', '.join(tool_state.get('allowed', []) or []) or '(none)'}",
+                f"Available autonomous tools: {', '.join(tool_state.get('available', []) or []) or '(none)'}",
+            ]
+            preview = payload.get("pending_candidates", []) if isinstance(payload.get("pending_candidates", []), list) else []
+            if preview:
+                lines.append("Next tasks:")
+                for item in preview[:5]:
+                    if not isinstance(item, dict):
+                        continue
+                    lines.append(f"- {item.get('title')} [{item.get('source')}]")
+            return "\n".join(lines)
+
+        if tool_name == "__autonomous_work_run__":
+            if not result.get("ok"):
+                return f"Autonomous work run failed: {result.get('error')}"
+
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            if not bool(payload.get("ran", False)):
+                return "No pending autonomous tasks to run right now."
+
+            task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
+            task_result = payload.get("task_result", {}) if isinstance(payload.get("task_result", {}), dict) else {}
+            lines = [
+                f"Autonomous task ran: {task.get('title')}",
+                f"Source: {task.get('source')}",
+                f"Result: {'ok' if task_result.get('ok') else 'failed'}",
+            ]
+            summary = str(task_result.get("summary") or "").strip()
+            if summary:
+                lines.append(f"Summary: {summary}")
+            patch = task_result.get("patch", {}) if isinstance(task_result.get("patch", {}), dict) else {}
+            if patch:
+                lines.append(f"Patch: applied={patch.get('applied')} reason={patch.get('reason')}")
+            lines.append(f"Remaining queued tasks: {payload.get('pending_candidate_count')}")
+            return "\n".join(lines)
+
         if tool_name == "__git_init__":
             if not result.get("ok"):
                 return f"Git init failed: {result.get('error')}"
@@ -8098,31 +10391,10 @@ class MK1Core:
                 lines.extend(["STDERR:", stderr])
             return "\n".join(lines)
 
-        if tool_name == "__project_tracker_status__":
-            if not result.get("ok"):
-                return f"Project tracker status failed: {result.get('error')}"
-            payload = result.get("result", {})
-            lines = [
-                f"Tracker file: {payload.get('tracker_path')}",
-                f"Updated at: {payload.get('updated_at')}",
-                f"Tracked projects: {payload.get('project_count')}",
-            ]
-            incomplete = payload.get("incomplete_projects", [])
-            if incomplete:
-                lines.append("Projects to complete:")
-                for p in incomplete[:20]:
-                    steps = p.get("next_steps", []) if isinstance(p.get("next_steps", []), list) else []
-                    lines.append(f"- {p.get('name')} [{p.get('status')}]")
-                    if steps:
-                        lines.append(f"  next: {steps[0]}")
-            else:
-                lines.append("Projects to complete: none detected")
-            return "\n".join(lines)
-
         if tool_name == "__project_tracker_update__":
             if not result.get("ok"):
                 return f"Project tracker update failed: {result.get('error')}"
-            payload = result.get("result", {})
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
             return (
                 f"Project updated: {payload.get('project')}\n"
                 f"Status: {payload.get('status')}\n"
@@ -8288,6 +10560,16 @@ class MK1Core:
                 return f"Scheduled task stored: {stored}"
             return "Scheduled task stored successfully."
 
+        if tool_name == "__learn_play_song_shorthand__":
+            if not result.get("ok"):
+                return f"Play shorthand learning failed: {result.get('error')}"
+            payload = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
+            phrase = str(payload.get("phrase") or "").strip()
+            track = str(payload.get("track_query") or "").strip()
+            if phrase and track:
+                return f"Learned: '{phrase}' means play the song '{track}'."
+            return "Play shorthand learned."
+
         if tool_name == "web_fetch":
             if not result.get("ok"):
                 return f"Web fetch failed: {result.get('error')}"
@@ -8321,6 +10603,84 @@ class MK1Core:
                 q = payload.get("query") or "(no query)"
                 mode = str(payload.get("mode") or "balanced")
                 return f"No web results found for: {q} (mode={mode})"
+
+            def _extract_gpu_model(query_text: str) -> str:
+                qtxt = str(query_text or "")
+                m = re.search(r"\b(rx|rtx|gtx)\s*(\d{3,4})\s*(xt|ti)?\b", qtxt, re.IGNORECASE)
+                if m:
+                    brand = m.group(1).upper()
+                    number = m.group(2)
+                    suffix = (m.group(3) or "").upper()
+                    if suffix:
+                        return f"{brand} {number} {suffix}"
+
+                m2 = re.search(r"\b(radeon|geforce)\s+([A-Za-z0-9\-\s]{3,30})\b", qtxt, re.IGNORECASE)
+                if m2:
+                    return f"{m2.group(1).title()} {m2.group(2).strip()}"
+                return ""
+
+            def _extract_vram_gb(text_value: str) -> Optional[int]:
+                src = str(text_value or "")
+                if not src:
+                    return None
+
+                patterns = [
+                    r"\b(\d{1,2})\s*gb\s*(?:of\s+)?(?:gddr\d+\s+)?(?:video\s+)?(?:v)?ram\b",
+                    r"\b(?:vram|video\s+memory|memory)\s*[:\-]?\s*(\d{1,2})\s*gb\b",
+                    r"\b(\d{1,2})\s*gb\s*gddr\d+\b",
+                ]
+                for pat in patterns:
+                    m = re.search(pat, src, re.IGNORECASE)
+                    if m:
+                        try:
+                            value = int(m.group(1))
+                        except Exception:
+                            value = 0
+                        if 1 <= value <= 64:
+                            return value
+                return None
+
+            query_text = str(payload.get("query") or "")
+            gpu_spec_q = (
+                re.search(r"\b(rx|rtx|gtx|radeon|geforce)\b", query_text, re.IGNORECASE) is not None
+                and re.search(r"\b(ram|vram|video\s+memory|memory)\b", query_text, re.IGNORECASE) is not None
+            )
+
+            if gpu_spec_q:
+                evidence_values: List[int] = []
+                source_urls: List[str] = []
+
+                for item in items[:5]:
+                    if not isinstance(item, dict):
+                        continue
+                    source_url = str(item.get("url") or "").strip()
+                    if source_url and source_url not in source_urls:
+                        source_urls.append(source_url)
+
+                    scan_fields = [
+                        str(item.get("title") or ""),
+                        str(item.get("snippet") or ""),
+                        str(item.get("content_excerpt") or ""),
+                    ]
+                    for field in scan_fields:
+                        v = _extract_vram_gb(field)
+                        if v is not None:
+                            evidence_values.append(v)
+
+                if evidence_values:
+                    counts: Dict[int, int] = {}
+                    for value in evidence_values:
+                        counts[value] = counts.get(value, 0) + 1
+                    best_value = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+                    gpu_model = _extract_gpu_model(query_text)
+                    label = gpu_model if gpu_model else "That GPU"
+
+                    lines = [f"{label} has {best_value} GB of VRAM."]
+                    if source_urls:
+                        lines.append("Sources:")
+                        for idx, link in enumerate(source_urls[:3], start=1):
+                            lines.append(f"{idx}. {link}")
+                    return "\n".join(lines)
 
             lines = []
             q = payload.get("query")
@@ -8600,7 +10960,7 @@ class MK1Core:
                 return f"Found {len(payload.get('devices') or [])} Spotify device(s)."
 
             if status in {"play_started", "playing"}:
-                return "Spotify playback started."
+                return "Playback command was sent to Spotify, but no confirmed track details were returned yet."
             if status in {"paused"}:
                 return "Spotify playback paused."
 
@@ -8608,7 +10968,16 @@ class MK1Core:
 
         if tool_name == "ps_run":
             if not result.get("ok"):
-                return f"PowerShell execution failed: {result.get('error')}"
+                error_text = str(result.get("error") or "").strip()
+                payload = result.get("result", {})
+                stderr = ""
+                if isinstance(payload, dict):
+                    stderr = str(payload.get("stderr") or "").strip()
+                if stderr:
+                    if error_text and error_text.lower() != stderr.lower():
+                        return f"PowerShell execution failed: {error_text}\n\nSTDERR:\n{stderr}"
+                    return f"PowerShell execution failed:\n\nSTDERR:\n{stderr}"
+                return f"PowerShell execution failed: {error_text or 'unknown_error'}"
             payload = result.get("result", {})
             stdout = payload.get("stdout", "")
             stderr = payload.get("stderr", "")
@@ -8648,6 +11017,9 @@ class MK1Core:
                 lines.append(f"EXIT CODE: {exit_code}")
 
             return "\n".join(lines)
+
+        if not result.get("ok"):
+            return self._format_generic_tool_failure(tool_name, result)
 
         return json.dumps(result, indent=2)
 
@@ -8786,6 +11158,14 @@ class MK1Core:
         if not tool_name:
             return None
 
+        followup_request = self._is_context_followup_request(user_input)
+        followup_hint = str(tool_args.pop("__followup_hint__", "") or "").strip()
+        followup_target = str(tool_args.pop("__followup_target__", "") or "").strip()
+        if tool_name == "dir_list" and followup_request and not followup_hint:
+            followup_hint = "focus_prompt"
+            path_for_hint = str(tool_args.get("path") or "").strip()
+            followup_target = os.path.basename(path_for_hint) if path_for_hint else ""
+
         print("\n========================================")
         print("TOOL DETECTED")
         print("========================================")
@@ -8836,9 +11216,39 @@ class MK1Core:
                 if generated.strip():
                     tool_args["content"] = generated
 
+        if tool_name == "file_write":
+            target_path = str(tool_args.get("path", "") or "").strip()
+            if target_path:
+                chosen_content, content_source = self._resolve_file_write_content_candidate(
+                    user_input=user_input,
+                    target_path=target_path,
+                    existing_content=str(tool_args.get("content", "") or ""),
+                    reply=reply,
+                )
+                if content_source == "artifact_payload_hijack":
+                    self._remember_artifact_payload_hijack(user_input=user_input, target_path=target_path)
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": (
+                                        "I blocked that file write because the payload no longer matched the requested artifact. "
+                                        "I need to regenerate the file content for the same target instead of writing a generic stub."
+                                    ),
+                                }
+                            }
+                        ]
+                    }
+                if chosen_content.strip():
+                    tool_args["content"] = chosen_content
+
         if tool_name in ("file_read", "file_write", "file_append", "file_delete", "dir_create", "dir_list"):
             path_val = str(tool_args.get("path", "") or "").strip()
             if path_val:
+                if tool_name == "file_read":
+                    indexed_path = self._resolve_file_index_path(path_val)
+                    if indexed_path:
+                        path_val = indexed_path
                 tool_args["path"] = self._normalize_path(path_val)
             else:
                 resolved = self._resolve_path_alias(user_input)
@@ -8924,8 +11334,16 @@ class MK1Core:
             )
         elif tool_name == "__workspace_info__":
             result = self._workspace_info()
+        elif tool_name == "__file_index_status__":
+            result = self._file_index_status()
+        elif tool_name == "__file_index_refresh__":
+            result = self._file_index_refresh()
         elif tool_name == "__startup_status__":
             result = self._startup_status()
+        elif tool_name == "__autonomous_work_status__":
+            result = self._autonomous_work_status()
+        elif tool_name == "__autonomous_work_run__":
+            result = self._run_autonomous_work_once()
         elif tool_name == "__git_init__":
             result = self._git_init()
         elif tool_name == "__git_status__":
@@ -8941,6 +11359,10 @@ class MK1Core:
         elif tool_name == "__project_test_run__":
             result = self._run_project_tests(
                 request=str(tool_args.get("request", user_input) or user_input),
+            )
+        elif tool_name == "__repair_python_file__":
+            result = self._repair_escaped_python_file(
+                path=str(tool_args.get("path", "") or ""),
             )
         elif tool_name == "__project_tracker_status__":
             result = self._project_tracker_status()
@@ -9002,6 +11424,44 @@ class MK1Core:
                     "tags": write_tags,
                 },
             }
+        elif tool_name == "__learn_play_song_shorthand__":
+            phrase = self._normalize_user_intent_text(str(tool_args.get("phrase") or "")).lower().strip()
+            track_query = str(tool_args.get("track_query") or "").strip()
+            if not phrase or not track_query:
+                result = {
+                    "ok": False,
+                    "result": None,
+                    "error": "play_song_shorthand_invalid",
+                }
+            else:
+                record_text = self._play_song_shorthand_record(phrase, track_query)
+                exists = False
+                if hasattr(self.memory, "find_memory_id_by_text"):
+                    exists = self.memory.find_memory_id_by_text(
+                        record_text,
+                        include_kinds=["procedure"],
+                        include_tags=["play_song_shorthand"],
+                    ) is not None
+                if not exists:
+                    self.memory.add_memory(
+                        record_text,
+                        kind="procedure",
+                        tags=["user_memory", "play_song_shorthand"],
+                    )
+
+                if not isinstance(getattr(self, "_play_song_shorthand_cache", None), dict):
+                    self._play_song_shorthand_cache = {}
+                self._play_song_shorthand_cache[phrase] = track_query
+
+                result = {
+                    "ok": True,
+                    "stored": record_text,
+                    "result": {
+                        "phrase": phrase,
+                        "track_query": track_query,
+                    },
+                    "error": None,
+                }
         elif tool_name == "__project_bootstrap__":
             result = self._bootstrap_project(
                 project_name=str(tool_args.get("project", "") or ""),
@@ -9013,6 +11473,39 @@ class MK1Core:
             result = self._execute_scaffold_request(user_input)
         else:
             result = self.tools.run(tool_name, tool_args)
+
+        tool_name, tool_args, result, _recovered = self._recover_failed_tool_once(
+            user_input=user_input,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            result=result,
+        )
+
+        if isinstance(result, dict) and followup_hint:
+            result["_followup_hint"] = followup_hint
+            if followup_target:
+                result["_followup_target"] = followup_target
+
+        self._set_last_tool_event(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            user_input=user_input,
+            result=result if isinstance(result, dict) else None,
+        )
+        self._set_context_continuation(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            user_input=user_input,
+            result=result if isinstance(result, dict) else None,
+        )
+
+        if tool_name == "file_write" and isinstance(result, dict) and bool(result.get("ok", False)):
+            self._remember_code_artifact_memory(
+                target_path=str(tool_args.get("path", "") or "").strip(),
+                content=str(tool_args.get("content", "") or ""),
+                user_input=user_input,
+                source_tag="written_artifact",
+            )
 
         blocked_external_write = (
             tool_name in self._write_auth_tool_names()
@@ -9077,13 +11570,16 @@ class MK1Core:
         )
 
         if self._should_direct_render_tool(tool_name):
-            content = self._render_tool_response_as_mina(
-                messages=messages,
-                user_input=user_input,
-                tool_name=tool_name,
-                formatted=formatted,
-                tool_ok=bool(result.get("ok", True)),
-            )
+            if tool_name == "spotify_link" or tool_name in self._truth_first_direct_tool_names():
+                content = formatted
+            else:
+                content = self._render_tool_response_as_mina(
+                    messages=messages,
+                    user_input=user_input,
+                    tool_name=tool_name,
+                    formatted=formatted,
+                    tool_ok=bool(result.get("ok", True)),
+                )
             return {
                 "choices": [
                     {
@@ -9285,6 +11781,19 @@ IMPORTANT RULES:
                     "row_limit": 8,
                 }
 
+        # Natural bare-file phrasing support, e.g.:
+        # "read core.py", "open agent/core.py", "show ./notes.txt"
+        bare_file_read = re.search(
+            r'^\s*(?:(?:travis|mina)\s+)?(?:please\s+)?(?:read|open|show|view|cat)\s+'
+            r'(["\']?[^"\'\s]+\.[A-Za-z0-9]{1,8}["\']?)\s*[?.!,:;]*\s*$',
+            raw_text,
+            re.IGNORECASE,
+        )
+        if bare_file_read:
+            path = str(bare_file_read.group(1) or "").strip().strip('"\'')
+            if path:
+                return "file_read", {"path": path}
+
         if any(x in t for x in ["read file", "open file", "show file"]):
             m = re.search(r'["\']([^"\']+)["\']', text)
             if not m:
@@ -9344,6 +11853,11 @@ IMPORTANT RULES:
                     m = re.search(r'\brename\s+[A-Za-z]:\\[^\s,]+\s+to\s+([^\s,]+)', text, re.IGNORECASE)
                 if m:
                     dst = m.group(1).strip()
+
+            # Guard against false positives from generic prompts such as
+            # "create and save a program to rename files..." with no concrete paths.
+            if not src or not dst:
+                return None
 
             if src and dst and not os.path.isabs(dst):
                 dst = os.path.join(os.path.dirname(src), dst)
@@ -9457,23 +11971,42 @@ IMPORTANT RULES:
         original_text = text.strip()
         raw_text = self._normalize_user_intent_text(original_text)
         t = raw_text.lower().strip()
-
-        if self._get_pending_directory_scan() is not None:
-            if self._is_directory_scan_confirmation(raw_text):
-                return "__confirm_directory_scan__", {}
-            if self._is_directory_scan_cancel(raw_text):
-                return "__cancel_directory_scan__", {}
-
-        if self._is_directory_scan_confirmation(raw_text):
-            return "__confirm_directory_scan__", {}
-        if self._is_directory_scan_cancel(raw_text):
-            return "__cancel_directory_scan__", {}
+        action_like_request = self._is_action_request_like(raw_text)
+        intent_signals = self._intent_signal_profile(raw_text)
 
         if self._get_pending_write_authorization() is not None:
             if self._is_write_authorization_confirmation(raw_text):
                 return "__confirm_external_write__", {}
             if self._is_write_authorization_cancel(raw_text):
                 return "__cancel_external_write__", {}
+
+        pending_alias = self._get_pending_alias_replay()
+        if isinstance(pending_alias, dict):
+            if self._is_generic_confirmation(raw_text):
+                self._clear_pending_alias_replay()
+                tool_name = str(pending_alias.get("tool_name") or "").strip()
+                tool_args = pending_alias.get("tool_args", {}) if isinstance(pending_alias.get("tool_args", {}), dict) else {}
+                if tool_name and (tool_name in self._tool_registry()):
+                    return tool_name, dict(tool_args)
+            if self._is_generic_cancellation(raw_text):
+                self._clear_pending_alias_replay()
+                return "__clarify_intent__", {
+                    "question": "Okay, I will not use that learned shortcut. Tell me exactly what you want me to do."
+                }
+            # Any new non-confirmation input cancels the pending alias replay.
+            self._clear_pending_alias_replay()
+
+        continuation_intent = self._resolve_continuation_intent(raw_text)
+        if continuation_intent is not None:
+            return continuation_intent
+
+        draft_execution_intent = self._resolve_draft_execution_intent(raw_text)
+        if draft_execution_intent is not None:
+            return draft_execution_intent
+
+        contextual_followup = self._resolve_contextual_followup_intent(raw_text)
+        if contextual_followup is not None:
+            return contextual_followup
 
         enroll_match = re.search(
             r"\b(?:set|enroll|register|save)\s+(?:my\s+)?voice\s+(?:passphrase|phrase|code)\s*(?:to|as|:)?\s*(.+)$",
@@ -9494,11 +12027,18 @@ IMPORTANT RULES:
         if re.search(r"\b(?:voice\s+auth\s+status|voice\s+passphrase\s+status|identity\s+status)\b", t):
             return "__voice_auth_status__", {}
 
-        alias_hit = self._resolve_intent_alias(raw_text)
-        if alias_hit is not None:
-            return alias_hit
+        shorthand_rule = self._extract_play_song_shorthand_rule(raw_text)
+        if shorthand_rule:
+            return "__learn_play_song_shorthand__", shorthand_rule
 
-        ambiguity_prompt = self._maybe_build_ambiguity_prompt(raw_text)
+        play_shorthand_track = self._resolve_play_song_shorthand(raw_text)
+        if play_shorthand_track and "spotify_link" in self._tool_registry():
+            return "spotify_link", {
+                "action": "play_track",
+                "track_query": play_shorthand_track,
+            }
+
+        ambiguity_prompt = self._maybe_build_ambiguity_prompt(raw_text, intent_signals=intent_signals)
         if ambiguity_prompt:
             return "__clarify_intent__", {"question": ambiguity_prompt}
 
@@ -9509,7 +12049,7 @@ IMPORTANT RULES:
             or re.search(rf"\bsend\s+{recipient_pattern}\b[^.?!\n]{{0,100}}\b(?:text|sms|message)\b", t) is not None
         )
         if external_message_intent:
-            tool_names = set(getattr(self.tools, "tools", {}).keys())
+            tool_names = set(self._tool_registry().keys())
             has_messaging_tool = any(name in tool_names for name in ["sms_send", "send_text", "phone_text", "twilio_sms"])
             if not has_messaging_tool:
                 return "__capability_limit__", {
@@ -9523,10 +12063,85 @@ IMPORTANT RULES:
         if bulk_read_match:
             folder = self._extract_explicit_windows_path(raw_text)
             if folder and os.path.isdir(folder):
-                return "__queue_directory_scan__", {
+                return "__inspect_directory_tree__", {
                     "path": folder,
                     "mode": self._extract_directory_inspection_filter(raw_text),
                 }
+
+        def _infer_ps_command(text_value: str) -> str:
+            query = str(text_value or "").strip()
+            lowered_query = query.lower()
+
+            query = re.sub(
+                r"^(?:[a-z0-9_]+\s+)?(?:hey|hi|hello|yo|sup)\b[\s,.:!-]*",
+                "",
+                query,
+                flags=re.IGNORECASE,
+            ).strip()
+            query = re.sub(
+                r"^(?:mina|travis|assistant|buddy|hottie)\b[\s,.:!-]*",
+                "",
+                query,
+                flags=re.IGNORECASE,
+            ).strip()
+            lowered_query = query.lower()
+
+            if lowered_query in {"hardware info", "list hardware", "list the current hardware"}:
+                return "Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsHardwareAbstractionLayer"
+
+            if lowered_query in {"gpu info", "graphics info"}:
+                return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
+
+            if lowered_query in {"cpu info", "processor info"}:
+                return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
+
+            if lowered_query in {"memory info", "ram info"}:
+                return "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory"
+
+            if lowered_query in {"what time is it", "current time", "local time", "time now"}:
+                return 'Get-Date -Format "yyyy-MM-dd HH:mm:ss"'
+
+            if lowered_query in {"what date is it", "current date", "today\'s date", "todays date"}:
+                return 'Get-Date -Format "yyyy-MM-dd"'
+
+            if re.search(r"\b(probe|check|inspect|query|scan)\b.*\b(cpu|processor)\b", lowered_query) or re.search(r"\b(cpu|processor)\b.*\b(probe|check|inspect|query|scan)\b", lowered_query):
+                return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
+
+            if re.search(r"\b(what|current|local)\b.*\btime\b", lowered_query):
+                return 'Get-Date -Format "yyyy-MM-dd HH:mm:ss"'
+
+            if re.search(r"\b(what|current)\b.*\bdate\b", lowered_query):
+                return 'Get-Date -Format "yyyy-MM-dd"'
+
+            if re.search(r"\bwhat\b.*\bcpu\b", lowered_query):
+                return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
+
+            if re.search(r"\bwhat\b.*\bgpu\b", lowered_query):
+                return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
+
+            if re.search(r"\bwhat\b.*\b(ram|memory)\b", lowered_query):
+                return "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory"
+
+            if re.search(r"\bwhat\b.*\b(system|spec|specs|os|platform|hardware)\b", lowered_query):
+                return "Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsHardwareAbstractionLayer"
+
+            if re.search(r"\b(run|execute|show|list|get)\b", lowered_query):
+                if "powershell" in lowered_query or "ps" in lowered_query:
+                    query = re.sub(r"\bpowershell\b", "", query, count=1, flags=re.IGNORECASE).strip()
+                    query = re.sub(r"\bps\b", "", query, count=1, flags=re.IGNORECASE).strip()
+
+            if query.startswith('"') and query.endswith('"'):
+                query = query[1:-1]
+
+            try:
+                from tools.ps_run import _normalize_command as _normalize_ps_command
+                normalized = _normalize_ps_command(query)
+                if normalized:
+                    return normalized
+            except Exception:
+                traceback.print_exc()
+
+            return query
 
         # ====================================================
         # DIRECT TOOL MARKUP (USER-PASTED)
@@ -9539,22 +12154,43 @@ IMPORTANT RULES:
         if pasted_tool:
             tool_name = str(pasted_tool.group(1) or "").strip()
             args = self._parse_tool_args(str(pasted_tool.group(2) or ""))
-            if tool_name in getattr(self.tools, "tools", {}):
+            if tool_name in self._tool_registry():
                 return tool_name, args
 
         # Route configurable tool self-test requests early so mentions like
         # "spotify" or "github" don't get hijacked by other intent handlers.
         if self._is_tool_self_test_request(t):
-            available_tools = sorted(list(getattr(self.tools, "tools", {}).keys()))
+            available_tools = sorted(list(self._tool_registry().keys()))
             alias_map = self._tool_self_test_aliases(available_tools)
             mentions = self._tool_self_test_extract_tools(raw_text, alias_map)
             if re.search(r"\btools?\b", t) is not None or bool(mentions):
                 return "__tool_self_test__", {"request": raw_text}
 
+        # Route pasted runtime errors to a concrete file inspection path when possible.
+        runtime_error_report = (
+            "traceback (most recent call last)" in t
+            or "syntaxerror" in t
+            or re.search(r"\b(it\s+errors?\s+out|error\s+out|throws?\s+an\s+error|exception)\b", t) is not None
+        )
+        if runtime_error_report:
+            script_path = ""
+
+            m = re.search(r'File\s+"([^"]+\.py)"', raw_text, re.IGNORECASE)
+            if m:
+                script_path = str(m.group(1) or "").strip()
+
+            if not script_path:
+                m = re.search(r'\bpython(?:\.exe)?\s+([\w./\\:-]+\.py)\b', raw_text, re.IGNORECASE)
+                if m:
+                    script_path = str(m.group(1) or "").strip().strip('"\'')
+
+            if script_path:
+                return "__repair_python_file__", {"path": script_path}
+
         # ====================================================
         # TRAVEL PRICE SEARCH (DIRECT ROUTING)
         # ====================================================
-        if "web_search" in getattr(self.tools, "tools", {}):
+        if "web_search" in self._tool_registry():
             asks_price = re.search(r"\b(how\s+much|price|cost|fare|cheap|cheapest|budget)\b", t) is not None
             travel_intent = re.search(r"\b(flight|flights|airfare|airline|airport|ticket|route|layover|itinerary|laos|vientiane|luang\s+prabang)\b", t) is not None
             if asks_price and travel_intent:
@@ -9584,7 +12220,18 @@ IMPORTANT RULES:
         # ====================================================
         # SPOTIFY INTENT (DIRECT ROUTING)
         # ====================================================
-        spotify_available = "spotify_link" in getattr(self.tools, "tools", {})
+        spotify_available = "spotify_link" in self._tool_registry()
+        if spotify_available:
+            ostranauts_query = bool(intent_signals.get("ostranauts_query"))
+            explicit_spotify = bool(intent_signals.get("explicit_spotify"))
+            music_signal = re.search(
+                r"\b(music|song|songs|track|tracks|playlist|playlists|spotify|favorites?|favourites?)\b",
+                raw_text,
+                re.IGNORECASE,
+            ) is not None
+            if ostranauts_query and not explicit_spotify and not music_signal:
+                spotify_available = False
+
         t_spotify = re.sub(r"\bplay\s+list(s)?\b", r"playlist\1", t, flags=re.IGNORECASE)
         quoted_parts = re.findall(r'[^\w]?["\']([^"\']+)["\']', f" {raw_text}")
 
@@ -9834,20 +12481,28 @@ IMPORTANT RULES:
                 )
                 tail = _clean_track_query(tail)
 
+                # Keep normal conversational "play with me" style requests out of music routing.
+                conversational_tail = re.search(
+                    r"\b(with\s+me|with\s+you|with\s+us|with\s+them|with\s+him|with\s+her|"
+                    r"a\s+game|the\s+game|something|anything|around|along|together)\b",
+                    tail,
+                    re.IGNORECASE,
+                ) is not None
+
                 song_like = bool(
                     re.search(r"\b(song|track)\b", t_spotify)
                     or " - " in tail
                     or re.search(r"\bby\b", tail, re.IGNORECASE)
                 )
                 looks_like_short_title = len([w for w in tail.split() if w.strip()]) <= 8
-                obviously_not_song = re.search(r"\b(game|video|movie|show|series|app|program|code|script)\b", tail, re.IGNORECASE) is not None
-                if tail and (song_like or (looks_like_short_title and not obviously_not_song)):
+                obviously_not_song = re.search(r"\b(game|steam|ostranauts?|ostanauts?|ostronauts?|ostranaughts?|video|movie|show|series|app|program|code|script)\b", tail, re.IGNORECASE) is not None
+                if tail and not conversational_tail and (song_like or (looks_like_short_title and not obviously_not_song)):
                     return "spotify_link", {
                         "action": "play_track",
                         "track_query": tail,
                     }
 
-        spotify_mentioned = re.search(r"\b(?:spotify|sportify|spotfiy|spotfy|spotifi)\b", t) is not None
+        spotify_mentioned = re.search(r"\b(?:spotify|spotiy|sportify|spotfiy|spotfy|spotifi)\b", t) is not None
         if spotify_mentioned and spotify_available:
             quoted_track = quoted_parts[0].strip() if quoted_parts else ""
 
@@ -9872,7 +12527,7 @@ IMPORTANT RULES:
                     return tail.strip('"\'')
                 return ""
 
-            if re.search(r"\b(what\s+song|what\s+is\s+playing|what\'?s\s+playing|now\s+playing|current\s+song)\b", t):
+            if re.search(r"\b(what\s+song|what\s+is\s+playing|what\'?s\s+playing|now\s+playing|current\s+song|what\'?s\s+on\s+(?:spotify|spotiy|sportify|spotfiy|spotfy|spotifi)|what\s+is\s+on\s+(?:spotify|spotiy|sportify|spotfiy|spotfy|spotifi))\b", t):
                 return "spotify_link", {"action": "current_playback"}
 
             if re.search(r"\b(pause|stop)\b", t):
@@ -10371,6 +13026,17 @@ IMPORTANT RULES:
         ]):
             return "__workspace_info__", {}
 
+        if any(x in t for x in [
+            "file index",
+            "index files",
+            "indexed files",
+            "common files",
+            "where files are",
+        ]):
+            if any(y in t for y in ["refresh", "rebuild", "rescan", "update index", "reindex"]):
+                return "__file_index_refresh__", {}
+            return "__file_index_status__", {}
+
         set_search_mode_match = re.search(
             r"\b(?:set|use|switch|change)\s+(?:the\s+)?(?:web\s+)?search\s+mode\s+(?:to\s+)?(balanced|strict|wide)\b",
             raw_text,
@@ -10520,6 +13186,33 @@ IMPORTANT RULES:
         ]):
             return "__startup_status__", {}
 
+        if self._is_operational_incident_report(raw_text):
+            return "__startup_status__", {}
+
+        if any(x in t for x in [
+            "autonomous status",
+            "curiosity status",
+            "self fix status",
+            "self-fix status",
+            "self repair status",
+            "self-repair status",
+        ]):
+            return "__autonomous_work_status__", {}
+
+        if any(x in t for x in [
+            "fix yourself",
+            "fix your self",
+            "self fix",
+            "self-fix",
+            "self repair",
+            "self-repair",
+            "run autonomous work",
+            "run one autonomous task",
+            "run one self fix",
+            "run one self repair",
+        ]):
+            return "__autonomous_work_run__", {}
+
         is_scheduled_phrase = re.search(
             r"\b(remind\s+me|check\s+in|do|work\s+on|handle|take\s+care\s+of)\b.*\b(?:in\s+\d+\s*(seconds?|minutes?|hours?)|at\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?)\b",
             t,
@@ -10531,6 +13224,9 @@ IMPORTANT RULES:
             "memory health",
             "how is your memory",
             "how is your memory working",
+            "how's your memory",
+            "how is the memory",
+            "how's the memory",
             "is your memory working",
             "check memory",
         ]):
@@ -10548,6 +13244,28 @@ IMPORTANT RULES:
         ]):
             dry_run = any(x in t for x in ["preview", "dry run", "dry-run", "show only", "what would"])
             return "__memory_tidy__", {"dry_run": dry_run}
+
+        explicit_script_path = self._extract_explicit_windows_path(raw_text)
+        if explicit_script_path and explicit_script_path.lower().endswith(".py"):
+            path_handoff_signal = re.search(
+                r"\b(path\s+provided|use\s+the\s+path|is\s+the\s+code\s+generator|that(?:'|\s+)?s\s+the\s+generator|code\s+generator)\b",
+                t,
+            ) is not None
+            run_signal = re.search(r"\b(run|execute|launch|start)\b", t) is not None
+
+            if path_handoff_signal or run_signal:
+                # Keep execution follow-ups grounded even when the user provides
+                # only a file path and then says "run it" in the next turn.
+                self._set_last_draft_artifact(
+                    target_path=explicit_script_path,
+                    content="",
+                    user_input=raw_text,
+                )
+                if run_signal:
+                    return "ps_run", {
+                        "script": f'python "{explicit_script_path}"',
+                    }
+                return "file_read", {"path": explicit_script_path}
 
         create_project_match = re.search(
             r'\bcreate\s+project\s+["\']?([^"\']+?)["\']?(?:\s|$)',
@@ -10636,6 +13354,13 @@ IMPORTANT RULES:
                 return "__path_alias_set__", {"alias": alias, "path": path}
 
         intent = detect_memory_intent(t)
+
+        explicit_file_write_target = (
+            re.search(r"[A-Za-z]:\\[^\r\n]+\.[A-Za-z0-9]{1,8}\b", raw_text) is not None
+            and re.search(r"\b(save|write|create|make|generate|build)\b", t) is not None
+        )
+        if intent == "memory_write" and explicit_file_write_target:
+            intent = None
 
         if intent == "memory_read":
             q_read = raw_text
@@ -10877,6 +13602,26 @@ IMPORTANT RULES:
                 "include_content": False,
             }
 
+        # External hardware spec questions (e.g., GPU model VRAM) should use
+        # web lookup, not local shell execution.
+        gpu_model_spec_query = (
+            re.search(r"\b(rx|rtx|gtx|radeon|geforce)\b", t) is not None
+            and re.search(r"\b\d{3,4}\b", t) is not None
+            and re.search(r"\b(ram|vram|video\s+memory|memory)\b", t) is not None
+            and re.search(r"\b(how\s+much|how\s+many|what|physical)\b", t) is not None
+            and re.search(r"\b(my|this\s+pc|this\s+computer|on\s+this\s+system|your\s+system)\b", t) is None
+        )
+        if gpu_model_spec_query and "web_search" in self._tool_registry():
+            query = re.sub(r"\brx\s+(\d{3,4})\s+tx\b", r"RX \1 XT", raw_text, flags=re.IGNORECASE)
+            query = query.strip() or raw_text
+            return "web_search", {
+                "query": query,
+                "max_results": 5,
+                "timeout": 12,
+                "include_content": True,
+                "content_chars": 1200,
+            }
+
         # ====================================================
         # POWERSHELL SCRIPT EXECUTION (ps_run)
         # ====================================================
@@ -10929,11 +13674,20 @@ IMPORTANT RULES:
         ) or (
             re.search(r"\b(what|current|local)\b.*\b(time|date)\b", t) is not None
         ) or (
+            re.search(r"\b(tell\s+me\s+about|about|show\s+me)\b", t) is not None
+            and re.search(r"\b(cpu|gpu|ram|memory|system|hardware|os|platform|specs?)\b", t) is not None
+        ) or (
             (t.startswith("get ") or t.startswith("show ") or t.startswith("list "))
             and any(x in t for x in ["cpu", "gpu", "memory", "ram", "hardware", "system", "spec", "os", "platform"])
+        ) or (
+            re.search(r"\b(probe|check|inspect|query|scan)\b.*\b(cpu|gpu|ram|memory|system|hardware|os|platform|specs?)\b", t) is not None
+            or re.search(r"\b(cpu|gpu|ram|memory|system|hardware|os|platform|specs?)\b.*\b(probe|check|inspect|query|scan)\b", t) is not None
+        ) or (
+            re.search(r"\bping\b", t) is not None
+            and re.search(r"\b(cpu|gpu|ram|memory|system|hardware|specs?)\b", t) is not None
         ):
             return "ps_run", {
-                "script": raw_text
+                "script": _infer_ps_command(raw_text)
             }
 
         if re.match(r'^(run|execute|start)\b', t):
@@ -10941,8 +13695,19 @@ IMPORTANT RULES:
             alias_hit = self._resolve_path_alias(raw_text) is not None
             if path_like or alias_hit:
                 return "ps_run", {
-                    "script": raw_text
+                    "script": _infer_ps_command(raw_text)
                 }
+
+        if any(x in t for x in [
+            "file index",
+            "index files",
+            "indexed files",
+            "common files",
+            "where files are",
+        ]):
+            if any(y in t for y in ["refresh", "rebuild", "rescan", "update index", "reindex"]):
+                return "__file_index_refresh__", {}
+            return "__file_index_status__", {}
 
         file_dir_intent = self._detect_file_directory_intent(
             text=original_text,
@@ -11034,7 +13799,7 @@ IMPORTANT RULES:
             return "__tool_list__", {}
 
         if self._is_tool_self_test_request(t):
-            available_tools = sorted(list(getattr(self.tools, "tools", {}).keys()))
+            available_tools = sorted(list(self._tool_registry().keys()))
             alias_map = self._tool_self_test_aliases(available_tools)
             mentions = self._tool_self_test_extract_tools(raw_text, alias_map)
             if re.search(r"\btools?\b", t) is not None or bool(mentions):
@@ -11088,6 +13853,46 @@ IMPORTANT RULES:
             if planned is not None:
                 return planned
 
+        alias_hit = self._resolve_intent_alias(raw_text)
+        if alias_hit is not None:
+            alias_tool, alias_args = alias_hit
+            if alias_tool == "spotify_link":
+                ostranauts_query = bool(intent_signals.get("ostranauts_query"))
+                explicit_spotify = bool(intent_signals.get("explicit_spotify"))
+                music_signal = re.search(
+                    r"\b(music|song|songs|track|tracks|playlist|playlists|spotify|favorites?|favourites?)\b",
+                    raw_text,
+                    re.IGNORECASE,
+                ) is not None
+                if ostranauts_query and not explicit_spotify and not music_signal:
+                    alias_hit = None
+
+            if alias_hit is not None:
+                confidence = self._alias_replay_confidence(raw_text, alias_tool, alias_args)
+                if confidence >= 0.8:
+                    return alias_tool, alias_args
+
+                self._set_pending_alias_replay(
+                    phrase=raw_text,
+                    tool_name=alias_tool,
+                    tool_args=alias_args,
+                    confidence=confidence,
+                )
+                return "__clarify_intent__", {
+                    "question": "I have a learned shortcut for that phrase. Do you want me to run it now? Reply yes or no."
+                }
+
+        if action_like_request:
+            planned = self._plan_tool_action(raw_text)
+            if planned is not None:
+                return planned
+            return "__clarify_intent__", {
+                "question": (
+                    "I can run that with tools, but I need one detail first: "
+                    "what exact target should I act on (path, URL, command, or app)?"
+                )
+            }
+
         return None, {}
 
     def _planner_candidate_tools(self) -> List[str]:
@@ -11100,7 +13905,7 @@ IMPORTANT RULES:
             "powershell",
             "ps_run",
         ]
-        return [name for name in preferred if name in self.tools.tools]
+        return [name for name in preferred if name in self._tool_registry()]
 
     def _extract_json_dict(self, text: str) -> Optional[Dict[str, Any]]:
         raw = (text or "").strip()
@@ -11277,6 +14082,39 @@ IMPORTANT RULES:
         text = self._strip_tool_call_markup(text)
         return text or ""
 
+    def _enforce_tool_outcome_truth(
+        self,
+        assistant_text: str,
+        tool_events: List[Tuple[str, Dict[str, Any]]],
+    ) -> str:
+        text = str(assistant_text or "").strip()
+        if not isinstance(tool_events, list) or not tool_events:
+            return text
+
+        last_failed: Optional[Tuple[str, Dict[str, Any]]] = None
+        for event in reversed(tool_events):
+            if not isinstance(event, tuple) or len(event) != 2:
+                continue
+            tool_name, tool_result = event
+            if isinstance(tool_result, dict) and not bool(tool_result.get("ok", True)):
+                last_failed = (str(tool_name or "").strip(), tool_result)
+                break
+
+        if last_failed is None:
+            return text
+
+        failed_tool, failed_result = last_failed
+        failure_summary = self._format_tool_result(failed_tool, failed_result).strip()
+        if not failure_summary:
+            failure_summary = f"Tool '{failed_tool}' failed: {failed_result.get('error') or 'unknown_error'}"
+
+        if not text:
+            return failure_summary
+        if failure_summary.lower() in text.lower():
+            return text
+
+        return f"{failure_summary}\n\n{text}"
+
     # ========================================================
     # EXTRACT TEXT
     # ========================================================
@@ -11372,7 +14210,7 @@ IMPORTANT RULES:
                 "io_channels": "CLEAR",
                 "core_online": True,
                 "model_loaded": True,
-                "tool_count": len(self.tools.tools),
+                "tool_count": len(self._tool_registry()),
                 "memory_enabled": self.memory is not None,
                 "personality_loaded": bool(self.system_prompt),
                 "idle_checkin_pending": self._idle_checkin_pending,

@@ -20,7 +20,7 @@ import uvicorn
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     import winsound  # type: ignore
@@ -47,6 +47,7 @@ class ProcessRequest(BaseModel):
     voice_hint: Optional[str] = None
     image_attachment: Optional[dict] = None
     input_source: Optional[str] = None
+    interface_name: Optional[str] = None
     client_id: Optional[str] = None
     client_token: Optional[str] = None
 
@@ -75,6 +76,24 @@ class ModelSelectRequest(BaseModel):
     autoload: bool = True
     persist: bool = False
     force_reload: bool = False
+
+
+class OstranautsActionRequest(BaseModel):
+    action_id: Optional[str] = None
+    schema_version: int = 1
+    source: str = "ostranauts_companion"
+    kind: str = "ostranauts_action"
+    intent: str
+    verb: str = "plan"
+    target: str = ""
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    request_text: str
+    plan_text: str = ""
+    telemetry: Optional[dict[str, Any]] = None
+    requires_confirmation: bool = True
+    confidence: Optional[float] = None
+    safety: str = "review_required"
+    notes: str = ""
 
 
 def _resolve_tts_rate() -> float:
@@ -111,6 +130,9 @@ _restart_lock = threading.Lock()
 _restart_requested_until = 0.0
 _shutdown_commit_lock = threading.Lock()
 _shutdown_commit_started = False
+_ostranauts_action_lock = threading.Lock()
+_ostranauts_action_queue: deque[dict[str, Any]] = deque(maxlen=50)
+_ostranauts_action_counter = 0
 
 
 @app.on_event("shutdown")
@@ -119,6 +141,86 @@ def _shutdown_core() -> None:
         core.close()
     except Exception:
         pass
+
+
+def _next_ostranauts_action_id() -> str:
+    global _ostranauts_action_counter
+    with _ostranauts_action_lock:
+        _ostranauts_action_counter += 1
+        return f"ost-action-{int(time.time() * 1000)}-{_ostranauts_action_counter}"
+
+
+def _coerce_ostranauts_action(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = dict(payload or {})
+    action_id = str(raw.get("action_id") or raw.get("id") or "").strip() or _next_ostranauts_action_id()
+    confidence = raw.get("confidence")
+    try:
+        confidence_value = float(confidence) if confidence is not None else None
+    except Exception:
+        confidence_value = None
+
+    telemetry = raw.get("telemetry") if isinstance(raw.get("telemetry"), dict) else None
+    parameters = raw.get("parameters") if isinstance(raw.get("parameters"), dict) else {}
+    target = str(raw.get("target") or "").strip()
+
+    return {
+        "action_id": action_id,
+        "schema_version": int(raw.get("schema_version") or 1),
+        "source": str(raw.get("source") or "ostranauts_companion").strip() or "ostranauts_companion",
+        "kind": str(raw.get("kind") or "ostranauts_action").strip() or "ostranauts_action",
+        "intent": str(raw.get("intent") or "next_action").strip() or "next_action",
+        "verb": str(raw.get("verb") or "plan").strip() or "plan",
+        "target": target,
+        "parameters": parameters,
+        "request_text": str(raw.get("request_text") or "").strip(),
+        "plan_text": str(raw.get("plan_text") or "").strip(),
+        "telemetry": telemetry,
+        "requires_confirmation": bool(raw.get("requires_confirmation", True)),
+        "confidence": confidence_value,
+        "safety": str(raw.get("safety") or "review_required").strip() or "review_required",
+        "notes": str(raw.get("notes") or "").strip(),
+        "status": str(raw.get("status") or "queued").strip() or "queued",
+        "approved": bool(raw.get("approved", False)),
+        "queued_at": float(raw.get("queued_at") or time.time()),
+        "updated_at": float(time.time()),
+    }
+
+
+def _snapshot_ostranauts_actions(limit: Optional[int] = None) -> list[dict[str, Any]]:
+    with _ostranauts_action_lock:
+        items = [dict(item) for item in _ostranauts_action_queue]
+    if limit is None:
+        return items
+    safe_limit = max(1, int(limit))
+    return items[:safe_limit]
+
+
+def _queue_ostranauts_action(payload: dict[str, Any]) -> dict[str, Any]:
+    action = _coerce_ostranauts_action(payload)
+    with _ostranauts_action_lock:
+        _ostranauts_action_queue.appendleft(action)
+    return action
+
+
+def _update_ostranauts_action(action_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]:
+    needle = str(action_id or "").strip()
+    if not needle:
+        return None
+
+    with _ostranauts_action_lock:
+        items = [dict(item) for item in _ostranauts_action_queue]
+        for index, item in enumerate(items):
+            if str(item.get("action_id") or "").strip() != needle:
+                continue
+            updated = dict(item)
+            updated.update({key: value for key, value in (updates or {}).items() if value is not None})
+            updated["updated_at"] = float(time.time())
+            items[index] = updated
+            _ostranauts_action_queue.clear()
+            for queued in reversed(items):
+                _ostranauts_action_queue.appendleft(queued)
+            return updated
+    return None
 
 
 PHONE_HTML = """<!doctype html>
@@ -557,6 +659,7 @@ VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 START_API_SCRIPT = PROJECT_ROOT / "start_mk1_api.ps1"
 VOICE_MONITOR_PID_FILE = PROJECT_ROOT / ".mk1_voice_monitor.pid"
 VOICE_MONITOR_LOG_FILE = PROJECT_ROOT / "logs" / "voice_monitor.log"
+FANCY_GUI_PID_FILE = PROJECT_ROOT / ".mk1_fancy_gui.pid"
 CONFIG_GUI_DIR = str(getattr(core, "config", None).get("gui", "fancy_dir", "") if getattr(core, "config", None) else "").strip()
 FANCY_GUI_DIR = Path(os.getenv("MK1_FANCY_GUI_DIR", CONFIG_GUI_DIR or "C:/dev/mina-gui"))
 FANCY_AVATAR_FILES = {
@@ -606,6 +709,10 @@ def _read_pid_file(path: Path) -> Optional[int]:
         return None
 
 
+def _write_pid_file(path: Path, pid: int) -> None:
+    path.write_text(str(int(pid)), encoding="utf-8")
+
+
 def _pid_is_running(pid: int) -> bool:
     if pid is None or int(pid) <= 0:
         return False
@@ -643,35 +750,67 @@ def _task_queue_status(limit: int = 5) -> dict:
     out = {
         "available": False,
         "due_count": 0,
+        "queued_count": 0,
         "preview": [],
         "error": None,
     }
 
     try:
         mem = getattr(core, "memory", None)
-        if mem is None or not hasattr(mem, "get_due_tasks"):
+        if mem is None or not hasattr(mem, "get_task_memories"):
             return out
 
-        rows = mem.get_due_tasks(top_k=max(1, int(limit)), include_tags=["scheduled_task"])
-        due_items = rows if isinstance(rows, list) else []
+        safe_limit = max(1, int(limit))
+        rows = mem.get_task_memories(top_k=max(10, safe_limit * 10), include_done=False)
+        task_items = rows if isinstance(rows, list) else []
 
-        preview = []
-        for item in due_items[:max(1, int(limit))]:
-            preview.append(
+        now_ts = time.time()
+        queued_items = []
+        due_count = 0
+        for item in task_items:
+            if not isinstance(item, dict):
+                continue
+
+            tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+            if "scheduled_task" not in tags:
+                continue
+
+            due_at = item.get("due_at")
+            due = False
+            if due_at is not None:
+                try:
+                    due = float(due_at) <= now_ts
+                except Exception:
+                    due = False
+
+            if due:
+                due_count += 1
+
+            queued_items.append(
                 {
                     "id": item.get("id"),
                     "text": item.get("text"),
-                    "due_at": item.get("due_at"),
+                    "due_at": due_at,
+                    "due": due,
                     "alarm": _task_is_alarm(item),
                 }
             )
 
-        out["available"] = True
-        out["due_count"] = len(due_items)
-        out["preview"] = preview
+        queued_items.sort(
+            key=lambda t: (
+                0 if t.get("due") else 1,
+                float(t.get("due_at")) if t.get("due_at") is not None else 9e18,
+                int(t.get("id") or 0),
+            )
+        )
+
+        out["available"] = bool(queued_items)
+        out["due_count"] = due_count
+        out["queued_count"] = len(queued_items)
+        out["preview"] = queued_items[:safe_limit]
         return out
     except Exception as e:
-        out["available"] = bool(hasattr(getattr(core, "memory", None), "get_due_tasks"))
+        out["available"] = bool(hasattr(getattr(core, "memory", None), "get_task_memories"))
         out["error"] = str(e)
         return out
 
@@ -1592,6 +1731,7 @@ def process(req: ProcessRequest):
             image_attachment=req.image_attachment,
             request_context={
                 "input_source": req.input_source,
+                "interface_name": req.interface_name,
                 "client_id": req.client_id,
                 "client_token": req.client_token,
             },
@@ -1897,6 +2037,70 @@ def voice_status():
 @app.get("/games/ostranauts/status")
 def ostranauts_status():
     return get_ostranauts_status()
+
+
+@app.get("/games/ostranauts/actions")
+def ostranauts_actions(limit: int = 25):
+    safe_limit = max(1, min(50, int(limit)))
+    queue = _snapshot_ostranauts_actions(limit=safe_limit)
+    return {
+        "ok": True,
+        "count": len(_snapshot_ostranauts_actions()),
+        "queue": queue,
+    }
+
+
+@app.post("/games/ostranauts/actions/propose")
+def ostranauts_actions_propose(request: OstranautsActionRequest):
+    payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    action = _queue_ostranauts_action(payload)
+    return {
+        "ok": True,
+        "action": action,
+        "queue": _snapshot_ostranauts_actions(limit=5),
+    }
+
+
+@app.post("/games/ostranauts/actions/{action_id}/approve")
+def ostranauts_actions_approve(action_id: str):
+    action = _update_ostranauts_action(action_id, {"status": "approved", "approved": True})
+    if action is None:
+        raise HTTPException(status_code=404, detail="ostranauts_action_not_found")
+    return {
+        "ok": True,
+        "action": action,
+    }
+
+
+@app.post("/games/ostranauts/actions/{action_id}/discard")
+def ostranauts_actions_discard(action_id: str):
+    needle = str(action_id or "").strip()
+    if not needle:
+        raise HTTPException(status_code=400, detail="ostranauts_action_id_required")
+
+    removed = None
+    with _ostranauts_action_lock:
+        items = [dict(item) for item in _ostranauts_action_queue]
+        kept = []
+        for item in items:
+            if removed is None and str(item.get("action_id") or "").strip() == needle:
+                removed = dict(item)
+                continue
+            kept.append(item)
+
+        if removed is None:
+            raise HTTPException(status_code=404, detail="ostranauts_action_not_found")
+
+        _ostranauts_action_queue.clear()
+        for item in reversed(kept):
+            _ostranauts_action_queue.appendleft(item)
+
+    removed["status"] = "discarded"
+    removed["updated_at"] = float(time.time())
+    return {
+        "ok": True,
+        "action": removed,
+    }
 
 
 @app.get("/tasks/queue_status")
@@ -2215,6 +2419,21 @@ def service_open_fancy_gui():
             "path": str(FANCY_GUI_DIR),
         }
 
+    existing_pid = _read_pid_file(FANCY_GUI_PID_FILE)
+    if existing_pid is not None and _pid_is_running(existing_pid):
+        return {
+            "ok": True,
+            "already_running": True,
+            "pid": int(existing_pid),
+            "cwd": str(FANCY_GUI_DIR),
+        }
+
+    if existing_pid is not None and not _pid_is_running(existing_pid):
+        try:
+            FANCY_GUI_PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     try:
         kwargs: dict[str, Any] = {
             "cwd": str(FANCY_GUI_DIR),
@@ -2238,6 +2457,7 @@ def service_open_fancy_gui():
             ],
             **kwargs,
         )
+        _write_pid_file(FANCY_GUI_PID_FILE, proc.pid)
         return {
             "ok": True,
             "pid": proc.pid,

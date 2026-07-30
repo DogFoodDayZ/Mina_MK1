@@ -1,7 +1,22 @@
+import ast
 import os
 from typing import Any, Dict
 
 from tools.file_access_policy import authorize_write_paths, normalize_tool_path
+
+
+def _normalize_write_content(content: Any) -> str:
+    text = str(content or "")
+    trimmed = text.strip()
+    if len(trimmed) >= 2 and trimmed[0] == trimmed[-1] and trimmed[0] in {'"', "'"}:
+        if any(token in trimmed for token in ["\\n", "\\r", "\\t", "\\\""]):
+            try:
+                parsed = ast.literal_eval(trimmed)
+                if isinstance(parsed, str):
+                    return parsed
+            except Exception:
+                pass
+    return text
 
 def file_write_impl(
     path: str,
@@ -41,9 +56,11 @@ def file_write_impl(
                 "error": "file_exists_no_overwrite"
             }
 
+        normalized_content = _normalize_write_content(content)
+
         # Write file
         with open(path, "w", encoding="utf-8") as f:
-            f.write(content or "")
+            f.write(normalized_content)
 
         return {
             "ok": True,

@@ -2,10 +2,12 @@ import sys
 import json
 import hashlib
 import time
+import threading
 from types import SimpleNamespace
 
 sys.path.insert(0, 'e:/Mina_MK1')
 
+import agent.core as core_module
 from agent.core import MK1Core
 from agent.pending_actions import PendingActionStore
 
@@ -90,6 +92,57 @@ def test_build_context_combines_short_and_long_recall():
     assert "Host is Windows" in context
 
 
+def test_build_context_includes_learning_lessons():
+    class LessonMemory(FakeMemory):
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_kinds == ["interaction"]:
+                return []
+            if include_kinds == ["note"] and include_tags == ["learning_lesson"]:
+                return [{"text": "Retry note: the prior attempt failed, so Mina should try a different approach.", "tags": ["learning_lesson"]}]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = LessonMemory()
+
+    context = MK1Core.build_context(core, "try again")
+
+    assert "Learned lessons:" in context
+    assert "different approach" in context
+
+
+def test_build_context_prioritizes_retry_attempt_lessons():
+    class OrderedLessonMemory(FakeMemory):
+        def recent_memories(self, top_k=6, include_kinds=None, include_tags=None):
+            return []
+
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_kinds == ["interaction"]:
+                return []
+            if include_kinds == ["note"] and include_tags == ["learning_lesson"]:
+                return [
+                    {
+                        "text": "Retry note: the prior attempt failed on the blocked route.",
+                        "tags": ["learning_lesson", "failed_decision"],
+                        "timestamp": 100.0,
+                    },
+                    {
+                        "text": "Retry attempt: checked the local status endpoint instead.",
+                        "tags": ["learning_lesson", "retry_attempt"],
+                        "timestamp": 200.0,
+                    },
+                ]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = OrderedLessonMemory()
+
+    context = MK1Core.build_context(core, "try again")
+
+    retry_idx = context.index("Retry attempt: checked the local status endpoint instead.")
+    failure_idx = context.index("Retry note: the prior attempt failed on the blocked route.")
+    assert retry_idx < failure_idx
+
+
 def test_process_stores_turn_memory_for_reflex_reply():
     core = MK1Core.__new__(MK1Core)
     core.memory = FakeMemory()
@@ -97,9 +150,32 @@ def test_process_stores_turn_memory_for_reflex_reply():
     core.auto_promote_min_hits = 2
     core.auto_promote_recent_window = 40
     core.auto_promote_semantic_top_k = 8
+    core._turn_clock_lock = threading.RLock()
+    core._turn_clock_started_monotonic = time.monotonic()
+    core._turn_clock_last_tick_monotonic = core._turn_clock_started_monotonic
+    core._turn_clock_started_at = "2026-07-27T00:00:00"
+    core._turn_clock_tick = 0
+    core._turn_clock_last_tick_at = core._turn_clock_started_at
+    core._turn_clock_last_elapsed_seconds = 0.0
+    core._last_user_activity_monotonic = time.monotonic()
+    core._last_user_activity_at = "2026-07-27T00:00:00"
+    core._last_shutdown_at = None
+    core._seconds_since_last_shutdown = None
+    core._idle_checkin_pending = False
+    core._idle_checkin_due_since_at = None
+    core._away_nag_prompt_pending = False
+    core.idle_clock_interval_seconds = 5
+    core.idle_checkin_interval_seconds = 1800
+    core.away_nag_threshold_seconds = 21600
+    core.startup_context = {}
+    core._refresh_idle_checkin_state = lambda: None
+    core._consume_idle_checkin_prompt = lambda: None
+    core._consume_away_nag_prompt = lambda: None
+    core._register_user_activity = lambda: None
+    core._maybe_run_maintenance_tick = lambda: None
 
     core.build_context = lambda _query: ""
-    core._reflex_tools_and_memory = lambda messages, reply, user_input: {
+    core._reflex_tools_and_memory = lambda messages, reply, user_input, request_context=None: {
         "choices": [{"message": {"content": "Tool says hi"}}]
     }
     core._extract_text = lambda reply: reply["choices"][0]["message"]["content"]
@@ -112,6 +188,156 @@ def test_process_stores_turn_memory_for_reflex_reply():
     assert "short_term" in core.memory.writes[0]["tags"]
     assert len(core.memory.promotions) == 1
     assert core.memory.promotions[0]["seed_text"] == "hardware info"
+
+
+def test_process_adds_retry_policy_prompt_when_failed_lesson_is_recalled():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    core.system_prompt = ""
+    core.fast_command_mode = False
+    core.fast_command_skip_context = False
+    core.action_mode_strictness = "balanced"
+    core._turn_clock_lock = threading.RLock()
+    core._turn_clock_started_monotonic = time.monotonic()
+    core._turn_clock_last_tick_monotonic = core._turn_clock_started_monotonic
+    core._turn_clock_started_at = "2026-07-27T00:00:00"
+    core._turn_clock_tick = 0
+    core._turn_clock_last_tick_at = core._turn_clock_started_at
+    core._turn_clock_last_elapsed_seconds = 0.0
+    core._last_user_activity_monotonic = time.monotonic()
+    core._last_user_activity_at = "2026-07-27T00:00:00"
+    core._last_shutdown_at = None
+    core._seconds_since_last_shutdown = None
+    core._idle_checkin_pending = False
+    core._idle_checkin_due_since_at = None
+    core._away_nag_prompt_pending = False
+    core.idle_clock_interval_seconds = 5
+    core.idle_checkin_interval_seconds = 1800
+    core.away_nag_threshold_seconds = 21600
+    core.startup_context = {}
+    core._correct_contextual_transcript = lambda text: text
+    core._refresh_idle_checkin_state = lambda: None
+    core._consume_idle_checkin_prompt = lambda: None
+    core._consume_away_nag_prompt = lambda: None
+    core._register_user_activity = lambda: None
+    core._maybe_run_maintenance_tick = lambda: None
+    core._advance_turn_clock = lambda: {"turn": 1}
+    core._build_turn_working_memory = lambda _query: ""
+    core._build_due_task_prompt = lambda: ""
+    core._format_turn_clock_line = lambda _clock: "Turn 1"
+    core._truth_first_system_rules = lambda: "Truth rules"
+    core._tool_usage_decision_rules = lambda: "Tool rules"
+    core._interface_label_line = lambda _ctx: "Interface: test"
+    core._interface_surface_line = lambda _ctx: "Surface: test"
+    core._is_command_like_query = lambda _text: False
+    core._should_run_reflex = lambda _text: False
+    core._handle_model_response = lambda _messages, reply: reply["choices"][0]["message"]["content"]
+    core._store_turn_memory = lambda user_input, assistant_text, retry_guided=False: None
+    core.build_context = lambda _query: (
+        "Learned lessons:\n"
+        "- Retry note: the prior attempt failed, so Mina should try a different approach."
+    )
+
+    captured = {}
+
+    class _FakeTools:
+        def get_tool_schemas(self):
+            return []
+
+    class _FakeModel:
+        def chat(self, messages, tools=None, allow_fallback=False, allow_model_load=False):
+            captured["messages"] = messages
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    core.tools = _FakeTools()
+    core.model = _FakeModel()
+
+    result = MK1Core.process(core, "try again")
+
+    assert result["reply"] == "ok"
+    system_messages = [m["content"] for m in captured["messages"] if m.get("role") == "system"]
+    assert any("prior failed attempt" in msg for msg in system_messages)
+    assert any("different safe approach" in msg for msg in system_messages)
+
+
+def test_process_keeps_learned_lessons_for_live_ostranauts_queries():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    core.system_prompt = ""
+    core.fast_command_mode = False
+    core.fast_command_skip_context = False
+    core.action_mode_strictness = "balanced"
+    core._turn_clock_lock = threading.RLock()
+    core._turn_clock_started_monotonic = time.monotonic()
+    core._turn_clock_last_tick_monotonic = core._turn_clock_started_monotonic
+    core._turn_clock_started_at = "2026-07-27T00:00:00"
+    core._turn_clock_tick = 0
+    core._turn_clock_last_tick_at = core._turn_clock_started_at
+    core._turn_clock_last_elapsed_seconds = 0.0
+    core._last_user_activity_monotonic = time.monotonic()
+    core._last_user_activity_at = "2026-07-27T00:00:00"
+    core._last_shutdown_at = None
+    core._seconds_since_last_shutdown = None
+    core._idle_checkin_pending = False
+    core._idle_checkin_due_since_at = None
+    core._away_nag_prompt_pending = False
+    core.idle_clock_interval_seconds = 5
+    core.idle_checkin_interval_seconds = 1800
+    core.away_nag_threshold_seconds = 21600
+    core.startup_context = {}
+    core._correct_contextual_transcript = lambda text: text
+    core._refresh_idle_checkin_state = lambda: None
+    core._consume_idle_checkin_prompt = lambda: None
+    core._consume_away_nag_prompt = lambda: None
+    core._register_user_activity = lambda: None
+    core._maybe_run_maintenance_tick = lambda: None
+    core._advance_turn_clock = lambda: {"turn": 1}
+    core._build_turn_working_memory = lambda _query: ""
+    core._build_due_task_prompt = lambda: ""
+    core._format_turn_clock_line = lambda _clock: "Turn 1"
+    core._truth_first_system_rules = lambda: "Truth rules"
+    core._tool_usage_decision_rules = lambda: "Tool rules"
+    core._interface_label_line = lambda _ctx: "Interface: test"
+    core._interface_surface_line = lambda _ctx: "Surface: test"
+    core._is_command_like_query = lambda _text: False
+    core._should_run_reflex = lambda _text: False
+    core._handle_model_response = lambda _messages, reply: reply["choices"][0]["message"]["content"]
+    core._store_turn_memory = lambda user_input, assistant_text, retry_guided=False: None
+    core.build_context = lambda _query: ""
+    core._build_ostranauts_memory_context = lambda _query: (
+        "Learned lessons:\n"
+        "- Retry attempt: use the reactor control panel path first."
+    )
+
+    captured = {}
+
+    class _FakeTools:
+        def get_tool_schemas(self):
+            return []
+
+    class _FakeModel:
+        def chat(self, messages, tools=None, allow_fallback=False, allow_model_load=False):
+            captured["messages"] = messages
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    core.tools = _FakeTools()
+    core.model = _FakeModel()
+
+    original_build = core_module.build_ostranauts_context
+    original_is_query = core_module.is_ostranauts_query
+    try:
+        core_module.build_ostranauts_context = lambda: "Live telemetry available"
+        core_module.is_ostranauts_query = lambda _text: True
+
+        result = MK1Core.process(core, "what should I try at the reactor panel")
+    finally:
+        core_module.build_ostranauts_context = original_build
+        core_module.is_ostranauts_query = original_is_query
+
+    assert result["reply"] == "ok"
+    system_messages = [m["content"] for m in captured["messages"] if m.get("role") == "system"]
+    assert any("Learned lessons:" in msg for msg in system_messages)
+    assert any("reactor control panel path first" in msg for msg in system_messages)
 
 
 def test_store_turn_memory_invokes_auto_promotion_with_settings():
@@ -148,6 +374,95 @@ def test_store_turn_memory_tags_failed_decisions_and_corrections():
     assert "routing_correction" in core.memory.writes[0]["tags"]
     assert "user_memory" in core.memory.writes[0]["tags"]
     assert "failed_decision" in core.memory.writes[1]["tags"]
+    assert len(core.memory.writes) == 3
+    assert core.memory.writes[2]["kind"] == "note"
+    assert "learning_lesson" in core.memory.writes[2]["tags"]
+    assert "routing_correction" in core.memory.writes[2]["tags"]
+
+
+def test_store_turn_memory_records_retry_attempt_note_when_guided():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    core.auto_promote_min_hits = 2
+    core.auto_promote_recent_window = 40
+    core.auto_promote_semantic_top_k = 8
+
+    MK1Core._store_turn_memory(
+        core,
+        "try again",
+        "I could not do the first route, so I checked the local status endpoint instead.",
+        retry_guided=True,
+    )
+
+    assert len(core.memory.writes) == 3
+    lesson = core.memory.writes[2]
+    assert lesson["kind"] == "note"
+    assert "learning_lesson" in lesson["tags"]
+    assert "retry_attempt" in lesson["tags"]
+    assert "Retry attempt:" in lesson["text"]
+    assert "checked the local status endpoint instead" in lesson["text"]
+
+
+def test_store_turn_memory_records_ostranauts_lesson_note():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    core.auto_promote_min_hits = 2
+    core.auto_promote_recent_window = 40
+    core.auto_promote_semantic_top_k = 8
+
+    MK1Core._store_turn_memory(
+        core,
+        "how should we handle this in Ostranauts?",
+        "Use the live ship and crew telemetry first, then try the safest next step.",
+    )
+
+    assert len(core.memory.writes) == 3
+    lesson = core.memory.writes[2]
+    assert lesson["kind"] == "note"
+    assert "ostranauts" in lesson["tags"]
+    assert "learning_lesson" in lesson["tags"]
+    assert "Use the live ship and crew telemetry first" in lesson["text"]
+
+
+def test_store_turn_memory_tags_ostranauts_turns_for_recall():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    core.auto_promote_min_hits = 2
+    core.auto_promote_recent_window = 40
+    core.auto_promote_semantic_top_k = 8
+
+    MK1Core._store_turn_memory(
+        core,
+        "how should we dock in Ostranauts?",
+        "Use low relative velocity and align before committing.",
+    )
+
+    assert "ostranauts" in core.memory.writes[0]["tags"]
+    assert "ostranauts" in core.memory.writes[1]["tags"]
+
+
+def test_build_ostranauts_memory_context_includes_tagged_memory():
+    core = MK1Core.__new__(MK1Core)
+
+    class _MemoryStub:
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_tags == ["learning_lesson"]:
+                return []
+            if include_tags == ["ostranauts"]:
+                return [
+                    {
+                        "text": "Prefer EVA prep checklist before reactor maintenance.",
+                        "tags": ["ostranauts"],
+                    }
+                ]
+            return []
+
+    core.memory = _MemoryStub()
+
+    ctx = MK1Core._build_ostranauts_memory_context(core, "ostranauts reactor checklist")
+
+    assert "Ostranauts memory:" in ctx
+    assert "EVA prep checklist" in ctx
 
 
 def test_detect_relative_alarm_with_called_label():
@@ -271,6 +586,12 @@ def test_detect_system_question_routes_to_ps_run():
     assert args["script"] == "what cpu are you on?"
 
 
+def test_hardware_question_is_command_like_for_reflex_execution():
+    core = MK1Core.__new__(MK1Core)
+
+    assert MK1Core._is_command_like_query(core, "how much physical ram is on a rx 6700 tx") is True
+
+
 def test_detect_time_question_routes_to_ps_run():
     core = MK1Core.__new__(MK1Core)
 
@@ -278,6 +599,16 @@ def test_detect_time_question_routes_to_ps_run():
 
     assert tool_name == "ps_run"
     assert args["script"] == "what time is it?"
+
+
+def test_detect_gpu_model_vram_question_routes_to_web_search_when_available():
+    core = MK1Core.__new__(MK1Core)
+    core.tools = SimpleNamespace(tools={"web_search": object(), "ps_run": object()})
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "how much physical ram is on a rx 6700 tx")
+
+    assert tool_name == "web_search"
+    assert "rx 6700 xt" in str(args.get("query") or "").lower()
 
 
 def test_detect_tool_list_routes_tool_inventory_phrase():
@@ -394,6 +725,15 @@ def test_detect_code_execute_for_powershell_phrase():
     assert "Write-Output MK1_OK" in args["code"]
 
 
+def test_detect_ps_run_for_probe_cpu_phrase():
+    core = MK1Core.__new__(MK1Core)
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "yes lets probe the CPU and see what comes up")
+
+    assert tool_name == "ps_run"
+    assert "Win32_Processor" in args["script"]
+
+
 def test_detect_code_execute_strips_trailing_explanation_phrase():
     core = MK1Core.__new__(MK1Core)
 
@@ -430,6 +770,193 @@ def test_send_text_to_brother_routes_to_external_texting_limit():
 
     assert tool_name == "__capability_limit__"
     assert "cannot send real texts" in args["message"]
+
+
+def test_git_status_response_is_grounded_in_verified_output():
+    core = MK1Core.__new__(MK1Core)
+    captured = {}
+
+    class _FakeModel:
+        def chat(self, messages, tools=None, allow_fallback=False, allow_model_load=False):
+            captured["messages"] = messages
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Your branch is dirty with modified and untracked files, so there is definitely new work here."
+                        }
+                    }
+                ]
+            }
+
+    core.model = _FakeModel()
+    core._clean_response_text = lambda text: text
+    core._extract_text = lambda reply: reply["choices"][0]["message"]["content"]
+
+    formatted = (
+        "Branch: backup/session-20260713-065536\n"
+        "Status:\n"
+        " M agent/core.py\n"
+        "?? tests/test_memory_recall.py"
+    )
+
+    out = MK1Core._render_tool_response_as_mina(
+        core,
+        messages=[],
+        user_input="hay mina notice anything new ?",
+        tool_name="__git_status__",
+        formatted=formatted,
+        tool_ok=True,
+    )
+
+    assert "dirty with modified and untracked files" in out
+    assert "VERIFIED OUTPUT:" in out
+    system_messages = [m["content"] for m in captured["messages"] if m.get("role") == "system"]
+    assert any("concise summary of the verified state" in msg for msg in system_messages)
+
+
+def test_memory_status_response_is_grounded_in_verified_output():
+    core = MK1Core.__new__(MK1Core)
+    captured = {}
+
+    class _FakeModel:
+        def chat(self, messages, tools=None, allow_fallback=False, allow_model_load=False):
+            captured["messages"] = messages
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Memory is online and the indexes are loaded, so recall should be available."
+                        }
+                    }
+                ]
+            }
+
+    core.model = _FakeModel()
+    core._clean_response_text = lambda text: text
+    core._extract_text = lambda reply: reply["choices"][0]["message"]["content"]
+
+    formatted = (
+        "db_exists: true\n"
+        "small_index_loaded: true\n"
+        "base_index_loaded: true"
+    )
+
+    out = MK1Core._render_tool_response_as_mina(
+        core,
+        messages=[],
+        user_input="show me memory status",
+        tool_name="__memory_status__",
+        formatted=formatted,
+        tool_ok=True,
+    )
+
+    assert "recall should be available" in out
+    assert "VERIFIED OUTPUT:" in out
+    system_messages = [m["content"] for m in captured["messages"] if m.get("role") == "system"]
+    assert any("concise summary of the verified state" in msg for msg in system_messages)
+
+
+def test_ps_run_response_returns_verified_output_directly():
+    core = MK1Core.__new__(MK1Core)
+    called = {"count": 0}
+
+    class _FakeModel:
+        def chat(self, *args, **kwargs):
+            called["count"] += 1
+            raise AssertionError("ps_run should not call the model for response rendering")
+
+    core.model = _FakeModel()
+
+    out = MK1Core._render_tool_response_as_mina(
+        core,
+        messages=[
+            {"role": "assistant", "content": "old CPU chatter that must not leak"},
+        ],
+        user_input="run this powershell: Get-Date -Format o",
+        tool_name="ps_run",
+        formatted="2026-07-29T09:46:33.1234567Z",
+        tool_ok=True,
+    )
+
+    assert "Here’s the verified PowerShell output:" in out
+    assert "2026-07-29T09:46:33.1234567Z" in out
+    assert called["count"] == 0
+
+
+def test_web_search_response_stays_raw_direct_render():
+    core = MK1Core.__new__(MK1Core)
+
+    formatted = "Result 1: example"
+
+    out = MK1Core._render_tool_response_as_mina(
+        core,
+        messages=[],
+        user_input="search the web for example",
+        tool_name="web_search",
+        formatted=formatted,
+        tool_ok=True,
+    )
+
+    assert out == formatted
+
+
+def test_web_search_gpu_vram_response_synthesizes_direct_answer_with_sources():
+    core = MK1Core.__new__(MK1Core)
+
+    msg = MK1Core._format_tool_result(
+        core,
+        "web_search",
+        {
+            "ok": True,
+            "result": {
+                "query": "how much physical ram is on a RX 6700 XT",
+                "results": [
+                    {
+                        "title": "AMD Radeon RX 6700 XT Specs | TechPowerUp GPU Database",
+                        "url": "https://www.techpowerup.com/gpu-specs/radeon-rx-6700-xt.c3695",
+                        "content_excerpt": "Memory Size 12 GB, Memory Type GDDR6, Bus Width 192 bit",
+                    },
+                    {
+                        "title": "Radeon RX 6700 XT Graphics Card - AMD",
+                        "url": "https://www.amd.com/en/products/graphics/desktops/radeon/6000-series/amd-radeon-rx-6700-xt.html",
+                        "snippet": "12GB GDDR6 memory",
+                    },
+                ],
+            },
+            "error": None,
+        },
+    )
+
+    low = msg.lower()
+    assert "rx 6700 xt has 12 gb of vram" in low
+    assert "sources:" in low
+    assert "techpowerup.com" in low
+
+
+def test_web_search_gpu_vram_response_falls_back_to_listing_without_numeric_evidence():
+    core = MK1Core.__new__(MK1Core)
+
+    msg = MK1Core._format_tool_result(
+        core,
+        "web_search",
+        {
+            "ok": True,
+            "result": {
+                "query": "how much physical ram is on a RX 6700 XT",
+                "results": [
+                    {
+                        "title": "AMD Radeon RX 6700 XT Specs | TechPowerUp GPU Database",
+                        "url": "https://www.techpowerup.com/gpu-specs/radeon-rx-6700-xt.c3695",
+                        "snippet": "Overview page",
+                    }
+                ],
+            },
+            "error": None,
+        },
+    )
+
+    assert "Web results for: how much physical ram is on a RX 6700 XT" in msg
 
 
 def test_voice_transcript_corrects_ostranauts_in_game_context():
@@ -845,3 +1372,34 @@ def test_build_turn_working_memory_uses_semantic_suggestion_context_hits():
     out = MK1Core._build_turn_working_memory(core, "what changed")
 
     assert "mina_capability_delta::" in out
+
+
+def test_enforce_tool_outcome_truth_surfaces_last_failed_tool():
+    core = MK1Core.__new__(MK1Core)
+
+    final = MK1Core._enforce_tool_outcome_truth(
+        core,
+        "Everything completed.",
+        [
+            ("ps_run", {"ok": True, "result": {"stdout": "ok"}, "error": None}),
+            ("ps_run", {"ok": False, "result": None, "error": "permission_denied"}),
+        ],
+    )
+
+    low = final.lower()
+    assert "powershell execution failed" in low
+    assert "permission_denied" in low
+
+
+def test_enforce_tool_outcome_truth_keeps_text_when_no_failures():
+    core = MK1Core.__new__(MK1Core)
+
+    final = MK1Core._enforce_tool_outcome_truth(
+        core,
+        "Everything completed.",
+        [
+            ("ps_run", {"ok": True, "result": {"stdout": "ok"}, "error": None}),
+        ],
+    )
+
+    assert final == "Everything completed."

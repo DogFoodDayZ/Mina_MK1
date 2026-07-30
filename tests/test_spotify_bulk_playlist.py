@@ -42,3 +42,16 @@ def test_bulk_playlist_action_searches_and_adds_distinct_tracks(monkeypatch):
         "playlist_id": "playlist-1",
         "uris": ["spotify:track:one", "spotify:track:two"],
     }
+
+
+def test_now_playing_alias_maps_to_current_playback(monkeypatch):
+    monkeypatch.setattr(
+        spotify_link,
+        "_current_playback",
+        lambda: {"ok": True, "result": {"is_playing": True}, "error": None},
+    )
+
+    result = spotify_link.tool_entry({"action": "now_playing"})
+
+    assert result["ok"] is True
+    assert isinstance(result.get("result"), dict)

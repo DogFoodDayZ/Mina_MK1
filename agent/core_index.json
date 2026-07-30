@@ -1,0 +1,286 @@
+{
+    "file": "agent/core.py",
+    "generated_from": "tmp/core_functions.txt",
+    "function_count": 293,
+    "owners": {
+        "primary": "MK1 runtime",
+        "supporting": [
+            "memory",
+            "tools",
+            "autonomy",
+            "project tracker"
+        ]
+    },
+    "sections": [
+        {
+            "name": "lmstudio_client",
+            "line_start": 1,
+            "line_end": 758,
+            "responsibility": "Model request formatting, fallback, role normalization, streaming",
+            "risk": "medium",
+            "key_functions": [
+                {
+                    "name": "chat",
+                    "line": 427
+                },
+                {
+                    "name": "chat_stream",
+                    "line": 611
+                }
+            ]
+        },
+        {
+            "name": "core_bootstrap_state",
+            "line_start": 759,
+            "line_end": 1340,
+            "responsibility": "Core initialization and runtime/identity state persistence",
+            "risk": "high",
+            "key_functions": [
+                {
+                    "name": "__init__",
+                    "line": 759
+                },
+                {
+                    "name": "_save_runtime_state",
+                    "line": 1202
+                },
+                {
+                    "name": "_load_runtime_state",
+                    "line": 1791
+                }
+            ]
+        },
+        {
+            "name": "identity_and_safety",
+            "line_start": 1341,
+            "line_end": 1790,
+            "responsibility": "Trusted client checks and high-risk tool gating",
+            "risk": "high",
+            "key_functions": [
+                {
+                    "name": "_is_high_risk_tool",
+                    "line": 1740
+                },
+                {
+                    "name": "_identity_gate_decision",
+                    "line": 1766
+                }
+            ]
+        },
+        {
+            "name": "intent_alias_and_reflex",
+            "line_start": 1890,
+            "line_end": 2406,
+            "responsibility": "Intent normalization, alias learning, pending actions, reflex handlers",
+            "risk": "high",
+            "key_functions": [
+                {
+                    "name": "_normalize_user_intent_text",
+                    "line": 1890
+                },
+                {
+                    "name": "_resolve_intent_alias",
+                    "line": 2040
+                },
+                {
+                    "name": "_handle_directory_scan_reflex",
+                    "line": 2252
+                }
+            ]
+        },
+        {
+            "name": "memory_and_response_layer",
+            "line_start": 2443,
+            "line_end": 3880,
+            "responsibility": "Turn memory writes, tool response shaping, memory recall logic",
+            "risk": "high",
+            "key_functions": [
+                {
+                    "name": "_store_turn_memory",
+                    "line": 2443
+                },
+                {
+                    "name": "_render_tool_response_as_mina",
+                    "line": 2832
+                },
+                {
+                    "name": "_build_memory_read_reply",
+                    "line": 3619
+                }
+            ]
+        },
+        {
+            "name": "project_and_test_helpers",
+            "line_start": 3882,
+            "line_end": 4148,
+            "responsibility": "Project path inference and test execution wrappers",
+            "risk": "medium",
+            "key_functions": [
+                {
+                    "name": "_run_project_tests",
+                    "line": 3973
+                }
+            ]
+        },
+        {
+            "name": "autonomy_engine",
+            "line_start": 4151,
+            "line_end": 4712,
+            "responsibility": "Autonomous work planning, patch validation, and guarded apply",
+            "risk": "high",
+            "key_functions": [
+                {
+                    "name": "_autonomous_work_candidates",
+                    "line": 4240
+                },
+                {
+                    "name": "_validate_autonomous_patch_paths",
+                    "line": 4372
+                },
+                {
+                    "name": "_apply_autonomous_patch",
+                    "line": 4412
+                },
+                {
+                    "name": "_run_autonomous_work_task",
+                    "line": 4644
+                }
+            ]
+        },
+        {
+            "name": "project_tracker",
+            "line_start": 4713,
+            "line_end": 5115,
+            "responsibility": "Project tracker synchronization and bootstrap flow",
+            "risk": "medium",
+            "key_functions": [
+                {
+                    "name": "_sync_project_tracker",
+                    "line": 4744
+                },
+                {
+                    "name": "_bootstrap_project",
+                    "line": 4901
+                }
+            ]
+        },
+        {
+            "name": "lifecycle_shutdown",
+            "line_start": 5116,
+            "line_end": 5868,
+            "responsibility": "Heartbeat, idle behavior, and safe shutdown orchestration",
+            "risk": "high",
+            "key_functions": [
+                {
+                    "name": "close",
+                    "line": 5173
+                },
+                {
+                    "name": "_prepare_safe_shutdown",
+                    "line": 5200
+                },
+                {
+                    "name": "_request_safe_shutdown",
+                    "line": 5384
+                }
+            ]
+        },
+        {
+            "name": "diagnostics_and_git",
+            "line_start": 5869,
+            "line_end": 7069,
+            "responsibility": "Tool self-test, status surfaces, alias maps, git helpers",
+            "risk": "medium",
+            "key_functions": [
+                {
+                    "name": "_run_tool_self_test",
+                    "line": 6097
+                },
+                {
+                    "name": "_git_snapshot",
+                    "line": 6706
+                },
+                {
+                    "name": "_git_push",
+                    "line": 6829
+                }
+            ]
+        },
+        {
+            "name": "main_processing_pipeline",
+            "line_start": 7155,
+            "line_end": 9344,
+            "responsibility": "Main request processing, streaming, context build, result formatting",
+            "risk": "critical",
+            "key_functions": [
+                {
+                    "name": "process",
+                    "line": 7155
+                },
+                {
+                    "name": "process_stream",
+                    "line": 7479
+                },
+                {
+                    "name": "build_context",
+                    "line": 7865
+                },
+                {
+                    "name": "_format_tool_result",
+                    "line": 7946
+                }
+            ]
+        },
+        {
+            "name": "intent_router_and_planner",
+            "line_start": 9345,
+            "line_end": 11730,
+            "responsibility": "Natural-language intent detection and planner tool selection",
+            "risk": "critical",
+            "key_functions": [
+                {
+                    "name": "detect_tool_intent",
+                    "line": 9648
+                },
+                {
+                    "name": "_detect_file_directory_intent",
+                    "line": 9737
+                },
+                {
+                    "name": "_plan_tool_action",
+                    "line": 11393
+                },
+                {
+                    "name": "_handle_model_response",
+                    "line": 11461
+                },
+                {
+                    "name": "run_tool",
+                    "line": 11703
+                }
+            ]
+        }
+    ],
+    "critical_invariants": [
+        "Never claim tool execution without verified tool result payload",
+        "Preserve identity gate for high-risk tools unless explicitly trusted",
+        "Command routing must prefer execution path over decorative chat",
+        "Build/generate requests mentioning rename must not route to file_move unless both src and dst are explicit",
+        "Shutdown path must not bypass memory quiesce and final backup",
+        "Autonomy patch apply must remain path-constrained and non-destructive"
+    ],
+    "regression_anchor_prompts": [
+        "create a text file named notes.txt with hello world",
+        "TRAVIS mina create and save a program to rename files in mass with a gui and name regression if needed.",
+        "rename file C:\\temp\\a.txt to C:\\temp\\b.txt",
+        "mina close edge webinterface",
+        "use the correct tool to close edge leave spotify running",
+        "please run the command",
+        "yes"
+    ],
+    "update_notes": [
+        "Update this index when section ownership changes or line drift exceeds 200 lines",
+        "Keep key_functions limited to high-impact entry points",
+        "Reflect new safety invariants immediately"
+    ]
+}

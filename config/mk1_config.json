@@ -3,11 +3,8 @@
     "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
     "load_endpoint": "http://127.0.0.1:1234/api/v1/models/load",
     "default_model": "qwen2.5-7b-instruct",
-    "auto_fallback_on_error": true,
-    "fallback_models": [
-      "qwen2.5-7b-instruct",
-      "mistral-nemo-2407-12b-thinking-claude-gemini-gpt5.2-uncensored-heretic"
-    ],
+    "auto_fallback_on_error": false,
+    "request_timeout_seconds": 240,
     "switch_allowed": [
       "qwen2.5-7b-instruct",
       "mistral-nemo-2407-12b-thinking-claude-gemini-gpt5.2-uncensored-heretic",
@@ -57,12 +54,14 @@
       "E:\\",
       "G:\\"
     ],
-    "idle_seconds": 600,
+    "idle_seconds": 1800,
     "local_interval_seconds": 3600,
     "news_interval_seconds": 21600,
     "work_interval_seconds": 1800,
     "max_work_retries": 2,
-    "allow_source_edits": true,
+    "allow_source_edits": false,
+    "suspend_during_ostranauts": true,
+    "pause_after_ostranauts_seconds": 1200,
     "keep_patch_files": true,
     "code_backup_dir": "E:\\workspace\\mina_code_backups",
     "watchdog_dir": "E:\\workspace\\mina_watchdog",

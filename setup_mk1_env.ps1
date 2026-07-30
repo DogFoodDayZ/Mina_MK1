@@ -46,6 +46,9 @@ Write-Host "Installing dependencies from $RequirementsFile"
 Write-Host 'Validating core imports...'
 & $venvPython -c "import fastapi, uvicorn, faiss; print('Dependency check OK')"
 
+Write-Host 'Installing tray launcher runtime dependencies...'
+& $venvPython -m pip install pystray pillow
+
 if ($RunTests) {
     Write-Host 'Running tests...'
     & $venvPython -m pytest -q

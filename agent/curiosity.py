@@ -59,6 +59,42 @@ TOPIC_STOP_WORDS = {
     "want", "what", "when", "where", "which", "with", "would", "your",
 }
 
+OSTRANAUTS_WIKI_HOST_HINTS = (
+    "ostranauts.wiki.gg",
+    "ostranauts.fandom.com",
+)
+
+CODING_REFERENCE_HOST_HINTS = (
+    "docs.python.org",
+    "developer.mozilla.org",
+    "stackoverflow.com",
+    "github.com",
+    "gitlab.com",
+    "learn.microsoft.com",
+    "readthedocs.io",
+)
+
+CODING_SIGNAL_KEYWORDS = (
+    "python",
+    "javascript",
+    "typescript",
+    "rust",
+    "c++",
+    "api",
+    "sdk",
+    "library",
+    "framework",
+    "algorithm",
+    "debug",
+    "testing",
+    "pytest",
+    "function",
+    "class",
+    "repository",
+    "source code",
+    "documentation",
+)
+
 
 def normalize_roots(roots: Iterable[str]) -> List[str]:
     out: List[str] = []
@@ -181,6 +217,18 @@ class AutonomousCuriosity:
         self._completed_work_keys = set()
         self._work_attempts: Dict[str, int] = {}
         self._last_error = ""
+        self._paused_until = 0.0
+        self._pause_reason = ""
+
+    def set_pause(self, seconds: int, reason: str = "") -> float:
+        now = time.time()
+        duration = max(0, int(seconds))
+        until = now + duration if duration > 0 else now
+        with self._lock:
+            if until > self._paused_until:
+                self._paused_until = until
+                self._pause_reason = str(reason or "runtime_pause").strip()[:160]
+            return self._paused_until
 
     def maybe_start(self, current_idle_seconds: float) -> bool:
         now = time.time()
@@ -188,6 +236,8 @@ class AutonomousCuriosity:
             return False
 
         with self._lock:
+            if now < float(self._paused_until or 0.0):
+                return False
             if self._worker is not None and self._worker.is_alive():
                 return False
             do_local = now - self._last_local_at >= self.local_interval_seconds
@@ -359,32 +409,50 @@ class AutonomousCuriosity:
         if "web_search" not in available:
             return
         query_topics = " ".join(topics[:3])
-        if not query_topics:
-            return
-        result = self.tools.run("web_search", {
-            "query": f"{query_topics} latest news",
-            "max_results": 3,
-            "timeout": 15,
-            "include_content": False,
-        })
-        if not isinstance(result, dict) or not result.get("ok"):
-            return
-        payload = result.get("result") if isinstance(result.get("result"), dict) else {}
-        rows = payload.get("results") if isinstance(payload.get("results"), list) else []
-        for row in rows:
-            if not isinstance(row, dict):
+        queries: List[str] = []
+        if query_topics:
+            queries.append(f"{query_topics} latest news")
+        # Keep a dedicated Ostranauts wiki pass so game-lore sources are discoverable.
+        queries.append("site:ostranauts.wiki.gg OR site:ostranauts.fandom.com ostranauts wiki")
+        # Include coding references so autonomous choices are grounded in technical sources.
+        queries.append(
+            "site:docs.python.org OR site:developer.mozilla.org OR site:learn.microsoft.com "
+            "OR site:stackoverflow.com OR site:github.com programming reference"
+        )
+
+        for search_query in queries:
+            result = self.tools.run("web_search", {
+                "query": search_query,
+                "max_results": 3,
+                "timeout": 15,
+                "include_content": False,
+            })
+            if not isinstance(result, dict) or not result.get("ok"):
                 continue
-            title = str(row.get("title") or "").strip()
-            url = str(row.get("url") or "").strip()
-            snippet = " ".join(str(row.get("snippet") or "").split())[:500]
-            key = url.lower() or title.lower()
-            haystack = f"{title} {snippet}".lower()
-            if not key or key in self._seen_items or not any(topic in haystack for topic in topics):
-                continue
-            self._seen_items.add(key)
-            summary = f"Autonomous news discovery: {title} | {snippet} | {url}"
-            self._store_and_announce("news", summary, url)
-            break
+            payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+            rows = payload.get("results") if isinstance(payload.get("results"), list) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("title") or "").strip()
+                url = str(row.get("url") or "").strip()
+                snippet = " ".join(str(row.get("snippet") or "").split())[:500]
+                key = url.lower() or title.lower()
+                haystack = f"{title} {snippet} {url}".lower()
+                is_ostranauts_wiki = any(host in haystack for host in OSTRANAUTS_WIKI_HOST_HINTS) or (
+                    "ostranauts" in haystack and "wiki" in haystack
+                )
+                is_coding_reference = any(host in haystack for host in CODING_REFERENCE_HOST_HINTS) or any(
+                    token in haystack for token in CODING_SIGNAL_KEYWORDS
+                )
+                if not key or key in self._seen_items:
+                    continue
+                if not is_ostranauts_wiki and not is_coding_reference and not any(topic in haystack for topic in topics):
+                    continue
+                self._seen_items.add(key)
+                summary = f"Autonomous news discovery: {title} | {snippet} | {url}"
+                self._store_and_announce("news", summary, url)
+                return
 
     def _store_and_announce(self, source: str, summary: str, reference: str) -> None:
         memory_id = self.memory.add_memory(
@@ -435,4 +503,7 @@ class AutonomousCuriosity:
             ),
             "last_work_result": dict(self._last_work_result) if self._last_work_result else None,
             "last_error": self._last_error or None,
+            "paused": time.time() < float(self._paused_until or 0.0),
+            "paused_until": self._paused_until or None,
+            "pause_reason": self._pause_reason or None,
         }

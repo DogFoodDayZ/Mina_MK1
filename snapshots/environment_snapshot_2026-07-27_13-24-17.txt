@@ -1,0 +1,16 @@
+﻿ Write-Output "Mina environment snapshot"; Write-Output "Timestamp: $(Get-Date 
+-Format o)"; Write-Output "--- Python ---"; & .\.venv\Scripts\python.exe 
+--version; Write-Output "--- pip packages ---"; & .\.venv\Scripts\python.exe 
+-m pip list --format=columns | Select-Object -First 80; Write-Output "--- Git 
+status (Mina) ---"; git status --short; Write-Output "--- Node ---"; node 
+--version; npm --version; Write-Output "--- GUI build status ---"; 
+Set-Location -LiteralPath 'C:\dev\mina-gui'; npm run build --silent; 
+Write-Output "--- End ---" 
+--- Hardware ---
+Computer: System manufacturer System Product Name
+CPU: AMD Ryzen 7 5700X 8-Core Processor             
+RAM: 31.91 GB
+GPUs:
+ - AMD Radeon RX 6700 XT | Driver: 32.0.21043.19003 | RAM: 4095 MB
+Monitors:
+ - Generic PnP Monitor | Type: Generic PnP Monitor | Resolution: x

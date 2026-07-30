@@ -1,7 +1,397 @@
+
+Stop The Churn Spec v1
+Owner intent: Mina must work for human phrasing first, not for internal intent labels.
+
+1) Non-Negotiable Product Contract
+
+Natural language first.
+No magic phrasing required.
+No hidden mode switches from keyword traps.
+If uncertain, ask one specific clarification question.
+If action is taken, verify completion and show proof.
+2) Core Failure We Are Preventing
+
+User asks for outcome.
+Router maps to wrong tool class.
+Tool runs with wrong or missing arguments.
+System reports a technical status while user goal is unmet.
+Patch adds another branch, moving failure elsewhere.
+Pass condition:
+
+Same prompt class succeeds across wording variants.
+Wrong-route rate is measurably reduced.
+No regression on prior successful prompts.
+3) Intent Class Hierarchy (Priority Order)
+
+Conversational chat.
+Build or generate artifact.
+Direct file operation.
+External web or API operation.
+Debug or tool introspection.
+Rule:
+
+Build or generate artifact always outranks direct file move or rename unless source and destination are explicitly provided.
+Tool inventory is never shown unless explicitly requested with a debug intent.
+4) Action Gating Rules
+
+Before execution, produce an internal action plan with:
+Task class.
+Selected tool.
+Required arguments.
+Confidence score.
+If required arguments are missing, do not execute.
+Ask one targeted clarification with the exact missing field.
+On low confidence, ask clarification instead of guessing.
+Never fallback to unrelated scripted prompts.
+5) Verification Contract (Must Run After Any Action)
+
+For file creation:
+Confirm file exists.
+Confirm path.
+Confirm first line or content hash.
+For code generation:
+Confirm artifact file path.
+Confirm language and entry point.
+Confirm runnable status or explain missing dependency.
+For move or rename:
+Confirm source existed before.
+Confirm destination exists after.
+If verification fails:
+Report failure plainly.
+Retry once with corrected arguments.
+If still failing, ask one precise question.
+6) Conversation Behavior Contract
+
+Keep Mina personality and tone.
+Keep responses concise by default.
+Do not leak internal tool routing unless user asks.
+Do not output canned disambiguation scripts unless explicit ambiguity is real and material.
+Do not derail user flow with unrelated domain choices.
+7) Regression Suite Based On Real Prompts
+Use transcript-grounded prompts, not synthetic labels.
+
+Required prompts that must pass:
+
+Create a text file named notes.txt with hello world.
+Create a program that can rename files with a graphical gui save it.
+Mina read this directory E:\Mina_MK1\integrations\ostranauts.
+Give me context on it.
+That whole directory is so we can play a game together would you like that?
+Expected outcomes:
+
+Correct task class.
+Correct tool class.
+Verified completion evidence.
+No unrelated scripted branch.
+8) Change Control Protocol
+
+No branch patch accepted without adding a matching regression prompt.
+Every fix must include:
+Root cause.
+Why previous logic failed.
+Why this fix cannot reroute neighboring intents.
+If a fix increases conditional branching in one area:
+Require compensating simplification elsewhere.
+Reject fixes that only silence surface errors.
+9) Health Metrics (Track Weekly)
+
+First-attempt success rate on real prompts.
+Wrong-tool execution rate.
+Clarification necessity rate.
+Verification failure rate.
+Repeat-prompt rate by user.
+User override or frustration events.
+Targets:
+
+First-attempt success above 90 percent for top 20 prompt classes.
+Wrong-tool rate below 3 percent.
+Repeat-prompt rate below 10 percent.
+10) Definition Of Done For Any Future Fix
+
+Passes all transcript-grounded regression prompts.
+Preserves Mina tone and concise style.
+Shows verification evidence for actions.
+No new scripted derailment in adjacent prompt classes.
+User can use normal phrasing and still complete the task.
+
+11) Implementation Choice Check (Memory vs Hardcoding)
+
+For any change or improvement, explicitly decide and document whether it should be memory-driven or hardcoded behavior.
+Preference order:
+
+Memory-first when behavior depends on user habits, evolving aliases, learned file context, or changing workflow patterns.
+Hardcode only when behavior is a stable safety constraint, protocol contract, or deterministic system invariant.
+
+Required in each fix note:
+
+Chosen approach: memory or hardcoded.
+Why that approach fits this specific change.
+What risk is introduced if the wrong approach is chosen.
+Regression prompt proving the choice works in natural phrasing.
+
+## Quick Issue Tracker Template (Use This First)
+
+Copy this block for each new problem and fill it in.
+
+---
+
+### Issue: <short title>
+
+- Date:
+- Reporter:
+- Priority: High / Medium / Low
+- Status: Open / In Progress / Blocked / Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+
+#### 2) What Mina actually did
+- Actual response:
+- Actual action taken:
+
+#### 3) What should have happened
+- Expected response:
+- Expected action/result:
+
+#### 4) Evidence
+- Transcript snippet:
+- File path(s) affected:
+- Error text (exact):
+
+#### 5) Failure class (pick one)
+- Intent routing wrong
+- Tool selected wrong
+- Args extraction wrong
+- Verification missing
+- Persona/response contract broken
+
+#### 6) Root cause (after investigation)
+-
+
+#### 7) Minimal fix
+-
+
+#### 8) Regression prompts (must pass)
+- Prompt 1:
+- Prompt 2:
+- Prompt 3:
+
+#### 9) Done criteria
+- [ ] Correct tool class selected
+- [ ] Correct args built
+- [ ] Action verified with proof
+- [ ] No regression on prompts above
+- [ ] Mina tone/conciseness still correct
+
+---
+
+### Issue: Bare file read phrase falls to clarification after restart
+
+- Date: 2026-07-26
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - TRAVIS read core.py
+
+#### 2) What Mina actually did
+- Actual response:
+  - MINA I can run that with tools, but I need one detail first: what exact target should I act on (path, URL, command, or app)?
+- Actual action taken:
+  - Asked generic clarification instead of routing to file read.
+
+#### 3) What should have happened
+- Expected response:
+  - Route directly to file read for the provided filename.
+- Expected action/result:
+  - Resolve and read core.py using file path resolution/index fallback.
+
+#### 4) Evidence
+- Transcript snippet:
+  - TRAVIS read core.py
+  - MINA I can run that with tools, but I need one detail first: what exact target should I act on (path, URL, command, or app)?
+- File path(s) affected:
+  - E:\Mina_MK1\agent\core.py
+- Error text (exact):
+  - None (intent routing miss to clarify path)
+
+#### 5) Failure class (pick one)
+- Intent routing wrong
+
+#### 6) Root cause (after investigation)
+- File-read routing required phrasing like "read file ..." and did not match natural bare-file phrasing like "read core.py", so request fell through to generic clarification flow.
+
+#### 7) Minimal fix
+- Added a deterministic bare-file read matcher in `MK1Core._detect_file_directory_intent` for `read/open/show/view/cat <name.ext>` and route to `file_read`.
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: read core.py
+- Prompt 2: open agent/core.py
+- Prompt 3: show ./TODO.md
+
+#### 9) Implementation choice (required)
+- Chosen approach: hardcoded
+- Why this approach fits: Intent parsing for explicit verb + filename is a stable deterministic routing rule and should not depend on volatile memory state.
+- Risk if wrong approach chosen: memory-only handling can drift or miss cold-start cases, causing fallback clarifications for straightforward file-read prompts.
+- Regression prompt proving choice: `read core.py` must map to `file_read` after restart without extra clarification.
+
+#### 10) Done criteria
+- [x] Correct tool class selected in code path (`file_read`)
+- [x] Correct args built (`path=core.py`)
+- [x] Action verified with proof via live API after restart
+- [x] No regression on prompts above
+- [x] Mina tone/conciseness still correct
+
+---
+
+### Issue: Traceback paste reads file but does not repair broken Python source
+
+- Date: 2026-07-26
+- Reporter: Travis
+- Priority: High
+- Status: In Progress
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - TRAVIS TRAVIS it errors out PS E:\workspace\file_renamer> python app.py ... SyntaxError: unterminated string literal ...
+
+#### 2) What Mina actually did
+- Actual response:
+  - MINA returned file content beginning with escaped source line text (example: import os\nimport tkinter ...)
+- Actual action taken:
+  - Parsed traceback path and read file, but did not perform a fix pass.
+
+#### 3) What should have happened
+- Expected response:
+  - Confirm a repair attempt on the referenced .py file and report success/failure clearly.
+- Expected action/result:
+  - If file is an escaped quoted Python string blob, decode and rewrite it to valid source, then compile-check.
+
+#### 4) Evidence
+- Transcript snippet:
+  - TRAVIS ... python app.py ... SyntaxError ...
+  - MINA import os\nimport tkinter as tk\nfrom tkinter import filedialog
+- File path(s) affected:
+  - app.py (path extracted from traceback)
+- Error text (exact):
+  - SyntaxError: unterminated string literal
+
+#### 5) Failure class (pick one)
+- Verification missing
+
+#### 6) Root cause (after investigation)
+- Runtime traceback detection routed to file read intent, which returns file content only and has no repair action.
+
+#### 7) Minimal fix
+- Add deterministic runtime repair action for traceback-referenced Python scripts: detect escaped-string wrapper, decode with `ast.literal_eval`, rewrite file, and compile-check with `py_compile`.
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: TRAVIS it errors out ... python app.py ... SyntaxError: unterminated string literal ...
+- Prompt 2: python app.py throws SyntaxError on launch
+- Prompt 3: traceback (most recent call last) ... File "app.py" ... SyntaxError ...
+
+#### 9) Implementation choice (required)
+- Chosen approach: hardcoded
+- Why this approach fits: traceback parsing and escaped-wrapper repair is a deterministic runtime safety behavior, not a user-preference pattern.
+- Risk if wrong approach chosen: memory-driven routing could miss cold-start or unseen phrasings, causing fallback read-only responses and repeated user retries.
+- Regression prompt proving choice: traceback paste must trigger repair action without requiring prior memory state.
+
+#### 10) Done criteria
+- [x] Correct tool class selected (`__repair_python_file__`) when traceback includes .py path
+- [x] Correct args built (path extracted from traceback/python command)
+- [x] Repair routine implemented (decode escaped wrapper + compile-check)
+- [ ] Action verified with transcript-grounded runtime proof via API call
+- [ ] No regression on prompts above
+- [x] Mina tone/conciseness still correct
+
+---
+
+## Churn Stop Rules
+
+1. No fix is accepted without at least one real transcript prompt added to regression tests.
+2. If required action arguments are missing, Mina must ask one targeted question and stop.
+3. For file/code tasks, Mina must verify the result and show proof in the reply.
+4. Tool inventory and internal routing details are hidden unless explicitly requested.
+5. Build/generate intent outranks direct move/rename intent unless source and destination are explicit.
+
 # TODO
 
-Last updated: 2026-07-25
+Last updated: 2026-07-30
+
+## Current Session Focus
+
+- [x] Harden Windows tray launcher startup registration so Mina can launch after reboot/sign-in.
+- [x] Verify tray-runtime dependencies and the batch launcher entry point.
+- [x] Improve Ostranauts companion launch handling for single-monitor environments.
+
+## Core Reference Workflow
+
+Purpose: keep `agent/core.py` changes understandable, testable, and low-risk.
+
+Reference artifacts:
+- Human map: `agent/core_reference.md`
+- Machine index: `agent/core_index.json`
+- Self-fix guardrails: `agent/core_self_fix_playbook.md`
+- Function refresh helper: `tools/refresh_core_reference.ps1`
+
+Standard update steps before/after core edits:
+1. Run `powershell -ExecutionPolicy Bypass -File .\tools\refresh_core_reference.ps1`
+2. If section responsibilities moved, update `agent/core_reference.md`
+3. If risk level, invariants, or key entry points changed, update `agent/core_index.json`
+4. If fix policy or regression gates changed, update `agent/core_self_fix_playbook.md`
+5. Add at least one transcript-grounded regression prompt for each routing or execution fix
+
+Core change acceptance gate:
+- No claim of action without verifiable tool output.
+- Functionality and correct execution are higher priority than style.
+- Keep edits localized and include a short root-cause note in the issue template.
+
 ## Completed
+
+- [x] Restore Spotify now-playing reliability and stop post-failure drift:
+  - Added intent recognition for typo variants like `spotiy` in current-playback asks.
+  - Added `spotify_link` action aliases so `now_playing`, `currently_playing`, `what_is_playing`, and `current_song` map to `current_playback`.
+  - Added transcript and tool regressions to keep the route/action mapping stable.
+- [x] Broaden autonomous curiosity discovery quality:
+  - Added explicit Ostranauts wiki discovery support (`ostranauts.wiki.gg`, `ostranauts.fandom.com`).
+  - Added coding-reference discovery lane (Python/MDN/Microsoft docs, Stack Overflow, GitHub/GitLab, ReadTheDocs).
+  - Added curiosity tests verifying both wiki and coding references are persisted to memory as relevant discoveries.
+
+- [x] Establish and validate core reference baseline workflow:
+  - Refreshed function inventory with `tools/refresh_core_reference.ps1`.
+  - Verified `tmp/core_functions.txt` and `agent/core_index.json` alignment (`function_count=281`, `sections=12`, key anchors present).
+- [x] Confirm and harden tray launcher deployment status on Windows:
+  - Verified tray runtime dependencies (`pystray`, `pillow`) are importable.
+  - Installed a current-user logon-start registration via the Run key so the tray launcher can start after reboot/sign-in.
+  - Verified the batch launcher entry point runs successfully from the project root.
+- [x] Improve the Ostranauts companion launch path in the fancy GUI:
+  - Added a safe monitor fallback so the companion opens reliably even when only one display is available.
+  - Added regression tests for the monitor-selection logic.
+- [x] Scaffold transcript-grounded routing regression tests:
+  - Added `tests/test_transcript_regression_prompts.py` with prompt coverage for file-write routing, recursive directory read routing, command-like detection, and pending-write `yes` confirmation.
+- [x] Accept explicit execution-confirmation phrasing for pending write authorization:
+  - Updated `agent/pending_actions.py` so phrases like `please run the command`, `run the command`, `execute the command`, and `run it` confirm pending external writes.
+  - Updated transcript regression test to require pass (removed xfail).
+  - Current run: `5 passed` for `tests/test_transcript_regression_prompts.py`.
+- [x] Validate current core Mina functionality using canonical runtime checks:
+  - `mk1_api.ps1 status`: API, embed health, and DB status all reported OK.
+  - `mk1_api.ps1 smoke`: passed with verified tool-backed output.
+  - Runtime status showed `core_online=true`, `model_loaded=true`, and memory engine healthy.
+- [x] Improve tool reliability with explicit chat-vs-action rules and durable tool usage memory:
+  - Added runtime decision rules so action-like requests prefer tool routing and missing-target cases ask one focused clarification instead of drifting into chat.
+  - Seeded a durable `tool_usage_rules` memory record at startup to persist tool-use formatting and action-detection guidance in the DB.
+  - Reinforced strict tool-call formatting contract in system guidance for both standard and streaming processing paths.
+- [x] Validate chat-versus-tool routing using natural-language prompts (functional probe, no pytest):
+  - Chat prompts stayed in chat route (joke/opinion/movie prompts).
+  - Action prompts routed to tools (`file_write`, `file_read`, `web_search`, `ps_run`, `dir_list`, `spotify_link`).
+  - Ambiguous action prompt `please run the command` correctly triggered `__clarify_intent__` instead of chat drift.
+- [x] Fix live API workspace-root mismatch causing tool behavior to diverge from tests:
+  - Root cause confirmed: `config/mk1_config.json` pointed workspace root to `E:\\workspace`, so live file tools wrote/read outside the active project.
+  - Added runtime guard in `agent/core.py` (`_resolve_workspace_root`) to prefer repo root when legacy default is detected or configured path is missing.
+  - Updated config workspace root to `E:\\Mina_MK1`.
+  - Added regression coverage in `tests/test_workspace_root_resolution.py` so legacy-root drift is caught in future testing.
 
 - [x] Harden the authoritative fancy GUI in `C:\dev\mina-gui`:
   - Abort stalled requests with bounded timeouts.
@@ -40,6 +430,8 @@ Last updated: 2026-07-25
 ## Next
 
 ### 1. Useful autonomous idle work
+
+- [ ] Validate the tray launcher behavior on a real reboot/sign-in cycle and confirm the tray icon appears.
 
 - [x] Add an external autonomous-update watchdog before enabling live source edits:
   - Launch candidate builds from a process independent of Mina's API and Python core.
@@ -113,9 +505,24 @@ Last updated: 2026-07-25
 
 ### 8. Ostranauts in-game helper
 
+Continuity docs: `integrations/ostranauts/BUILD_STATUS.md` and `integrations/ostranauts/MOD_REFERENCES.md`.
+
 - [x] Discover the installed Ostranauts and Steam library paths without hard-coding drive letters.
 - [x] Install the Ostranauts BepInEx pack and deploy Mina's read-only telemetry bridge.
 - [x] Add a switchable Ostranauts companion view to the authoritative fancy GUI.
+- [x] Resolve live player and current-ship discovery through static `CrewSim` fields in bridge v0.3/schema 3.
+- [x] Record authoritative GUI ownership, verified live facts, safety rules, and mod references for future sessions.
+- [x] Classify explicit player/`aCrew` `alive` and `destroyed` values as living, deceased/remains, destroyed, or unknown; never treat collection membership as proof of living crew.
+- [ ] Map raw conditions into verified skills, training, traits, needs/mood, injuries, and hidden/internal data, using CharacterSidebar as a reference.
+- [x] Prepare and compile bridge v0.4/schema 4 with game-defined condition display metadata and honest truncation reporting.
+- [ ] Deploy bridge v0.4 after Ostranauts is closed, then validate condition metadata after the next game launch.
+- [x] Download CharacterSidebar 0.1.2, LaunchControl 1.0.5, and FFU Console 0.6.1 into an offline reference folder; record archive hashes and inspect DLL metadata without installing them.
+- [x] Review LaunchControl assembly surfaces for item categories, tooltip modules, sprite lookup, and persistence patterns.
+- [x] Review FFU condition-owner/rule/ticker concepts and console patch surfaces for read-only reflection guidance; do not add console execution.
+- [x] Inventory the installed `StreamingAssets/data/items` files and record the verified `strName` visual-definition schema.
+- [ ] Locate the gameplay-definition layer containing human names, categories, mass, and prices, then verify joins to `strName`.
+- [ ] Agree on the companion information hierarchy with the user before changing its existing layout.
+- [ ] Add focused tests for life-state classification and condition normalization.
 - [ ] Build read-only context from game files, saves, logs, configuration, and installed mods.
 - [ ] Let Mina answer voice questions about the current game, crew, ship, inventory, objectives, and mod setup.
 - [ ] Add focused Ostranauts knowledge retrieval with source paths and freshness timestamps so Mina does not invent game state.

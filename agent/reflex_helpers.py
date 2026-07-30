@@ -24,34 +24,6 @@ def handle_directory_scan_reflex(core: Any, tool_name: str, tool_args: Dict[str,
             return message_choice(f"Directory inspection failed: {result.get('error')}")
         return message_choice(str((result.get("result") or {}).get("report") or "No inspection report generated."))
 
-    if tool_name == "__queue_directory_scan__":
-        inspect_path = str(tool_args.get("path") or "").strip()
-        inspect_mode = str(tool_args.get("mode") or "all").strip().lower()
-        core._set_pending_directory_scan(path=inspect_path, mode=inspect_mode, user_input=user_input)
-        return message_choice(
-            f"I can do this reliably, but not as one giant blind read. "
-            f"I will scan {inspect_path} using mode={inspect_mode} and report verified findings. "
-            f"Say: 'yes scan now' to proceed, or 'cancel scan' to stop."
-        )
-
-    if tool_name == "__cancel_directory_scan__":
-        pending = core._get_pending_directory_scan()
-        core._clear_pending_directory_scan()
-        target = str((pending or {}).get("path") or "the pending directory scan")
-        return message_choice(f"Canceled. I will not scan {target}.")
-
-    if tool_name == "__confirm_directory_scan__":
-        pending = core._get_pending_directory_scan()
-        if not pending:
-            return message_choice("No pending directory scan to run.")
-        inspect_path = str(pending.get("path") or "").strip()
-        inspect_mode = str(pending.get("mode") or "all").strip().lower()
-        result = core._inspect_directory_tree(inspect_path, mode=inspect_mode)
-        core._clear_pending_directory_scan()
-        if not result.get("ok"):
-            return message_choice(f"Directory inspection failed: {result.get('error')}")
-        return message_choice(str((result.get("result") or {}).get("report") or "No inspection report generated."))
-
     return None
 
 

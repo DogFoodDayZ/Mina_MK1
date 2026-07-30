@@ -40,6 +40,7 @@ tmp/
 backup/
 integrations/**/build/
 integrations/**/install_record.json
+integrations/**/reference_packages/
 
 # Android/Gradle generated files
 android/.idea/

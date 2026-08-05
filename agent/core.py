@@ -11706,6 +11706,30 @@ class MK1Core:
                 user_input=user_input,
                 source_tag="written_artifact",
             )
+            # Log to memory for future reference (e.g., "read back the file you created")
+            file_path = tool_args.get("path", "")
+            if file_path:
+                try:
+                    self.memory.store(
+                        category="recent file operations",
+                        text=f"Created file: {file_path}",
+                        metadata={"operation": "write", "path": file_path, "turn_input": user_input},
+                    )
+                except Exception:
+                    pass
+
+        if tool_name == "file_read" and isinstance(result, dict) and bool(result.get("ok", False)):
+            # Log file reads to memory for context
+            file_path = tool_args.get("path", "")
+            if file_path:
+                try:
+                    self.memory.store(
+                        category="recent file operations",
+                        text=f"Read file: {file_path}",
+                        metadata={"operation": "read", "path": file_path, "turn_input": user_input},
+                    )
+                except Exception:
+                    pass
 
         blocked_external_write = (
             tool_name in self._write_auth_tool_names()
@@ -14214,15 +14238,29 @@ IMPORTANT RULES:
         system_prompt = (
             "You are a tool planner for Mina. "
             "Pick the best single tool and arguments for the user request. "
+            "Use context provided (e.g., recent file operations) to resolve ambiguous references like 'that file' or 'the one I just created'. "
             "Return ONLY strict JSON with keys: tool, args, confidence, reason. "
             "tool must be one of: " + ", ".join(candidates) + ". "
             "confidence is 0.0-1.0. "
             "If no suitable tool exists, set tool to null and confidence to 0.0."
         )
 
+        # Enrich context with recent memory if user is referencing something just created/done
+        user_text_lower = user_text.lower()
+        context_addition = ""
+        if any(phrase in user_text_lower for phrase in ["created", "just made", "the file you", "that file", "read back", "what did you"]):
+            try:
+                recent = self.memory.recall("recent file operations", limit=3)
+                if recent and recent.get("results"):
+                    context_lines = [str(r.get("text", "")) for r in recent.get("results", [])[:2]]
+                    if context_lines:
+                        context_addition = "\n\nRecent context: " + " | ".join(context_lines)
+            except Exception:
+                pass
+
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
+            {"role": "user", "content": user_text + context_addition},
         ]
 
         try:

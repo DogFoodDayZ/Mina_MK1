@@ -1,7 +1,7 @@
 {
     "file": "agent/core.py",
     "generated_from": "tmp/core_functions.txt",
-    "function_count": 293,
+    "function_count": 363,
     "owners": {
         "primary": "MK1 runtime",
         "supporting": [

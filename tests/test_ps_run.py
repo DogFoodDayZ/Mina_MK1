@@ -99,6 +99,12 @@ def test_normalize_command_maps_natural_cpu_question():
     assert "Win32_Processor" in cmd
 
 
+def test_normalize_command_maps_list_gpu_prompt_with_apostrophe():
+    cmd = ps_run._normalize_command("list gpu's")
+    assert "Win32_VideoController" in cmd
+    assert "AdapterRAM" in cmd
+
+
 def test_normalize_command_rewrites_invalid_get_processor_variant():
     cmd = ps_run._normalize_command("Get-Processor")
     assert "Win32_Processor" in cmd

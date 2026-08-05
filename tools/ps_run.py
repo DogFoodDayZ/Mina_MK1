@@ -57,6 +57,11 @@ def _normalize_command(script: str) -> str:
     if lowered in {"gpu info", "graphics info"}:
         return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
 
+    if re.search(r"\bgpu['’]s?\b", lowered) and re.search(r"\b(?:list|show|get|what|tell me about|check|inspect|query|scan)\b", lowered):
+        if re.search(r"\b(?:how many|count|number of)\b", lowered):
+            return "(Get-CimInstance Win32_VideoController).Count"
+        return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
+
     if lowered in {"cpu info", "processor info"}:
         return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
 

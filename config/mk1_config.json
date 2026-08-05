@@ -2,7 +2,7 @@
   "model": {
     "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
     "load_endpoint": "http://127.0.0.1:1234/api/v1/models/load",
-    "default_model": "qwen2.5-7b-instruct",
+    "default_model": "qwen/qwen3.5-9b",
     "auto_fallback_on_error": false,
     "request_timeout_seconds": 240,
     "switch_allowed": [
@@ -39,7 +39,7 @@
     "directory": "E:\\mina_mk1\\tools"
   },
   "workspace": {
-    "root": "E:\\workspace",
+    "root": "E:\\Mina_MK1",
     "default_dirs": [
       "projects",
       "scratch",

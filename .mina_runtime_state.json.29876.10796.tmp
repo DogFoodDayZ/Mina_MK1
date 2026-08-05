@@ -1,0 +1,12 @@
+{
+  "updated_at": "2026-08-01T17:01:18",
+  "reason": "heartbeat",
+  "turn_clock_started_at": "2026-08-01T06:31:08",
+  "turn_clock_tick": 7547,
+  "turn_clock_last_tick_at": "2026-08-01T17:01:18",
+  "turn_clock_last_elapsed_seconds": 37809.9191402,
+  "last_user_activity_at": "2026-08-01T06:50:36",
+  "last_shutdown_at": "2026-07-31T20:22:58",
+  "idle_checkin_pending": true,
+  "idle_checkin_due_since_at": "2026-08-01T07:20:41"
+}

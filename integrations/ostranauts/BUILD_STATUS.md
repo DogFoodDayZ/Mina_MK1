@@ -1,6 +1,6 @@
 # Mina Ostranauts Companion - Build Status
 
-Last updated: 2026-07-28
+Last updated: 2026-07-30
 
 This file is the restart point for future work. Read it before inspecting code or proposing UI changes.
 
@@ -15,9 +15,9 @@ Build a read-only Mina companion for Ostranauts that presents verified live game
 - Ostranauts: `0.15.1.20`
 - Unity: `6000.3.10f1`
 - BepInEx: `5.4.23.5` / Thunderstore pack `5.4.2305`
-- Live Mina plugin: `0.6.0`
+- Live Mina plugin: `0.6.1`
 - Live telemetry schema: `6`
-- Deployed plugin DLL SHA-256: `c883cf3e0d3cacfd3c99fe01d14c353dd0a0d81403f4e3497eb9949755aec97a`
+- Deployed plugin DLL SHA-256: `3c652f8ec9a5e9c62a68fdd59577d6be8f8800d96f1aa0a7428ca675a0bc4102`
 - Plugin source: `integrations/ostranauts/MinaOstranauts/`
 - Live file: `G:\SteamLibrary\steamapps\common\Ostranauts\BepInEx\config\MinaOstranauts\telemetry.json`
 - API endpoint: `GET /games/ostranauts/status`
@@ -85,6 +85,7 @@ Do not treat `agent/gui/mina_gui.py` or the root `mina_gui.py` shim as the activ
 - [x] Added backend `source_freshness` metadata for telemetry/source provenance and freshness checks, with focused regression coverage in `tests/test_ostranauts.py`.
 - [x] Added plugin-side interface scan metadata (component type, game object, hierarchy path, token-hit scoring) for `nearby_interactables`, `ui_candidates`, `open_ui`, and `pda_devices`; plugin compiles successfully and awaits next-launch live verification.
 - [x] Reduced broadened-scan hitch risk by caching and reusing heavy UI/PDA world scans in `TelemetryReader` instead of rescanning every telemetry write.
+- [x] Disabled scene-wide UI/PDA/interactable fallback sweeps by default so routine telemetry stays on direct runtime references instead of `Resources.FindObjectsOfTypeAll` probes.
 - [x] Added sparse-scene fallback seeding for kiosk/people discovery (`likely_target_fallback` and `likely_ui_fallback`) so interaction lists are not empty when direct arrays are missing.
 - [x] Deployed latest compiled plugin DLL to live game plugin path after-hours.
 
@@ -97,14 +98,14 @@ Reference directions are documented in `MOD_REFERENCES.md`. Installed base-game 
 ## Next work
 
 1. Validate the structured Ostranauts action queue against a live save once the next game session is running.
-2. Classify live conditions using the game's display flags and metadata, with CharacterSidebar as the verified reference.
-3. Identify which conditions represent learned skills, training progress, traits, needs, mood, injuries, and transient internal mechanics.
-4. Locate gameplay item definitions and join them to the verified `strName` visual definitions.
-5. Decide with the user what belongs in the existing companion layout before editing it.
-6. Add focused telemetry tests for condition normalization.
-7. Implement the smallest approved GUI slice and validate it in the actual Tauri companion route.
-8. Expand source/freshness metadata beyond telemetry (save files, logs, configuration, installed mods).
-9. Validate sparse-scene fallback live at kiosks/people clusters and tune candidate scoring thresholds if false positives dominate.
+2. Measure the live post-change telemetry size and hitch behavior with scene sweeps disabled.
+3. Classify live conditions using the game's display flags and metadata, with CharacterSidebar as the verified reference.
+4. Identify which conditions represent learned skills, training progress, traits, needs, mood, injuries, and transient internal mechanics.
+5. Locate gameplay item definitions and join them to the verified `strName` visual definitions.
+6. Decide with the user what belongs in the existing companion layout before editing it.
+7. Add focused telemetry tests for condition normalization.
+8. Implement the smallest approved GUI slice and validate it in the actual Tauri companion route.
+9. Expand source/freshness metadata beyond telemetry (save files, logs, configuration, installed mods).
 
 ## Safety and change control
 

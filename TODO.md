@@ -308,6 +308,246 @@ Copy this block for each new problem and fill it in.
 
 ---
 
+### Issue: Save follow-up replaced drafted script with generic or stale artifact
+
+- Date: 2026-07-31
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - TRAVIS Mina create a script call it screen_filler.py have it fill the screen with random ascii for ten seconds then exit.
+  - TRAVIS save your script in screen_filler.py
+
+#### 2) What Mina actually did
+- Actual response:
+  - MINA reported the file write, but the actual file contents were a different generic terminal-fill stub.
+- Actual action taken:
+  - Replaced the drafted script with newly generated fallback content instead of reusing the earlier draft artifact.
+
+#### 3) What should have happened
+- Expected response:
+  - Save the exact drafted `screen_filler.py` artifact.
+- Expected action/result:
+  - Reuse the stored same-target draft on save follow-up requests instead of generating replacement content.
+
+#### 4) Evidence
+- Transcript snippet:
+  - TRAVIS save your script in screen_filler.py
+  - MINA File written to: E:\workspace\screen_filler.py actual file contents import os ...
+- File path(s) affected:
+  - `screen_filler.py`
+- Error text (exact):
+  - None; wrong artifact content was written.
+
+#### 5) Failure class (pick one)
+- Args extraction wrong
+
+#### 6) Root cause (after investigation)
+- `file_write` pre-generated fallback content before artifact resolution, and same-target stored drafts were still re-scored with the original prompt-keyword matcher instead of being trusted for plain save follow-up requests.
+
+#### 7) Minimal fix
+- Removed pre-generation from the `file_write` follow-up path and added a deterministic same-target stored-draft preference for generic save-followup requests.
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: TRAVIS Mina create a script call it screen_filler.py have it fill the screen with random ascii for ten seconds then exit.
+- Prompt 2: TRAVIS save your script in screen_filler.py
+- Prompt 3: TRAVIS save the script
+
+#### 9) Implementation choice (required)
+- Chosen approach: hardcoded
+- Why this approach fits: save-followup reuse for the active draft is a deterministic execution invariant, not a learned preference.
+- Risk if wrong approach chosen: memory-only behavior can drift to generic stubs or stale artifacts after restart or when competing draft history exists.
+- Regression prompt proving choice: `save your script in screen_filler.py` must reuse the prior draft without requiring hidden phrasing.
+
+#### 10) Done criteria
+- [x] Correct tool class selected (`file_write`)
+- [x] Correct args built (`path=screen_filler.py`, `overwrite=True`)
+- [x] Action verified with proof via focused regression and direct helper smoke (`stored_draft`)
+- [x] No regression on prompts above
+- [x] Mina tone/conciseness still correct
+
+---
+
+### Issue: Bare save confirmation replayed stale continuation from an older script
+
+- Date: 2026-07-31
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - TRAVIS mina make a script that counts down from 10 to 0 save it as countdown.py
+  - TRAVIS there is no test work directory
+  - TRAVIS save the script
+  - TRAVIS yes
+
+#### 2) What Mina actually did
+- Actual response:
+  - MINA later ran `screen_filler.py` and surfaced its PowerShell failure instead of saving or running the new countdown script.
+- Actual action taken:
+  - Replayed stale `context_continuation` state from an older `screen_filler.py` write flow.
+
+#### 3) What should have happened
+- Expected response:
+  - Save the current `countdown.py` draft.
+- Expected action/result:
+  - Route `save the script` to the latest draft artifact and prevent stale continuation replay from hijacking the save flow.
+
+#### 4) Evidence
+- Transcript snippet:
+  - TRAVIS save the script
+  - TRAVIS yes
+  - MINA PowerShell execution failed ... File "E:\workspace\screen_filler.py" ...
+- File path(s) affected:
+  - `countdown.py`
+  - `screen_filler.py`
+- Error text (exact):
+  - `OSError: [WinError 6] The handle is invalid`
+
+#### 5) Failure class (pick one)
+- Intent routing wrong
+
+#### 6) Root cause (after investigation)
+- Bare save follow-up phrasing was not deterministically routed to the last draft artifact, so Mina could fall through to chat while stale continuation state remained active and later hijacked `yes`.
+
+#### 7) Minimal fix
+- Added a deterministic draft-save follow-up route ahead of continuation replay, using the latest draft artifact or an explicitly named target path.
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: TRAVIS mina make a script that counts down from 10 to 0 save it as countdown.py
+- Prompt 2: TRAVIS save the script
+- Prompt 3: TRAVIS save your script in countdown.py
+
+#### 9) Implementation choice (required)
+- Chosen approach: hardcoded
+- Why this approach fits: confirmation/save routing precedence is a stable protocol contract in Mina's execution layer.
+- Risk if wrong approach chosen: learned or memory-only routing can replay stale script flows and rerun the wrong artifact.
+- Regression prompt proving choice: `save the script` must select the active draft even when an older script has continuation state.
+
+#### 10) Done criteria
+- [x] Correct tool class selected (`file_write`)
+- [x] Correct args built (`path=countdown.py`)
+- [x] Action verified with proof via direct routing smoke (`file_write`, `countdown.py`), focused transcript regressions, and live API proof (`File written to: E:\Mina_MK1\countdown.py`)
+- [x] No regression on prompts above
+- [x] Mina tone/conciseness still correct
+
+### Issue: Autonomous audit marked TODO tasks complete without structured proof
+
+- Date: 2026-07-31
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - 3 looks safe can you impment that ?
+
+#### 2) What Mina actually did
+- Actual response:
+  - Prior audit rows used `ok=true` alone, which could mark tasks complete without hard verification.
+- Actual action taken:
+  - Added a verified-completion gate so only structured proof can close autonomous TODO tasks.
+
+#### 3) What should have happened
+- Expected response:
+  - Completion claims should only count when backed by structured evidence.
+- Expected action/result:
+  - Autonomous candidates remain queued until verification is explicitly recorded.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py`
+  - `tests/test_autonomous_work.py`
+  - `agent/core_reference.md`
+  - `agent/core_index.json`
+
+#### 5) Failure class (pick one)
+- Verification/proof mismatch
+
+#### 6) Root cause (after investigation)
+- `_completed_autonomy_keys()` treated any audit row with `ok=true` as completed, even when no structured proof existed.
+
+#### 7) Minimal fix
+- Added `_autonomy_row_has_verified_completion()` and required it in `_completed_autonomy_keys()`.
+- Added structured `verification` fields in autonomous task audit rows.
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: 3 looks safe can you impment that ?
+
+#### 9) Implementation choice (required)
+- Chosen approach: hardcoded
+- Why this approach fits: completion-proof gating is a stable protocol/safety contract, not a user habit.
+- Risk if wrong approach chosen: memory-driven gating could drift and reintroduce unverifiable completion claims.
+- Regression prompt proving choice: unverified `ok=true` audit rows must keep TODO candidates queued.
+
+#### 10) Done criteria
+- [x] Verified-only completion gate added in autonomous candidate filtering.
+- [x] Structured verification fields persisted in audit rows.
+- [x] Regression coverage added for verified vs unverified completion rows.
+- [x] Focused tests passing (`tests/test_autonomous_work.py`: `9 passed`).
+
+### Issue: Execution reply could roleplay terminal output without proof
+
+- Date: 2026-07-31
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - yes run the script countdown.py
+  - make it more Dramatic please.
+
+#### 2) What Mina actually did
+- Actual response:
+  - Returned dramatic/fabricated command output and leaked an internal control line.
+- Actual action taken:
+  - Added proof-gated execution fallback and response sanitization for internal control strings.
+
+#### 3) What should have happened
+- Expected response:
+  - Execution output should only be shown when a real tool run is performed.
+- Expected action/result:
+  - For execution requests with unverified transcript-like output, Mina must run a tool or state she did not run it.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py`
+  - `tests/test_memory_recall.py`
+  - `agent/core_reference.md`
+  - `agent/core_index.json`
+
+#### 5) Failure class (pick one)
+- Action verified with proof mismatch
+
+#### 6) Root cause (after investigation)
+- Execution-like prompts could fall back to plain model text without a tool event, allowing pseudo-terminal roleplay and occasional leaked internal control lines.
+
+#### 7) Minimal fix
+- Added `_is_execution_request_like()`, `_looks_like_unverified_execution_claim()`, and `_maybe_enforce_verified_execution_reply()`.
+- Wired the verified-execution fallback into both `process()` and `process_stream()` when no tool events occurred.
+- Extended `_clean_response_text()` to strip internal DB-tone instruction leakage.
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: yes run the script countdown.py
+- Prompt 2: make it more Dramatic please.
+
+#### 9) Implementation choice (required)
+- Chosen approach: hardcoded
+- Why this approach fits: proof gating and internal-line stripping are stable protocol/safety invariants.
+- Risk if wrong approach chosen: memory-driven handling could drift and re-enable fabricated execution claims.
+- Regression prompt proving choice: execution request with pseudo PowerShell block must force real tool execution or explicit non-claim fallback.
+
+#### 10) Done criteria
+- [x] Unverified execution transcript claims are intercepted by verified fallback logic.
+- [x] Internal DB-tone control line is stripped from user-visible replies.
+- [x] Focused tests passing (`tests/test_memory_recall.py`: `71 passed`, `tests/test_transcript_regression_prompts.py`: `44 passed`).
+
+---
+
 ## Churn Stop Rules
 
 1. No fix is accepted without at least one real transcript prompt added to regression tests.
@@ -392,6 +632,16 @@ Core change acceptance gate:
   - Added runtime guard in `agent/core.py` (`_resolve_workspace_root`) to prefer repo root when legacy default is detected or configured path is missing.
   - Updated config workspace root to `E:\\Mina_MK1`.
   - Added regression coverage in `tests/test_workspace_root_resolution.py` so legacy-root drift is caught in future testing.
+- [x] Bring the core-edit workflow back into TODO-contract compliance after the July 31 routing fixes:
+  - Ran `tools/refresh_core_reference.ps1` after `agent/core.py` edits.
+  - Updated stale core-reference metadata counts to match the refreshed function inventory (`function_count=359`).
+  - Recorded transcript-grounded issue notes for draft-save overwrite and stale-continuation replay regressions.
+- [x] Restore live countdown script creation end to end:
+  - Added bare single-line tool-call parsing so fenced `file_write{...}` / `dir_create{...}` lines execute instead of echoing back as text.
+  - Added direct routing for `save it as countdown.py` so the model no longer invents `test_work` to satisfy the prompt.
+  - Corrected `config/mk1_config.json` workspace root back to `E:\Mina_MK1`.
+  - Aligned the identity gate with the multi-root write policy so repo-local writes are not treated as sensitive.
+  - Live proof: `/process` returned `File written to: E:\Mina_MK1\countdown.py`, and the file exists with the expected countdown body.
 
 - [x] Harden the authoritative fancy GUI in `C:\dev\mina-gui`:
   - Abort stalled requests with bounded timeouts.

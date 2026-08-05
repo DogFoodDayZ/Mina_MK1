@@ -24,6 +24,7 @@ namespace Mina.Ostranauts
         private const int MaxSignalFields = 48;
         private const int MaxUiCandidates = 24;
         private const float HeavyScanCacheSeconds = 30f;
+        private const bool EnableSceneSweepFallbacks = false;
 
         private static readonly object ScanCacheLock = new object();
         private static float cachedNearbyScanAt = -999f;
@@ -588,7 +589,7 @@ namespace Mina.Ostranauts
             }
 
             // If scene lists are empty, seed with best-effort live targets so nearby does not return empty.
-            if (rows.Count == 0)
+            if (EnableSceneSweepFallbacks && rows.Count == 0)
             {
                 var likelyTarget = FindLikelyInteractionTarget(player);
                 AddInteractableRow(rows, seen, likelyTarget, JValue.CreateNull(), "likely_target_fallback");
@@ -597,12 +598,12 @@ namespace Mina.Ostranauts
                 AddInteractableRow(rows, seen, likelyUi, JValue.CreateNull(), "likely_ui_fallback");
             }
 
-            if (rows.Count == 0)
+            if (EnableSceneSweepFallbacks && rows.Count == 0)
             {
                 AppendFallbackInteractables(rows, seen, player);
             }
 
-            if (rows.Count == 0)
+            if (EnableSceneSweepFallbacks && rows.Count == 0)
             {
                 AppendCachedUnfilteredNearby(rows, seen, player);
             }
@@ -641,12 +642,12 @@ namespace Mina.Ostranauts
                 ReadMember(crewSim, "objContactsUI", "ContactsUI", "objSpacebookUI", "SpacebookUI", "objPdaUI", "PdaUI", "objCommUI", "CommUI") ??
                 ReadMember(player, "objContactsUI", "ContactsUI", "objSpacebookUI", "SpacebookUI", "objPdaUI", "PdaUI", "objCommUI", "CommUI");
 
-            if (openUi == null)
+            if (EnableSceneSweepFallbacks && openUi == null)
             {
                 openUi = FindLikelyOpenUi(player);
             }
 
-            if (target == null)
+            if (EnableSceneSweepFallbacks && target == null)
             {
                 target = FindLikelyInteractionTarget(player);
             }
@@ -823,14 +824,17 @@ namespace Mina.Ostranauts
                 }
             }
 
-            foreach (var item in GetCachedDeviceCandidates(origin))
+            if (EnableSceneSweepFallbacks && rows.Count == 0)
             {
-                if (rows.Count >= MaxDeviceCandidates)
+                foreach (var item in GetCachedDeviceCandidates(origin))
                 {
-                    break;
-                }
+                    if (rows.Count >= MaxDeviceCandidates)
+                    {
+                        break;
+                    }
 
-                AppendDeviceRow(rows, seen, item, "device_cached_scan", DistanceFrom(origin, GetWorldPosition(item)));
+                    AppendDeviceRow(rows, seen, item, "device_cached_scan", DistanceFrom(origin, GetWorldPosition(item)));
+                }
             }
 
             return new JArray(rows);
@@ -1033,23 +1037,26 @@ namespace Mina.Ostranauts
             AppendUiCandidate(rows, seen, ReadMember(crewSim, "objContactsUI", "ContactsUI", "objSpacebookUI", "SpacebookUI", "objPdaUI", "PdaUI", "objCommUI", "CommUI"), "crewsim_contacts_ui");
 
             // Keep at least one actionable surface candidate in sparse scenes.
-            if (rows.Count == 0)
+            if (EnableSceneSweepFallbacks && rows.Count == 0)
             {
                 AppendUiCandidate(rows, seen, FindLikelyOpenUi(player), "likely_open_ui");
                 AppendUiCandidate(rows, seen, FindLikelyInteractionTarget(player), "likely_interaction_target");
             }
 
-            foreach (var item in GetCachedUiCandidates(origin))
+            if (EnableSceneSweepFallbacks && rows.Count == 0)
             {
-                if (rows.Count >= MaxUiCandidates)
+                foreach (var item in GetCachedUiCandidates(origin))
                 {
-                    break;
-                }
+                    if (rows.Count >= MaxUiCandidates)
+                    {
+                        break;
+                    }
 
-                AppendUiCandidate(rows, seen, item, "ui_cached_scan", DistanceFrom(origin, GetWorldPosition(item)));
+                    AppendUiCandidate(rows, seen, item, "ui_cached_scan", DistanceFrom(origin, GetWorldPosition(item)));
+                }
             }
 
-            if (rows.Count == 0)
+            if (EnableSceneSweepFallbacks && rows.Count == 0)
             {
                 AppendCachedUnfilteredUiCandidates(rows, seen, origin);
             }

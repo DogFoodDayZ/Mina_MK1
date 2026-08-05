@@ -17,7 +17,7 @@ Use it before making changes so you touch the correct zone first.
 
 ## File Scale Snapshot
 
-- Function count: 293
+- Function count: 363
 - Main classes:
   - `LMStudioClient`
   - `MK1Core`

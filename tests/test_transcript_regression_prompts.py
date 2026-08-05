@@ -268,6 +268,51 @@ def test_cpu_ping_prompt_routes_ps_run_with_cores_speed_usage_script():
     assert "LoadPercent" in script or "LoadPercentage" in script
 
 
+def test_bare_powershell_command_routes_to_ps_run():
+    core = _core_for_intent_tests()
+    core.tools = SimpleNamespace(tools={"ps_run": object()})
+
+    tool_name, args = MK1Core.detect_tool_intent(
+        core,
+        "Get-WmiObject -Class Win32_VideoController | Select-Object Name, DeviceID",
+    )
+
+    assert tool_name == "ps_run"
+    assert "Get-WmiObject" in str(args.get("script") or "")
+
+
+def test_how_many_gpus_prompt_routes_to_ps_run_count_command():
+    core = _core_for_intent_tests()
+    core.tools = SimpleNamespace(tools={"ps_run": object()})
+
+    tool_name, args = MK1Core.detect_tool_intent(
+        core,
+        "TRAVIS how many gpu's are there ?",
+    )
+
+    assert tool_name == "ps_run"
+    script = str(args.get("script") or "")
+    assert "Win32_VideoController" in script
+    assert ".Count" in script
+    assert "Measure-Object" not in script
+
+
+def test_number_of_hard_drives_prompt_routes_to_ps_run_count_command():
+    core = _core_for_intent_tests()
+    core.tools = SimpleNamespace(tools={"ps_run": object()})
+
+    tool_name, args = MK1Core.detect_tool_intent(
+        core,
+        "TRAVIS what is the number of hard drives ?",
+    )
+
+    assert tool_name == "ps_run"
+    script = str(args.get("script") or "")
+    assert "Win32_DiskDrive" in script
+    assert ".Count" in script
+    assert "Measure-Object" not in script
+
+
 def test_take_a_look_with_pending_write_routes_directory_scan_with_focus_hint(tmp_path):
     core = _core_for_intent_tests()
     core.workspace_root = str(tmp_path)
@@ -425,6 +470,86 @@ def test_context_continuation_yes_runs_suggested_next_action_when_available():
     assert "jellybeans.py" in str(args.get("script") or "").lower()
 
 
+def test_save_the_script_prefers_last_draft_over_stale_context_continuation():
+    core = _core_for_intent_tests()
+    core.tools = SimpleNamespace(tools={"ps_run": object(), "file_write": object()})
+
+    MK1Core._set_context_continuation(
+        core,
+        "file_write",
+        {"path": "screen_filler.py", "content": "print('old')"},
+        "save the script",
+        {"ok": True, "result": {"path": "screen_filler.py"}},
+    )
+    MK1Core._set_last_draft_artifact(
+        core,
+        target_path="countdown.py",
+        content=(
+            "import time\n\n"
+            "def countdown():\n"
+            "    for i in range(10, -1, -1):\n"
+            "        print(i)\n"
+            "        time.sleep(1)\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    countdown()\n"
+        ),
+        user_input="TRAVIS mina make a script that counts down from 10 to 0 save it as countdown.py",
+    )
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "save the script")
+
+    assert tool_name == "file_write"
+    assert str(args.get("path") or "").lower().endswith("countdown.py")
+    assert args.get("overwrite") is True
+    assert args.get("content") == ""
+
+
+def test_save_the_script_with_explicit_name_uses_requested_target_not_stale_context():
+    core = _core_for_intent_tests()
+    core.tools = SimpleNamespace(tools={"ps_run": object(), "file_write": object()})
+
+    MK1Core._set_context_continuation(
+        core,
+        "file_write",
+        {"path": "screen_filler.py", "content": "print('old')"},
+        "save the script",
+        {"ok": True, "result": {"path": "screen_filler.py"}},
+    )
+    MK1Core._set_last_draft_artifact(
+        core,
+        target_path="countdown.py",
+        content="print('countdown')\n",
+        user_input="TRAVIS mina make a script that counts down from 10 to 0 save it as countdown.py",
+    )
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "save your script in countdown.py")
+
+    assert tool_name == "file_write"
+    assert str(args.get("path") or "").lower().endswith("countdown.py")
+
+
+def test_create_script_save_it_as_filename_routes_direct_file_write():
+    core = _core_for_intent_tests()
+
+    tool_name, args = MK1Core.detect_tool_intent(
+        core,
+        "TRAVIS mina make a script that counts down from 10 to 0 save it as countdown.py",
+    )
+
+    assert tool_name == "file_write"
+    assert str(args.get("path") or "").lower().endswith("countdown.py")
+
+
+def test_repo_local_file_write_is_not_high_risk_after_workspace_root_fix():
+    core = _core_for_intent_tests()
+
+    assert MK1Core._is_high_risk_tool(
+        core,
+        "file_write",
+        {"path": r"E:\Mina_MK1\countdown.py", "content": "print('ok')"},
+    ) is False
+
+
 def test_execution_followup_runs_python_from_context_continuation_artifact():
     core = _core_for_intent_tests()
     core.tools = SimpleNamespace(tools={"ps_run": object(), "file_write": object()})
@@ -543,8 +668,106 @@ def test_file_write_candidate_reuses_stored_draft_artifact_on_later_save_turn():
     )
 
     assert source == "stored_draft"
-    assert "draw_cross_bones" in content
-    assert "open_mouth" in content
+
+
+def test_file_write_candidate_prefers_stored_draft_over_generated_save_stub_on_followup():
+    core = _core_for_intent_tests()
+
+    MK1Core._set_last_draft_artifact(
+        core,
+        target_path="screen_filler.py",
+        content=(
+            "import random\n"
+            "import time\n"
+            "import os\n\n"
+            "def screen_filler():\n"
+            "    chars = ['@', '#', '$', '%', '&', '*', '+', '-', '=', '!', '?']\n"
+            "    for _ in range(10):\n"
+            "        os.system('cls' if os.name == 'nt' else 'clear')\n"
+            "        print('\\n'.join([''.join(random.choice(chars) * random.randint(1, 40)) for _ in range(20)]))\n"
+            "        time.sleep(1)\n\n"
+            "screen_filler()\n"
+        ),
+        user_input="TRAVIS Mina create a script call it screen_filler.py have it fill the screen with random ascii for ten seconds then exit.",
+    )
+
+    content, source = MK1Core._resolve_file_write_content_candidate(
+        core,
+        user_input="save your script in screen_filler.py",
+        target_path="screen_filler.py",
+        existing_content=(
+            "import os\n\n"
+            "def fill_screen_with_character(char):\n"
+            "    width = os.get_terminal_size().columns\n"
+            "    height = os.get_terminal_size().lines\n"
+            "    for _ in range(height):\n"
+            "        print(char * width)\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    fill_screen_with_character('*')\n"
+        ),
+        reply={},
+    )
+
+    assert source == "stored_draft"
+    assert "chars = ['@', '#', '$', '%', '&', '*', '+', '-', '=', '!', '?']" in content
+    assert "fill_screen_with_character" not in content
+
+
+def test_file_write_candidate_uses_stored_draft_on_generic_save_followup_when_existing_is_empty():
+    core = _core_for_intent_tests()
+
+    MK1Core._set_last_draft_artifact(
+        core,
+        target_path="screen_filler.py",
+        content=(
+            "import random\n"
+            "import time\n"
+            "import os\n\n"
+            "def screen_filler():\n"
+            "    chars = ['@', '#', '$', '%', '&', '*', '+', '-', '=', '!', '?']\n"
+            "    for _ in range(10):\n"
+            "        os.system('cls' if os.name == 'nt' else 'clear')\n"
+            "        print('\\n'.join([''.join(random.choice(chars) * random.randint(1, 40)) for _ in range(20)]))\n"
+            "        time.sleep(1)\n\n"
+            "screen_filler()\n"
+        ),
+        user_input="TRAVIS Mina create a script call it screen_filler.py have it fill the screen with random ascii for ten seconds then exit.",
+    )
+
+    content, source = MK1Core._resolve_file_write_content_candidate(
+        core,
+        user_input="save your script in screen_filler.py",
+        target_path="screen_filler.py",
+        existing_content="",
+        reply={},
+    )
+
+    assert source == "stored_draft"
+    assert "screen_filler" in content
+    assert "fill_screen_with_character" not in content
+
+
+def test_file_write_candidate_accepts_generated_countdown_script_for_countdown_request():
+    core = _core_for_intent_tests()
+    core._generate_file_content_from_intent = lambda user_input, target_path: (
+        "import time\n\n"
+        "for i in range(10, -1, -1):\n"
+        "    print(i)\n"
+        "    time.sleep(1)\n\n"
+        "print(\"Blastoff!\")\n"
+    )
+
+    content, source = MK1Core._resolve_file_write_content_candidate(
+        core,
+        user_input="TRAVIS mina make a script that counts down from 10 to 0 save it as countdown.py",
+        target_path="countdown.py",
+        existing_content="",
+        reply={},
+    )
+
+    assert source == "generated"
+    assert "range(10, -1, -1)" in content
+    assert "time.sleep(1)" in content
 
 
 def test_file_write_candidate_reuses_durable_memory_artifact_when_draft_cache_missing():

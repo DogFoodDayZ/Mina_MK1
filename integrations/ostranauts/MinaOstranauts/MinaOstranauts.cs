@@ -13,7 +13,7 @@ namespace Mina.Ostranauts
     {
         public const string PluginGuid = "com.mina.ostranauts.bridge";
         public const string PluginName = "Mina Ostranauts Bridge";
-        public const string PluginVersion = "0.6.0";
+        public const string PluginVersion = "0.6.1";
 
         private string telemetryDirectory;
         private string telemetryPath;

@@ -18,7 +18,7 @@ Read both files before proposing telemetry or GUI changes.
 - Telemetry: `BepInEx\config\MinaOstranauts\telemetry.json`
 - Mina API: `GET /games/ostranauts/status`
 
-Bridge v0.5 reports loader health, game and Unity versions, active scene, session uptime, objectives, and read-only player, crew, and ship state when the game exposes it. It also feeds structured Ostranauts action drafts into Mina's queue API for later review, and adds opportunistic `ship_layout`, `ship_systems`, and `nearby_interactables` telemetry blocks when runtime fields are available. It does not patch methods, issue commands, edit saves, or mutate game state.
+Bridge v0.6.1 reports loader health, game and Unity versions, active scene, session uptime, objectives, and read-only player, crew, and ship state when the game exposes it. It also feeds structured Ostranauts action drafts into Mina's queue API for later review, and adds opportunistic `ship_layout`, `ship_systems`, and `nearby_interactables` telemetry blocks when runtime fields are available. Expensive scene-wide fallback sweeps for UI/device discovery are now disabled by default so routine snapshots stay anchored to direct runtime references. It does not patch methods, issue commands, edit saves, or mutate game state.
 
 ## Build and install
 

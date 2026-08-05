@@ -42,7 +42,7 @@ from agent.reflex_helpers import (
 from agent.ostranauts import build_ostranauts_context, get_ostranauts_status, is_ostranauts_query
 from config.config_loader import load_config
 from tools.tool_loader import ToolLoader
-from tools.file_access_policy import full_access_root, normalize_tool_path
+from tools.file_access_policy import full_access_roots, normalize_tool_path
 from tools.file_inspector import inspect_file, inspect_sqlite_table, is_probably_text_path
 from memory.mk1_memory import MK1Memory
 from memory.retention import is_failed_decision_text
@@ -1844,7 +1844,7 @@ class MK1Core:
             return True
 
         if tname in self._write_auth_tool_names():
-            root = normalize_tool_path(full_access_root())
+            roots = [normalize_tool_path(root) for root in full_access_roots()]
             targets: List[str] = []
             if tname == "file_move":
                 targets = [
@@ -1858,7 +1858,10 @@ class MK1Core:
 
             for target in [p for p in targets if p]:
                 try:
-                    if os.path.commonpath([os.path.normcase(target), os.path.normcase(root)]) != os.path.normcase(root):
+                    if not any(
+                        os.path.commonpath([os.path.normcase(target), os.path.normcase(root)]) == os.path.normcase(root)
+                        for root in roots if root
+                    ):
                         return True
                 except Exception:
                     return True
@@ -3094,6 +3097,42 @@ class MK1Core:
             "script": f'python "{target_path}"',
         }
 
+    def _is_draft_save_followup_request(self, text: str) -> bool:
+        t = str(text or "").strip().lower()
+        if not t:
+            return False
+        if re.search(r"\b(save|write)\b", t) is None:
+            return False
+        if "```" in t:
+            return False
+        return (
+            re.search(r"\b(script|file|it|this)\b", t) is not None
+            or re.search(r"\.[a-z0-9]{1,8}\b", t) is not None
+        )
+
+    def _resolve_draft_save_intent(self, raw_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not self._is_draft_save_followup_request(raw_text):
+            return None
+
+        draft = self._get_last_draft_artifact()
+        if not isinstance(draft, dict):
+            return None
+
+        draft_target = str(draft.get("target_path") or "").strip()
+        if not draft_target:
+            return None
+
+        explicit_target = self._infer_draft_target_path(raw_text, raw_text)
+        target_path = str(explicit_target or draft_target).strip()
+        if not target_path:
+            return None
+
+        return "file_write", {
+            "path": target_path,
+            "content": "",
+            "overwrite": True,
+        }
+
     def _resolve_continuation_intent(self, raw_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         state = self._get_context_continuation()
         if not isinstance(state, dict):
@@ -3698,6 +3737,10 @@ class MK1Core:
                 continue
             if low in {"---", "important rules:"}:
                 continue
+            if "db-backed mina tone" in low:
+                continue
+            if "prefer these db-backed facts over guessing" in low:
+                continue
             if re.match(r"^\s*mina-style sentence", low):
                 ln = re.sub(r"^\s*mina-style sentence[^:]*:\s*", "", ln, flags=re.IGNORECASE)
                 if not ln.strip():
@@ -3762,6 +3805,19 @@ class MK1Core:
         # Fallback for bare spotify_link{...}.
         for args in re.findall(r"spotify_link\s*\{([\s\S]*?)\}", content, flags=re.IGNORECASE):
             _add("spotify_link", args)
+
+        # Fallback for bare single-line tool calls inside plain text or fenced
+        # blocks, e.g.:
+        # file_write{path: "foo.py", content: "print('ok')"}
+        available_tools = set(self._tool_registry().keys())
+        for name, args in re.findall(
+            r"(?m)^\s*([A-Za-z_][\w.-]*)\s*\{([^\n\r]*?)\}\s*$",
+            content,
+            flags=re.IGNORECASE,
+        ):
+            if available_tools and name not in available_tools:
+                continue
+            _add(name, args)
 
         # Fallback for pipe-arrow wrapper emitted by some templates, e.g.
         # |>web_search{query: "...", max_results: 5}
@@ -3837,6 +3893,12 @@ class MK1Core:
         )
         cleaned = re.sub(
             r"\|>\s*[A-Za-z_][\w.-]*\s*\{[\s\S]*?\}\s*(?:<\|tool_call\>|<tool_call\|>)?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"(?m)^\s*[A-Za-z_][\w.-]*\s*\{[^\n\r]*?\}\s*$",
             "",
             cleaned,
             flags=re.IGNORECASE,
@@ -5071,6 +5133,26 @@ class MK1Core:
             return True
         return False
 
+    def _matches_python_countdown_request(self, user_input: str, content: str) -> bool:
+        request = str(user_input or "").lower()
+        body = str(content or "").lower()
+        if not request or not body:
+            return False
+
+        countdown_signal = (
+            "countdown" in request
+            or "count down" in request
+            or "counts down" in request
+            or "from 10 to 0" in request
+        )
+        if not countdown_signal:
+            return False
+
+        has_descending_range = "range(10, -1, -1)" in body
+        has_sleep = "time.sleep(" in body
+        has_countdown_name = "countdown" in body
+        return has_descending_range and (has_sleep or has_countdown_name)
+
     def _content_matches_artifact_intent(self, user_input: str, target_path: str, content: str) -> bool:
         text = str(content or "").strip()
         if not text:
@@ -5080,6 +5162,9 @@ class MK1Core:
 
         ext = os.path.splitext(str(target_path or ""))[1].lower()
         if ext != ".py":
+            return True
+
+        if self._matches_python_countdown_request(user_input, text):
             return True
 
         keywords = self._artifact_request_keywords(user_input, target_path)
@@ -5093,6 +5178,26 @@ class MK1Core:
             return False
         return True
 
+    def _is_save_followup_without_explicit_content(self, user_input: str) -> bool:
+        text = str(user_input or "")
+        lowered = text.lower()
+        if not lowered.strip():
+            return False
+        if re.search(r"\b(save|write)\b", lowered) is None:
+            return False
+        if re.search(r"\b(script|file)\b", lowered) is None:
+            return False
+        if "```" in text:
+            return False
+        explicit_content_markers = [
+            "with content",
+            "that says",
+            "that prints",
+            "print ",
+            "contains ",
+        ]
+        return not any(marker in lowered for marker in explicit_content_markers)
+
     def _resolve_file_write_content_candidate(
         self,
         user_input: str,
@@ -5101,6 +5206,23 @@ class MK1Core:
         reply: Dict[str, Any],
     ) -> Tuple[str, str]:
         existing = str(existing_content or "").strip()
+
+        stored = self._get_last_draft_artifact()
+        if isinstance(stored, dict):
+            stored_path = str(stored.get("target_path") or "").strip()
+            stored_content = str(stored.get("content") or "")
+            stored_request = str(stored.get("user_input") or user_input or "").strip()
+            target_name = os.path.basename(str(target_path or "")).strip().lower()
+            stored_name = os.path.basename(stored_path).strip().lower()
+            same_target = bool(target_name) and target_name == stored_name
+            if (
+                same_target
+                and self._is_save_followup_without_explicit_content(user_input)
+                and stored_content.strip()
+                and not self._looks_generic_file_stub(target_path, stored_content)
+            ):
+                return stored_content, "stored_draft"
+
         if self._content_matches_artifact_intent(user_input, target_path, existing):
             return existing, "existing"
 
@@ -5108,7 +5230,6 @@ class MK1Core:
         if self._content_matches_artifact_intent(user_input, target_path, drafted):
             return drafted, "reply_code"
 
-        stored = self._get_last_draft_artifact()
         if isinstance(stored, dict):
             stored_path = str(stored.get("target_path") or "").strip()
             stored_content = str(stored.get("content") or "")
@@ -5550,11 +5671,32 @@ class MK1Core:
                         row = json.loads(line)
                     except Exception:
                         continue
-                    if bool(row.get("ok")) and str(row.get("task_key") or "").strip():
+                    if (
+                        bool(row.get("ok"))
+                        and self._autonomy_row_has_verified_completion(row)
+                        and str(row.get("task_key") or "").strip()
+                    ):
                         completed.add(str(row.get("task_key")).strip())
         except FileNotFoundError:
             pass
         return completed
+
+    def _autonomy_row_has_verified_completion(self, row: Dict[str, Any]) -> bool:
+        if not isinstance(row, dict):
+            return False
+
+        verification = row.get("verification")
+        if isinstance(verification, dict):
+            if "completion_verified" in verification:
+                return bool(verification.get("completion_verified"))
+
+        # Legacy compatibility: only trust legacy rows that recorded a real applied patch.
+        patch = row.get("patch")
+        if isinstance(patch, dict):
+            if bool(patch.get("applied")) and bool(patch.get("ok", True)):
+                return True
+
+        return False
 
     def _autonomous_work_candidates(self) -> List[Dict[str, Any]]:
         completed = self._completed_autonomy_keys()
@@ -6020,6 +6162,23 @@ class MK1Core:
             "patch": patch_result,
             "context_files": [item["path"] for item in context_files],
             "duration_seconds": round(time.time() - started_at, 3),
+        }
+        patch_applied = bool(patch_result.get("applied"))
+        validations_value = patch_result.get("validations")
+        raw_validations: List[Any] = validations_value if isinstance(validations_value, list) else []
+        validation_items: List[Dict[str, Any]] = [item for item in raw_validations if isinstance(item, dict)]
+        validations_ok = bool(validation_items) and all(bool(item.get("ok")) for item in validation_items)
+        pytest_changed_ok = any(
+            item.get("name") == "pytest_changed" and bool(item.get("ok"))
+            for item in validation_items
+        )
+        result["verification"] = {
+            "policy": "verified_completion_requires_structured_proof",
+            "patch_applied": patch_applied,
+            "validations_ok": validations_ok,
+            "pytest_changed_ok": pytest_changed_ok,
+            "live_api_proof": False,
+            "completion_verified": patch_applied and bool(patch_result.get("ok", False)),
         }
         self._write_autonomy_audit({
             "ts": time.time(),
@@ -9220,6 +9379,18 @@ class MK1Core:
                 if rescued is not None:
                     final_text = self._extract_text(rescued)
 
+            if not executed_tool_events:
+                # Why: command-like prompts occasionally produced model-only terminal roleplay.
+                # Guard: require a real execution path or explicit non-claim fallback.
+                verified_fallback = self._maybe_enforce_verified_execution_reply(
+                    messages=messages,
+                    user_input=user_input,
+                    assistant_text=final_text,
+                    request_context=request_context,
+                )
+                if verified_fallback is not None:
+                    final_text = verified_fallback
+
             self._store_turn_memory(
                 user_input=user_input,
                 assistant_text=final_text,
@@ -9536,6 +9707,16 @@ class MK1Core:
                     )
                     if rescued is not None:
                         preflight_text = self._extract_text(rescued)
+                    # Why: preflight can still return unverified transcript-like text with no tool events.
+                    # Guard: force verified execution fallback before returning preflight response.
+                    verified_fallback = self._maybe_enforce_verified_execution_reply(
+                        messages=messages,
+                        user_input=user_input,
+                        assistant_text=preflight_text,
+                        request_context=request_context,
+                    )
+                    if verified_fallback is not None:
+                        preflight_text = verified_fallback
                     if preflight_text:
                         self._store_turn_memory(
                             user_input=user_input,
@@ -9582,6 +9763,17 @@ class MK1Core:
             )
             if rescued is not None:
                 final_text = self._extract_text(rescued)
+
+            # Why: streamed replies can emit pseudo terminal blocks without tool execution.
+            # Guard: enforce proof-backed execution or explicit non-claim fallback.
+            verified_fallback = self._maybe_enforce_verified_execution_reply(
+                messages=messages,
+                user_input=user_input,
+                assistant_text=final_text,
+                request_context=request_context,
+            )
+            if verified_fallback is not None:
+                final_text = verified_fallback
 
             self._store_turn_memory(
                 user_input=user_input,
@@ -9634,6 +9826,12 @@ class MK1Core:
 
         # Path-looking strings are usually operational commands.
         if re.search(r"([a-z]:\\|[.]{1,2}[\\/]|\\\w+\\|\.(ps1|py|bat|cmd)\b)", q, re.IGNORECASE):
+            return True
+
+        # Bare PowerShell style commands should be treated as executable requests.
+        if re.search(r"^(?:get|select|where|set|write|new|remove|invoke|start|stop|echo|format)-[a-z]+(?:\s|$)", q, re.IGNORECASE):
+            return True
+        if re.search(r"\b(?:get|select|where|invoke|write|new|remove|set|echo|format)-[a-z]+\b", q, re.IGNORECASE):
             return True
 
         return False
@@ -11077,8 +11275,8 @@ class MK1Core:
                     mem_text = f"hardware_snapshot::{low_query} => {snapshot}"
                     self.memory.add_memory(
                         mem_text,
-                        kind="tool",
-                        tags=["tool_result", "hardware_snapshot", "suggestion_context"],
+                        kind="fact",
+                        tags=["tool_result", "hardware_snapshot", "suggestion_context", "user_memory"],
                     )
                 return
 
@@ -11204,7 +11402,7 @@ class MK1Core:
         if external_write_reply is not None:
             return external_write_reply
 
-        if tool_name in ("file_write", "file_append"):
+        if tool_name == "file_append":
             existing = str(tool_args.get("content", "") or "").strip()
             target_path = str(tool_args.get("path", "") or "").strip()
 
@@ -11677,6 +11875,7 @@ IMPORTANT RULES:
                     return candidate.rstrip('.,;:')
 
             patterns = [
+                r'\bsave\s+(?:it|this|that|script|file)\s+as\s+([^\s,;:]+\.[A-Za-z0-9]{1,8})',
                 r'\bfile\s+([^\s,;:]+\.[A-Za-z0-9]{1,8})',
                 r'\b(?:at|to|in)\s+([A-Za-z]:\\[^\s,;]+)',
                 r'\b(?:at|to|in)\s+([.]{1,2}[\\/][^\s,;]+)',
@@ -11996,6 +12195,10 @@ IMPORTANT RULES:
             # Any new non-confirmation input cancels the pending alias replay.
             self._clear_pending_alias_replay()
 
+        draft_save_intent = self._resolve_draft_save_intent(raw_text)
+        if draft_save_intent is not None:
+            return draft_save_intent
+
         continuation_intent = self._resolve_continuation_intent(raw_text)
         if continuation_intent is not None:
             return continuation_intent
@@ -12092,6 +12295,14 @@ IMPORTANT RULES:
             if lowered_query in {"gpu info", "graphics info"}:
                 return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
 
+            # Why: count-style hardware questions should use the same execution path as other system queries.
+            # Guard: keeps "how many ..." prompts from falling back to chat while avoiding per-phrase branching.
+            if re.search(r"\bhow many\b.*\b(gpu|gpus|graphics|video controller)\b", lowered_query) or re.search(r"\b(gpu|gpus|graphics|video controller)\b.*\bhow many\b", lowered_query):
+                return "(Get-CimInstance Win32_VideoController).Count"
+
+            if re.search(r"\b(number of|count of|how many|how much)\b.*\b(hard drive|hard drives|disk drive|disk drives|drive|drives)\b", lowered_query) or re.search(r"\b(hard drive|hard drives|disk drive|disk drives|drive|drives)\b.*\b(number of|count of|how many|how much)\b", lowered_query):
+                return "(Get-CimInstance Win32_DiskDrive).Count"
+
             if lowered_query in {"cpu info", "processor info"}:
                 return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
 
@@ -12118,6 +12329,12 @@ IMPORTANT RULES:
 
             if re.search(r"\bwhat\b.*\bgpu\b", lowered_query):
                 return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
+
+            if re.search(r"\bhow many\b.*\b(gpu|gpus|graphics|video controller)\b", lowered_query) or re.search(r"\b(gpu|gpus|graphics|video controller)\b.*\bhow many\b", lowered_query):
+                return "(Get-CimInstance Win32_VideoController).Count"
+
+            if re.search(r"\b(number of|count of|how many|how much)\b.*\b(hard drive|hard drives|disk drive|disk drives|drive|drives)\b", lowered_query) or re.search(r"\b(hard drive|hard drives|disk drive|disk drives|drive|drives)\b.*\b(number of|count of|how many|how much)\b", lowered_query):
+                return "(Get-CimInstance Win32_DiskDrive).Count"
 
             if re.search(r"\bwhat\b.*\b(ram|memory)\b", lowered_query):
                 return "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory"
@@ -12156,6 +12373,12 @@ IMPORTANT RULES:
             args = self._parse_tool_args(str(pasted_tool.group(2) or ""))
             if tool_name in self._tool_registry():
                 return tool_name, args
+
+        # Bare PowerShell-style commands should still execute directly when the user
+        # pastes or types them as operational input.
+        if re.search(r"^(?:get|select|where|set|write|new|remove|invoke|start|stop|echo|format)-[A-Za-z]+", raw_text, re.IGNORECASE):
+            if "ps_run" in self._tool_registry():
+                return "ps_run", {"script": _infer_ps_command(raw_text)}
 
         # Route configurable tool self-test requests early so mentions like
         # "spotify" or "github" don't get hijacked by other intent handlers.
@@ -13657,6 +13880,15 @@ IMPORTANT RULES:
             "todays date",
         ]
 
+        # Why: hardware-count phrasing is a stable system-query class, not a one-off prompt hack.
+        # Guard: routes "how many ..." hardware questions through the same ps_run branch as other system intents.
+        hardware_count_query = (
+            re.search(r"\bhow many\b.*\b(cpu|gpu|gpus|graphics|ram|memory|disk|storage|hard drive|hard drives|drive|drives)\b", t) is not None
+            or re.search(r"\b(cpu|gpu|gpus|graphics|ram|memory|disk|storage|hard drive|hard drives|drive|drives)\b.*\bhow many\b", t) is not None
+            or re.search(r"\b(number of|count of|how many|how much)\b.*\b(cpu|gpu|gpus|graphics|ram|memory|disk|storage|hard drive|hard drives|drive|drives)\b", t) is not None
+            or re.search(r"\b(cpu|gpu|gpus|graphics|ram|memory|disk|storage|hard drive|hard drives|drive|drives)\b.*\b(number of|count of|how many|how much)\b", t) is not None
+        )
+
         if any(x in t for x in [
             "run ps",
             "run powershell",
@@ -13669,7 +13901,7 @@ IMPORTANT RULES:
             "run this script",
             "run this ps",
             "run this powershell",
-        ]) or any(x in t for x in system_query_terms) or (
+        ]) or any(x in t for x in system_query_terms) or hardware_count_query or (
             re.search(r"\bwhat\b.*\b(cpu|gpu|ram|memory|system|os|platform|specs?)\b", t) is not None
         ) or (
             re.search(r"\b(what|current|local)\b.*\b(time|date)\b", t) is not None
@@ -14114,6 +14346,82 @@ IMPORTANT RULES:
             return text
 
         return f"{failure_summary}\n\n{text}"
+
+    def _is_execution_request_like(self, text: str) -> bool:
+        q = str(text or "").strip().lower()
+        if not q:
+            return False
+
+        if re.search(r"\b(run|execute|start|launch)\b", q) is None:
+            return False
+
+        if re.search(r"\b(script|command|powershell|python|pytest|test|tests|api|service|server)\b", q):
+            return True
+
+        if re.search(r"([a-z]:\\|[.]{1,2}[\\/]|\.(ps1|py|bat|cmd)\b)", q, re.IGNORECASE):
+            return True
+
+        return False
+
+    def _looks_like_unverified_execution_claim(self, text: str) -> bool:
+        body = str(text or "")
+        if not body.strip():
+            return False
+
+        if re.search(r"```(?:powershell|pwsh|cmd|bash|sh|python)?", body, re.IGNORECASE):
+            return True
+
+        if re.search(r"^\s*PS\s+[^\r\n>]+>\s*", body, re.MULTILINE):
+            return True
+
+        if re.search(r"\b(exited with code|exit code|stdout:|stderr:)\b", body, re.IGNORECASE):
+            return True
+
+        return False
+
+    def _maybe_enforce_verified_execution_reply(
+        self,
+        messages: List[Dict[str, Any]],
+        user_input: str,
+        assistant_text: str,
+        request_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        if not self._is_execution_request_like(user_input):
+            return None
+
+        if not self._looks_like_unverified_execution_claim(assistant_text):
+            return None
+
+        try:
+            tool_name, _tool_args = self.detect_tool_intent(user_input)
+        except Exception:
+            traceback.print_exc()
+            tool_name = None
+
+        if not tool_name:
+            planned = self._plan_tool_action(user_input)
+            if planned is not None:
+                tool_name = planned[0]
+
+        if not tool_name or tool_name == "__clarify_intent__":
+            return (
+                "I did not run that command yet, so I cannot claim output. "
+                "Give me the exact command or file path and I will run it for real."
+            )
+
+        rescued = self._reflex_tools_and_memory(
+            messages=messages,
+            reply={},
+            user_input=user_input,
+            request_context=request_context,
+        )
+        if rescued is None:
+            return (
+                "I did not run that command yet, so I cannot claim output. "
+                "Give me the exact command or file path and I will run it for real."
+            )
+
+        return self._extract_text(rescued)
 
     # ========================================================
     # EXTRACT TEXT

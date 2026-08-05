@@ -1,0 +1,1798 @@
+{
+  "generated_at": "2026-07-30T21:42:47",
+  "entry_count": 224,
+  "entries": [
+    {
+      "name": ".gitignore",
+      "name_lower": ".gitignore",
+      "path": "E:\\Mina_MK1\\.gitignore",
+      "root_kind": "workspace",
+      "rel_path": ".gitignore",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": ".mk1_last_shutdown.json",
+      "name_lower": ".mk1_last_shutdown.json",
+      "path": "E:\\Mina_MK1\\.mk1_last_shutdown.json",
+      "root_kind": "workspace",
+      "rel_path": ".mk1_last_shutdown.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "debug_duckduckgo.py",
+      "name_lower": "debug_duckduckgo.py",
+      "path": "E:\\Mina_MK1\\debug_duckduckgo.py",
+      "root_kind": "workspace",
+      "rel_path": "debug_duckduckgo.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "debug_duckduckgo2.py",
+      "name_lower": "debug_duckduckgo2.py",
+      "path": "E:\\Mina_MK1\\debug_duckduckgo2.py",
+      "root_kind": "workspace",
+      "rel_path": "debug_duckduckgo2.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "deploy_mina_android_auto.ps1",
+      "name_lower": "deploy_mina_android_auto.ps1",
+      "path": "E:\\Mina_MK1\\deploy_mina_android_auto.ps1",
+      "root_kind": "workspace",
+      "rel_path": "deploy_mina_android_auto.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "Install Mina Tray Startup.ps1",
+      "name_lower": "install mina tray startup.ps1",
+      "path": "E:\\Mina_MK1\\Install Mina Tray Startup.ps1",
+      "root_kind": "workspace",
+      "rel_path": "Install Mina Tray Startup.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "launch_all.py",
+      "name_lower": "launch_all.py",
+      "path": "E:\\Mina_MK1\\launch_all.py",
+      "root_kind": "workspace",
+      "rel_path": "launch_all.py",
+      "description": "Python launcher/orchestration script."
+    },
+    {
+      "name": "launch_api.py",
+      "name_lower": "launch_api.py",
+      "path": "E:\\Mina_MK1\\launch_api.py",
+      "root_kind": "workspace",
+      "rel_path": "launch_api.py",
+      "description": "Python launcher/orchestration script."
+    },
+    {
+      "name": "launch_database.py",
+      "name_lower": "launch_database.py",
+      "path": "E:\\Mina_MK1\\launch_database.py",
+      "root_kind": "workspace",
+      "rel_path": "launch_database.py",
+      "description": "Python launcher/orchestration script."
+    },
+    {
+      "name": "MINA_FINAL_SUMMARY.py",
+      "name_lower": "mina_final_summary.py",
+      "path": "E:\\Mina_MK1\\MINA_FINAL_SUMMARY.py",
+      "root_kind": "workspace",
+      "rel_path": "MINA_FINAL_SUMMARY.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mina_gui.py",
+      "name_lower": "mina_gui.py",
+      "path": "E:\\Mina_MK1\\mina_gui.py",
+      "root_kind": "workspace",
+      "rel_path": "mina_gui.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mina_tray_launcher.py",
+      "name_lower": "mina_tray_launcher.py",
+      "path": "E:\\Mina_MK1\\mina_tray_launcher.py",
+      "root_kind": "workspace",
+      "rel_path": "mina_tray_launcher.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mina_watchdog.ps1",
+      "name_lower": "mina_watchdog.ps1",
+      "path": "E:\\Mina_MK1\\mina_watchdog.ps1",
+      "root_kind": "workspace",
+      "rel_path": "mina_watchdog.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mina_windows_voice_loop.py",
+      "name_lower": "mina_windows_voice_loop.py",
+      "path": "E:\\Mina_MK1\\mina_windows_voice_loop.py",
+      "root_kind": "workspace",
+      "rel_path": "mina_windows_voice_loop.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mk1_api.ps1",
+      "name_lower": "mk1_api.ps1",
+      "path": "E:\\Mina_MK1\\mk1_api.ps1",
+      "root_kind": "workspace",
+      "rel_path": "mk1_api.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mk1_api.py",
+      "name_lower": "mk1_api.py",
+      "path": "E:\\Mina_MK1\\mk1_api.py",
+      "root_kind": "workspace",
+      "rel_path": "mk1_api.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mk1_api.recovered.ps1",
+      "name_lower": "mk1_api.recovered.ps1",
+      "path": "E:\\Mina_MK1\\mk1_api.recovered.ps1",
+      "root_kind": "workspace",
+      "rel_path": "mk1_api.recovered.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "open_mina_restore.ps1",
+      "name_lower": "open_mina_restore.ps1",
+      "path": "E:\\Mina_MK1\\open_mina_restore.ps1",
+      "root_kind": "workspace",
+      "rel_path": "open_mina_restore.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "requirements.lock.txt",
+      "name_lower": "requirements.lock.txt",
+      "path": "E:\\Mina_MK1\\requirements.lock.txt",
+      "root_kind": "workspace",
+      "rel_path": "requirements.lock.txt",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "requirements.txt",
+      "name_lower": "requirements.txt",
+      "path": "E:\\Mina_MK1\\requirements.txt",
+      "root_kind": "workspace",
+      "rel_path": "requirements.txt",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "setup_mk1_env.ps1",
+      "name_lower": "setup_mk1_env.ps1",
+      "path": "E:\\Mina_MK1\\setup_mk1_env.ps1",
+      "root_kind": "workspace",
+      "rel_path": "setup_mk1_env.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "shutdown_mina_safe.ps1",
+      "name_lower": "shutdown_mina_safe.ps1",
+      "path": "E:\\Mina_MK1\\shutdown_mina_safe.ps1",
+      "root_kind": "workspace",
+      "rel_path": "shutdown_mina_safe.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "Start Mina Tray.cmd",
+      "name_lower": "start mina tray.cmd",
+      "path": "E:\\Mina_MK1\\Start Mina Tray.cmd",
+      "root_kind": "workspace",
+      "rel_path": "Start Mina Tray.cmd",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "start_mina_voice_monitor.ps1",
+      "name_lower": "start_mina_voice_monitor.ps1",
+      "path": "E:\\Mina_MK1\\start_mina_voice_monitor.ps1",
+      "root_kind": "workspace",
+      "rel_path": "start_mina_voice_monitor.ps1",
+      "description": "PowerShell start script for a Mina service."
+    },
+    {
+      "name": "start_mk1_api.ps1",
+      "name_lower": "start_mk1_api.ps1",
+      "path": "E:\\Mina_MK1\\start_mk1_api.ps1",
+      "root_kind": "workspace",
+      "rel_path": "start_mk1_api.ps1",
+      "description": "PowerShell start script for a Mina service."
+    },
+    {
+      "name": "start_mk1_api.recovered.ps1",
+      "name_lower": "start_mk1_api.recovered.ps1",
+      "path": "E:\\Mina_MK1\\start_mk1_api.recovered.ps1",
+      "root_kind": "workspace",
+      "rel_path": "start_mk1_api.recovered.ps1",
+      "description": "PowerShell start script for a Mina service."
+    },
+    {
+      "name": "status_mk1_api.ps1",
+      "name_lower": "status_mk1_api.ps1",
+      "path": "E:\\Mina_MK1\\status_mk1_api.ps1",
+      "root_kind": "workspace",
+      "rel_path": "status_mk1_api.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "stop_mk1_api.ps1",
+      "name_lower": "stop_mk1_api.ps1",
+      "path": "E:\\Mina_MK1\\stop_mk1_api.ps1",
+      "root_kind": "workspace",
+      "rel_path": "stop_mk1_api.ps1",
+      "description": "PowerShell stop script for a Mina service."
+    },
+    {
+      "name": "STREAMING_SOLUTION.md",
+      "name_lower": "streaming_solution.md",
+      "path": "E:\\Mina_MK1\\STREAMING_SOLUTION.md",
+      "root_kind": "workspace",
+      "rel_path": "STREAMING_SOLUTION.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "test.txt",
+      "name_lower": "test.txt",
+      "path": "E:\\Mina_MK1\\test.txt",
+      "root_kind": "workspace",
+      "rel_path": "test.txt",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "test_code_exec.py",
+      "name_lower": "test_code_exec.py",
+      "path": "E:\\Mina_MK1\\test_code_exec.py",
+      "root_kind": "workspace",
+      "rel_path": "test_code_exec.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_code_execute.py",
+      "name_lower": "test_code_execute.py",
+      "path": "E:\\Mina_MK1\\test_code_execute.py",
+      "root_kind": "workspace",
+      "rel_path": "test_code_execute.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_code_features.py",
+      "name_lower": "test_code_features.py",
+      "path": "E:\\Mina_MK1\\test_code_features.py",
+      "root_kind": "workspace",
+      "rel_path": "test_code_features.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_code_gen.py",
+      "name_lower": "test_code_gen.py",
+      "path": "E:\\Mina_MK1\\test_code_gen.py",
+      "root_kind": "workspace",
+      "rel_path": "test_code_gen.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_comprehensive.py",
+      "name_lower": "test_comprehensive.py",
+      "path": "E:\\Mina_MK1\\test_comprehensive.py",
+      "root_kind": "workspace",
+      "rel_path": "test_comprehensive.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_direct.txt",
+      "name_lower": "test_direct.txt",
+      "path": "E:\\Mina_MK1\\test_direct.txt",
+      "root_kind": "workspace",
+      "rel_path": "test_direct.txt",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "test_duckduckgo_api.py",
+      "name_lower": "test_duckduckgo_api.py",
+      "path": "E:\\Mina_MK1\\test_duckduckgo_api.py",
+      "root_kind": "workspace",
+      "rel_path": "test_duckduckgo_api.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_duckduckgo_raw.py",
+      "name_lower": "test_duckduckgo_raw.py",
+      "path": "E:\\Mina_MK1\\test_duckduckgo_raw.py",
+      "root_kind": "workspace",
+      "rel_path": "test_duckduckgo_raw.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_file_write.py",
+      "name_lower": "test_file_write.py",
+      "path": "E:\\Mina_MK1\\test_file_write.py",
+      "root_kind": "workspace",
+      "rel_path": "test_file_write.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_file_write_intent.py",
+      "name_lower": "test_file_write_intent.py",
+      "path": "E:\\Mina_MK1\\test_file_write_intent.py",
+      "root_kind": "workspace",
+      "rel_path": "test_file_write_intent.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_file_write_intent2.py",
+      "name_lower": "test_file_write_intent2.py",
+      "path": "E:\\Mina_MK1\\test_file_write_intent2.py",
+      "root_kind": "workspace",
+      "rel_path": "test_file_write_intent2.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_file_write_tool.py",
+      "name_lower": "test_file_write_tool.py",
+      "path": "E:\\Mina_MK1\\test_file_write_tool.py",
+      "root_kind": "workspace",
+      "rel_path": "test_file_write_tool.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_intent_detection.py",
+      "name_lower": "test_intent_detection.py",
+      "path": "E:\\Mina_MK1\\test_intent_detection.py",
+      "root_kind": "workspace",
+      "rel_path": "test_intent_detection.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_mina_comprehensive.py",
+      "name_lower": "test_mina_comprehensive.py",
+      "path": "E:\\Mina_MK1\\test_mina_comprehensive.py",
+      "root_kind": "workspace",
+      "rel_path": "test_mina_comprehensive.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_mina_comprehensive_streaming.py",
+      "name_lower": "test_mina_comprehensive_streaming.py",
+      "path": "E:\\Mina_MK1\\test_mina_comprehensive_streaming.py",
+      "root_kind": "workspace",
+      "rel_path": "test_mina_comprehensive_streaming.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_mina_works.py",
+      "name_lower": "test_mina_works.py",
+      "path": "E:\\Mina_MK1\\test_mina_works.py",
+      "root_kind": "workspace",
+      "rel_path": "test_mina_works.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_search_engines.py",
+      "name_lower": "test_search_engines.py",
+      "path": "E:\\Mina_MK1\\test_search_engines.py",
+      "root_kind": "workspace",
+      "rel_path": "test_search_engines.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_streaming.py",
+      "name_lower": "test_streaming.py",
+      "path": "E:\\Mina_MK1\\test_streaming.py",
+      "root_kind": "workspace",
+      "rel_path": "test_streaming.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_streaming_quick.py",
+      "name_lower": "test_streaming_quick.py",
+      "path": "E:\\Mina_MK1\\test_streaming_quick.py",
+      "root_kind": "workspace",
+      "rel_path": "test_streaming_quick.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_stream_simple.py",
+      "name_lower": "test_stream_simple.py",
+      "path": "E:\\Mina_MK1\\test_stream_simple.py",
+      "root_kind": "workspace",
+      "rel_path": "test_stream_simple.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_weather.py",
+      "name_lower": "test_weather.py",
+      "path": "E:\\Mina_MK1\\test_weather.py",
+      "root_kind": "workspace",
+      "rel_path": "test_weather.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_weather_intent.py",
+      "name_lower": "test_weather_intent.py",
+      "path": "E:\\Mina_MK1\\test_weather_intent.py",
+      "root_kind": "workspace",
+      "rel_path": "test_weather_intent.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_web_search_weather.py",
+      "name_lower": "test_web_search_weather.py",
+      "path": "E:\\Mina_MK1\\test_web_search_weather.py",
+      "root_kind": "workspace",
+      "rel_path": "test_web_search_weather.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "TODO.md",
+      "name_lower": "todo.md",
+      "path": "E:\\Mina_MK1\\TODO.md",
+      "root_kind": "workspace",
+      "rel_path": "TODO.md",
+      "description": "Project task tracker and active work items."
+    },
+    {
+      "name": "__init__.py",
+      "name_lower": "__init__.py",
+      "path": "E:\\Mina_MK1\\__init__.py",
+      "root_kind": "workspace",
+      "rel_path": "__init__.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "settings.json",
+      "name_lower": "settings.json",
+      "path": "E:\\Mina_MK1\\.vscode\\settings.json",
+      "root_kind": "workspace",
+      "rel_path": ".vscode/settings.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "core.py",
+      "name_lower": "core.py",
+      "path": "E:\\Mina_MK1\\agent\\core.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/core.py",
+      "description": "Main runtime brain: routing, memory, tools, and response logic."
+    },
+    {
+      "name": "core_index.json",
+      "name_lower": "core_index.json",
+      "path": "E:\\Mina_MK1\\agent\\core_index.json",
+      "root_kind": "workspace",
+      "rel_path": "agent/core_index.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "core_reference.md",
+      "name_lower": "core_reference.md",
+      "path": "E:\\Mina_MK1\\agent\\core_reference.md",
+      "root_kind": "workspace",
+      "rel_path": "agent/core_reference.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "core_self_fix_playbook.md",
+      "name_lower": "core_self_fix_playbook.md",
+      "path": "E:\\Mina_MK1\\agent\\core_self_fix_playbook.md",
+      "root_kind": "workspace",
+      "rel_path": "agent/core_self_fix_playbook.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "curiosity.py",
+      "name_lower": "curiosity.py",
+      "path": "E:\\Mina_MK1\\agent\\curiosity.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/curiosity.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "file_intents.py",
+      "name_lower": "file_intents.py",
+      "path": "E:\\Mina_MK1\\agent\\file_intents.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/file_intents.py",
+      "description": "Natural-language file and directory intent parsing rules."
+    },
+    {
+      "name": "ostranauts.py",
+      "name_lower": "ostranauts.py",
+      "path": "E:\\Mina_MK1\\agent\\ostranauts.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/ostranauts.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "pending_actions.py",
+      "name_lower": "pending_actions.py",
+      "path": "E:\\Mina_MK1\\agent\\pending_actions.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/pending_actions.py",
+      "description": "Pending confirmations and approval phrase handling."
+    },
+    {
+      "name": "reflex_helpers.py",
+      "name_lower": "reflex_helpers.py",
+      "path": "E:\\Mina_MK1\\agent\\reflex_helpers.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/reflex_helpers.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "__init__.py",
+      "name_lower": "__init__.py",
+      "path": "E:\\Mina_MK1\\agent\\__init__.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/__init__.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mina_gui.py",
+      "name_lower": "mina_gui.py",
+      "path": "E:\\Mina_MK1\\agent\\gui\\mina_gui.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/gui/mina_gui.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "__init__.py",
+      "name_lower": "__init__.py",
+      "path": "E:\\Mina_MK1\\agent\\gui\\__init__.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/gui/__init__.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mk1_api.py",
+      "name_lower": "mk1_api.py",
+      "path": "E:\\Mina_MK1\\agent\\server\\mk1_api.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/server/mk1_api.py",
+      "description": "HTTP API entrypoint that serves Mina process endpoints."
+    },
+    {
+      "name": "__init__.py",
+      "name_lower": "__init__.py",
+      "path": "E:\\Mina_MK1\\agent\\server\\__init__.py",
+      "root_kind": "workspace",
+      "rel_path": "agent/server/__init__.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": ".gitignore",
+      "name_lower": ".gitignore",
+      "path": "E:\\Mina_MK1\\android\\.idea\\.gitignore",
+      "root_kind": "workspace",
+      "rel_path": "android/.idea/.gitignore",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": ".name",
+      "name_lower": ".name",
+      "path": "E:\\Mina_MK1\\android\\.idea\\.name",
+      "root_kind": "workspace",
+      "rel_path": "android/.idea/.name",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "gradlew",
+      "name_lower": "gradlew",
+      "path": "E:\\Mina_MK1\\android\\mina-voice-app\\gradlew",
+      "root_kind": "workspace",
+      "rel_path": "android/mina-voice-app/gradlew",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "gradlew.bat",
+      "name_lower": "gradlew.bat",
+      "path": "E:\\Mina_MK1\\android\\mina-voice-app\\gradlew.bat",
+      "root_kind": "workspace",
+      "rel_path": "android/mina-voice-app/gradlew.bat",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "README.md",
+      "name_lower": "readme.md",
+      "path": "E:\\Mina_MK1\\android\\mina-voice-app\\README.md",
+      "root_kind": "workspace",
+      "rel_path": "android/mina-voice-app/README.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "implementation_plan.artifact.md",
+      "name_lower": "implementation_plan.artifact.md",
+      "path": "E:\\Mina_MK1\\android\\mina-voice-app\\.artifacts\\implementation_plan.artifact.md",
+      "root_kind": "workspace",
+      "rel_path": "android/mina-voice-app/.artifacts/implementation_plan.artifact.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "implementation_plan.artifact.md",
+      "name_lower": "implementation_plan.artifact.md",
+      "path": "E:\\Mina_MK1\\android\\mina-voice-app\\.artifacts\\03f23ce3-df78-4013-9930-b0455684cd9b\\implementation_plan.artifact.md",
+      "root_kind": "workspace",
+      "rel_path": "android/mina-voice-app/.artifacts/03f23ce3-df78-4013-9930-b0455684cd9b/implementation_plan.artifact.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": ".gitignore",
+      "name_lower": ".gitignore",
+      "path": "E:\\Mina_MK1\\android\\mina-voice-app\\.idea\\.gitignore",
+      "root_kind": "workspace",
+      "rel_path": "android/mina-voice-app/.idea/.gitignore",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": ".name",
+      "name_lower": ".name",
+      "path": "E:\\Mina_MK1\\android\\mina-voice-app\\.idea\\.name",
+      "root_kind": "workspace",
+      "rel_path": "android/mina-voice-app/.idea/.name",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "package-lock.json",
+      "name_lower": "package-lock.json",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\package-lock.json",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/package-lock.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "package.json",
+      "name_lower": "package.json",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\package.json",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/package.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "server.js",
+      "name_lower": "server.js",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\server.js",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/server.js",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "index.html",
+      "name_lower": "index.html",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\index.html",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/index.html",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "prompts.json",
+      "name_lower": "prompts.json",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\prompts.json",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/prompts.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "index.html",
+      "name_lower": "index.html",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\moods\\annoyed\\index.html",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/moods/annoyed/index.html",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "prompts.json",
+      "name_lower": "prompts.json",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\moods\\annoyed\\prompts.json",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/moods/annoyed/prompts.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "index.html",
+      "name_lower": "index.html",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\moods\\smirk\\index.html",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/moods/smirk/index.html",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "prompts.json",
+      "name_lower": "prompts.json",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\moods\\smirk\\prompts.json",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/moods/smirk/prompts.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "index.html",
+      "name_lower": "index.html",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\moods\\talk\\index.html",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/moods/talk/index.html",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "prompts.json",
+      "name_lower": "prompts.json",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\moods\\talk\\prompts.json",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/moods/talk/prompts.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "index.html",
+      "name_lower": "index.html",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\moods\\talk-red\\index.html",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/moods/talk-red/index.html",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "prompts.json",
+      "name_lower": "prompts.json",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\moods\\talk-red\\prompts.json",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/moods/talk-red/prompts.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "index.html",
+      "name_lower": "index.html",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\run-01\\index.html",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/run-01/index.html",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "prompts.json",
+      "name_lower": "prompts.json",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\run-01\\prompts.json",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/run-01/prompts.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "index.html",
+      "name_lower": "index.html",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\run-02\\index.html",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/run-02/index.html",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "prompts.json",
+      "name_lower": "prompts.json",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\concepts\\run-02\\prompts.json",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/concepts/run-02/prompts.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "app.js",
+      "name_lower": "app.js",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\public\\app.js",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/public/app.js",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "index.html",
+      "name_lower": "index.html",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\public\\index.html",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/public/index.html",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "style.css",
+      "name_lower": "style.css",
+      "path": "E:\\Mina_MK1\\avatar-overlay\\public\\style.css",
+      "root_kind": "workspace",
+      "rel_path": "avatar-overlay/public/style.css",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "tmp_mina_prompt.py",
+      "name_lower": "tmp_mina_prompt.py",
+      "path": "E:\\Mina_MK1\\cleanup_archive\\cleanup_20260709_073804\\tmp_mina_prompt.py",
+      "root_kind": "workspace",
+      "rel_path": "cleanup_archive/cleanup_20260709_073804/tmp_mina_prompt.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "config_loader.py",
+      "name_lower": "config_loader.py",
+      "path": "E:\\Mina_MK1\\config\\config_loader.py",
+      "root_kind": "workspace",
+      "rel_path": "config/config_loader.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mk1_config.json",
+      "name_lower": "mk1_config.json",
+      "path": "E:\\Mina_MK1\\config\\mk1_config.json",
+      "root_kind": "workspace",
+      "rel_path": "config/mk1_config.json",
+      "description": "Runtime configuration: workspace, model, tools, and behavior flags."
+    },
+    {
+      "name": "personality.txt",
+      "name_lower": "personality.txt",
+      "path": "E:\\Mina_MK1\\config\\personality.txt",
+      "root_kind": "workspace",
+      "rel_path": "config/personality.txt",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "__init__.py",
+      "name_lower": "__init__.py",
+      "path": "E:\\Mina_MK1\\config\\__init__.py",
+      "root_kind": "workspace",
+      "rel_path": "config/__init__.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "Front End.txt",
+      "name_lower": "front end.txt",
+      "path": "E:\\Mina_MK1\\Core - requirments\\Front End.txt",
+      "root_kind": "workspace",
+      "rel_path": "Core - requirments/Front End.txt",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "build_plugin.ps1",
+      "name_lower": "build_plugin.ps1",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\build_plugin.ps1",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/build_plugin.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "BUILD_STATUS.md",
+      "name_lower": "build_status.md",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\BUILD_STATUS.md",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/BUILD_STATUS.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "install_companion.ps1",
+      "name_lower": "install_companion.ps1",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\install_companion.ps1",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/install_companion.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "install_record.json",
+      "name_lower": "install_record.json",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\install_record.json",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/install_record.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "ITEM_DATA_REFERENCE.md",
+      "name_lower": "item_data_reference.md",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\ITEM_DATA_REFERENCE.md",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/ITEM_DATA_REFERENCE.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "LIVE_PLUGIN_DATA_POINTS.md",
+      "name_lower": "live_plugin_data_points.md",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\LIVE_PLUGIN_DATA_POINTS.md",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/LIVE_PLUGIN_DATA_POINTS.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "MOD_REFERENCES.md",
+      "name_lower": "mod_references.md",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\MOD_REFERENCES.md",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/MOD_REFERENCES.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "README.md",
+      "name_lower": "readme.md",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\README.md",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/README.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\reference_packages\\CharacterSidebar-0.1.2\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/reference_packages/CharacterSidebar-0.1.2/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "README.md",
+      "name_lower": "readme.md",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\reference_packages\\CharacterSidebar-0.1.2\\README.md",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/reference_packages/CharacterSidebar-0.1.2/README.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\reference_packages\\FFU_Console-0.6.1\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/reference_packages/FFU_Console-0.6.1/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "README.md",
+      "name_lower": "readme.md",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\reference_packages\\FFU_Console-0.6.1\\README.md",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/reference_packages/FFU_Console-0.6.1/README.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\reference_packages\\LaunchControl-1.0.5\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/reference_packages/LaunchControl-1.0.5/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "README.md",
+      "name_lower": "readme.md",
+      "path": "E:\\Mina_MK1\\integrations\\ostranauts\\reference_packages\\LaunchControl-1.0.5\\README.md",
+      "root_kind": "workspace",
+      "rel_path": "integrations/ostranauts/reference_packages/LaunchControl-1.0.5/README.md",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mk1_memory.py",
+      "name_lower": "mk1_memory.py",
+      "path": "E:\\Mina_MK1\\memory\\mk1_memory.py",
+      "root_kind": "workspace",
+      "rel_path": "memory/mk1_memory.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "retention.py",
+      "name_lower": "retention.py",
+      "path": "E:\\Mina_MK1\\memory\\retention.py",
+      "root_kind": "workspace",
+      "rel_path": "memory/retention.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "__init__.py",
+      "name_lower": "__init__.py",
+      "path": "E:\\Mina_MK1\\memory\\__init__.py",
+      "root_kind": "workspace",
+      "rel_path": "memory/__init__.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260709_235731\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260709_235731/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260710_134950\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260710_134950/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260711_180324\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260711_180324/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260712_203113\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260712_203113/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260713_234543\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260713_234543/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260714_235332\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260714_235332/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260716_235138\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260716_235138/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260717_052512\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260717_052512/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260718_174932\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260718_174932/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260719_222825\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260719_222825/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260720_021328\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260720_021328/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260723_233325\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260723_233325/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260724_142444\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260724_142444/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260725_175225\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260725_175225/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260726_203715\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260726_203715/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260727_225240\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260727_225240/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260728_210652\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260728_210652/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260728_223816\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260728_223816/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260728_233515\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260728_233515/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260729_005930\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260729_005930/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260729_010549\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260729_010549/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260729_020952\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260729_020952/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260729_030358\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260729_030358/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260729_043801\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260729_043801/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260729_053925\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260729_053925/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260729_165806\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260729_165806/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260729_170541\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260729_170541/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260730_035131\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260730_035131/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260730_042612\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260730_042612/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260730_055150\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260730_055150/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260730_063620\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260730_063620/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260730_071650\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260730_071650/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260730_161030\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260730_161030/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260730_172359\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260730_172359/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260731_013526\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260731_013526/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260731_024501\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260731_024501/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260731_033015\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260731_033015/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260731_044221\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260731_044221/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "manifest.json",
+      "name_lower": "manifest.json",
+      "path": "E:\\Mina_MK1\\memory\\backups\\backup_20260731_044238\\manifest.json",
+      "root_kind": "workspace",
+      "rel_path": "memory/backups/backup_20260731_044238/manifest.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "bge_base_vocab.json",
+      "name_lower": "bge_base_vocab.json",
+      "path": "E:\\Mina_MK1\\Memory_server\\bge_base_vocab.json",
+      "root_kind": "workspace",
+      "rel_path": "Memory_server/bge_base_vocab.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "bge_small_vocab.json",
+      "name_lower": "bge_small_vocab.json",
+      "path": "E:\\Mina_MK1\\Memory_server\\bge_small_vocab.json",
+      "root_kind": "workspace",
+      "rel_path": "Memory_server/bge_small_vocab.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "embed_server.py",
+      "name_lower": "embed_server.py",
+      "path": "E:\\Mina_MK1\\Memory_server\\embed_server.py",
+      "root_kind": "workspace",
+      "rel_path": "Memory_server/embed_server.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "export_bge_hybrid.py",
+      "name_lower": "export_bge_hybrid.py",
+      "path": "E:\\Mina_MK1\\Memory_server\\export_bge_hybrid.py",
+      "root_kind": "workspace",
+      "rel_path": "Memory_server/export_bge_hybrid.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "export_bge_models.py",
+      "name_lower": "export_bge_models.py",
+      "path": "E:\\Mina_MK1\\Memory_server\\export_bge_models.py",
+      "root_kind": "workspace",
+      "rel_path": "Memory_server/export_bge_models.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "gguf_embed_server.py",
+      "name_lower": "gguf_embed_server.py",
+      "path": "E:\\Mina_MK1\\Memory_server\\gguf_embed_server.py",
+      "root_kind": "workspace",
+      "rel_path": "Memory_server/gguf_embed_server.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mk1_embed_server.py",
+      "name_lower": "mk1_embed_server.py",
+      "path": "E:\\Mina_MK1\\Memory_server\\mk1_embed_server.py",
+      "root_kind": "workspace",
+      "rel_path": "Memory_server/mk1_embed_server.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "Scratch.json",
+      "name_lower": "scratch.json",
+      "path": "E:\\Mina_MK1\\Mina\\Scratch.json",
+      "root_kind": "workspace",
+      "rel_path": "Mina/Scratch.json",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "code_backup.py",
+      "name_lower": "code_backup.py",
+      "path": "E:\\Mina_MK1\\restore\\code_backup.py",
+      "root_kind": "workspace",
+      "rel_path": "restore/code_backup.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "restore.py",
+      "name_lower": "restore.py",
+      "path": "E:\\Mina_MK1\\restore\\restore.py",
+      "root_kind": "workspace",
+      "rel_path": "restore/restore.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "environment_snapshot_2026-07-27_13-24-17.txt",
+      "name_lower": "environment_snapshot_2026-07-27_13-24-17.txt",
+      "path": "E:\\Mina_MK1\\snapshots\\environment_snapshot_2026-07-27_13-24-17.txt",
+      "root_kind": "workspace",
+      "rel_path": "snapshots/environment_snapshot_2026-07-27_13-24-17.txt",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "launcher_companion_snapshot.txt",
+      "name_lower": "launcher_companion_snapshot.txt",
+      "path": "E:\\Mina_MK1\\snapshots\\launcher_companion_snapshot.txt",
+      "root_kind": "workspace",
+      "rel_path": "snapshots/launcher_companion_snapshot.txt",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "test_api_memory_flow.py",
+      "name_lower": "test_api_memory_flow.py",
+      "path": "E:\\Mina_MK1\\tests\\test_api_memory_flow.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_api_memory_flow.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_autonomous_work.py",
+      "name_lower": "test_autonomous_work.py",
+      "path": "E:\\Mina_MK1\\tests\\test_autonomous_work.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_autonomous_work.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_backup_retention.py",
+      "name_lower": "test_backup_retention.py",
+      "path": "E:\\Mina_MK1\\tests\\test_backup_retention.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_backup_retention.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_code_backup.py",
+      "name_lower": "test_code_backup.py",
+      "path": "E:\\Mina_MK1\\tests\\test_code_backup.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_code_backup.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_curiosity_policy.py",
+      "name_lower": "test_curiosity_policy.py",
+      "path": "E:\\Mina_MK1\\tests\\test_curiosity_policy.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_curiosity_policy.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_file_access_policy.py",
+      "name_lower": "test_file_access_policy.py",
+      "path": "E:\\Mina_MK1\\tests\\test_file_access_policy.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_file_access_policy.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_intent_ambiguity.py",
+      "name_lower": "test_intent_ambiguity.py",
+      "path": "E:\\Mina_MK1\\tests\\test_intent_ambiguity.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_intent_ambiguity.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_memory_promotion_filters.py",
+      "name_lower": "test_memory_promotion_filters.py",
+      "path": "E:\\Mina_MK1\\tests\\test_memory_promotion_filters.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_memory_promotion_filters.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_memory_read_tool.py",
+      "name_lower": "test_memory_read_tool.py",
+      "path": "E:\\Mina_MK1\\tests\\test_memory_read_tool.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_memory_read_tool.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_memory_recall.py",
+      "name_lower": "test_memory_recall.py",
+      "path": "E:\\Mina_MK1\\tests\\test_memory_recall.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_memory_recall.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_memory_retention.py",
+      "name_lower": "test_memory_retention.py",
+      "path": "E:\\Mina_MK1\\tests\\test_memory_retention.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_memory_retention.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_memory_safe_shutdown.py",
+      "name_lower": "test_memory_safe_shutdown.py",
+      "path": "E:\\Mina_MK1\\tests\\test_memory_safe_shutdown.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_memory_safe_shutdown.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_memory_write_tool.py",
+      "name_lower": "test_memory_write_tool.py",
+      "path": "E:\\Mina_MK1\\tests\\test_memory_write_tool.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_memory_write_tool.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_mina_watchdog.py",
+      "name_lower": "test_mina_watchdog.py",
+      "path": "E:\\Mina_MK1\\tests\\test_mina_watchdog.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_mina_watchdog.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_ostranauts.py",
+      "name_lower": "test_ostranauts.py",
+      "path": "E:\\Mina_MK1\\tests\\test_ostranauts.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_ostranauts.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_ostranauts_actions_api.py",
+      "name_lower": "test_ostranauts_actions_api.py",
+      "path": "E:\\Mina_MK1\\tests\\test_ostranauts_actions_api.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_ostranauts_actions_api.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_ps_run.py",
+      "name_lower": "test_ps_run.py",
+      "path": "E:\\Mina_MK1\\tests\\test_ps_run.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_ps_run.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_runtime_state.py",
+      "name_lower": "test_runtime_state.py",
+      "path": "E:\\Mina_MK1\\tests\\test_runtime_state.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_runtime_state.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_spotify_bulk_playlist.py",
+      "name_lower": "test_spotify_bulk_playlist.py",
+      "path": "E:\\Mina_MK1\\tests\\test_spotify_bulk_playlist.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_spotify_bulk_playlist.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_status_cache.py",
+      "name_lower": "test_status_cache.py",
+      "path": "E:\\Mina_MK1\\tests\\test_status_cache.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_status_cache.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_transcript_regression_prompts.py",
+      "name_lower": "test_transcript_regression_prompts.py",
+      "path": "E:\\Mina_MK1\\tests\\test_transcript_regression_prompts.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_transcript_regression_prompts.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "test_workspace_root_resolution.py",
+      "name_lower": "test_workspace_root_resolution.py",
+      "path": "E:\\Mina_MK1\\tests\\test_workspace_root_resolution.py",
+      "root_kind": "workspace",
+      "rel_path": "tests/test_workspace_root_resolution.py",
+      "description": "Automated test module."
+    },
+    {
+      "name": "code_execute.py",
+      "name_lower": "code_execute.py",
+      "path": "E:\\Mina_MK1\\tools\\code_execute.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/code_execute.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "dir_create.py",
+      "name_lower": "dir_create.py",
+      "path": "E:\\Mina_MK1\\tools\\dir_create.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/dir_create.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "dir_list.py",
+      "name_lower": "dir_list.py",
+      "path": "E:\\Mina_MK1\\tools\\dir_list.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/dir_list.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "file_access_policy.py",
+      "name_lower": "file_access_policy.py",
+      "path": "E:\\Mina_MK1\\tools\\file_access_policy.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/file_access_policy.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "file_append.py",
+      "name_lower": "file_append.py",
+      "path": "E:\\Mina_MK1\\tools\\file_append.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/file_append.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "file_delete.py",
+      "name_lower": "file_delete.py",
+      "path": "E:\\Mina_MK1\\tools\\file_delete.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/file_delete.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "file_inspector.py",
+      "name_lower": "file_inspector.py",
+      "path": "E:\\Mina_MK1\\tools\\file_inspector.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/file_inspector.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "file_move.py",
+      "name_lower": "file_move.py",
+      "path": "E:\\Mina_MK1\\tools\\file_move.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/file_move.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "file_read.py",
+      "name_lower": "file_read.py",
+      "path": "E:\\Mina_MK1\\tools\\file_read.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/file_read.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "file_write.py",
+      "name_lower": "file_write.py",
+      "path": "E:\\Mina_MK1\\tools\\file_write.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/file_write.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "github_repo.py",
+      "name_lower": "github_repo.py",
+      "path": "E:\\Mina_MK1\\tools\\github_repo.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/github_repo.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "gremlin_chaos.py",
+      "name_lower": "gremlin_chaos.py",
+      "path": "E:\\Mina_MK1\\tools\\gremlin_chaos.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/gremlin_chaos.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "memory_read.py",
+      "name_lower": "memory_read.py",
+      "path": "E:\\Mina_MK1\\tools\\memory_read.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/memory_read.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "memory_write.py",
+      "name_lower": "memory_write.py",
+      "path": "E:\\Mina_MK1\\tools\\memory_write.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/memory_write.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mina_echo.py",
+      "name_lower": "mina_echo.py",
+      "path": "E:\\Mina_MK1\\tools\\mina_echo.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/mina_echo.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "monitor_ostranauts_display2.ps1",
+      "name_lower": "monitor_ostranauts_display2.ps1",
+      "path": "E:\\Mina_MK1\\tools\\monitor_ostranauts_display2.ps1",
+      "root_kind": "workspace",
+      "rel_path": "tools/monitor_ostranauts_display2.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "powershell.py",
+      "name_lower": "powershell.py",
+      "path": "E:\\Mina_MK1\\tools\\powershell.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/powershell.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "ps_run.py",
+      "name_lower": "ps_run.py",
+      "path": "E:\\Mina_MK1\\tools\\ps_run.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/ps_run.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "publish_android_repo.ps1",
+      "name_lower": "publish_android_repo.ps1",
+      "path": "E:\\Mina_MK1\\tools\\publish_android_repo.ps1",
+      "root_kind": "workspace",
+      "rel_path": "tools/publish_android_repo.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "refresh_core_reference.ps1",
+      "name_lower": "refresh_core_reference.ps1",
+      "path": "E:\\Mina_MK1\\tools\\refresh_core_reference.ps1",
+      "root_kind": "workspace",
+      "rel_path": "tools/refresh_core_reference.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "safe_copy.py",
+      "name_lower": "safe_copy.py",
+      "path": "E:\\Mina_MK1\\tools\\safe_copy.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/safe_copy.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "spotify_get_refresh_token.ps1",
+      "name_lower": "spotify_get_refresh_token.ps1",
+      "path": "E:\\Mina_MK1\\tools\\spotify_get_refresh_token.ps1",
+      "root_kind": "workspace",
+      "rel_path": "tools/spotify_get_refresh_token.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "spotify_link.py",
+      "name_lower": "spotify_link.py",
+      "path": "E:\\Mina_MK1\\tools\\spotify_link.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/spotify_link.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "spotify_relink_auto.ps1",
+      "name_lower": "spotify_relink_auto.ps1",
+      "path": "E:\\Mina_MK1\\tools\\spotify_relink_auto.ps1",
+      "root_kind": "workspace",
+      "rel_path": "tools/spotify_relink_auto.ps1",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "tool_loader.py",
+      "name_lower": "tool_loader.py",
+      "path": "E:\\Mina_MK1\\tools\\tool_loader.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/tool_loader.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "web_fetch.py",
+      "name_lower": "web_fetch.py",
+      "path": "E:\\Mina_MK1\\tools\\web_fetch.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/web_fetch.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "web_search.py",
+      "name_lower": "web_search.py",
+      "path": "E:\\Mina_MK1\\tools\\web_search.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/web_search.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "__init__.py",
+      "name_lower": "__init__.py",
+      "path": "E:\\Mina_MK1\\tools\\__init__.py",
+      "root_kind": "workspace",
+      "rel_path": "tools/__init__.py",
+      "description": "Workspace file under Mina personal root."
+    },
+    {
+      "name": "mina_watchdog.py",
+      "name_lower": "mina_watchdog.py",
+      "path": "E:\\Mina_MK1\\watchdog\\mina_watchdog.py",
+      "root_kind": "workspace",
+      "rel_path": "watchdog/mina_watchdog.py",
+      "description": "Workspace file under Mina personal root."
+    }
+  ]
+}

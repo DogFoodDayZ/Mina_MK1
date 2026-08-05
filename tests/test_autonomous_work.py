@@ -54,9 +54,41 @@ def test_completed_audit_task_is_not_queued_again(tmp_path):
     first = core._autonomous_work_candidates()[0]
     audit_path = Path(core._autonomy_audit_path())
     audit_path.parent.mkdir(parents=True)
-    audit_path.write_text(json.dumps({"task_key": first["key"], "ok": True}) + "\n", encoding="utf-8")
+    audit_path.write_text(
+        json.dumps(
+            {
+                "task_key": first["key"],
+                "ok": True,
+                "verification": {"completion_verified": True},
+            }
+        ) + "\n",
+        encoding="utf-8",
+    )
 
     assert core._autonomous_work_candidates() == []
+
+
+def test_unverified_audit_task_remains_queued(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    todo_path = project_root / "TODO.md"
+    todo_path.write_text("- [ ] Review logs\n", encoding="utf-8")
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({
+        ("curiosity", "project_roots"): [str(project_root)],
+        ("curiosity", "todo_paths"): [str(todo_path)],
+    })
+    core._load_project_tracker = lambda: {"projects": {}}
+    first = core._autonomous_work_candidates()[0]
+    audit_path = Path(core._autonomy_audit_path())
+    audit_path.parent.mkdir(parents=True)
+    audit_path.write_text(json.dumps({"task_key": first["key"], "ok": True}) + "\n", encoding="utf-8")
+
+    queued = core._autonomous_work_candidates()
+    assert len(queued) == 1
+    assert queued[0]["key"] == first["key"]
 
 
 def test_autonomous_model_result_accepts_fenced_json():
@@ -238,3 +270,5 @@ def test_autonomous_executor_writes_structured_audit(tmp_path):
     audit_rows = [json.loads(line) for line in Path(core._autonomy_audit_path()).read_text(encoding="utf-8").splitlines()]
     assert audit_rows[0]["task_key"] == "todo:improve-worker"
     assert audit_rows[0]["evidence"] == ["sample.py contains the relevant implementation"]
+    assert audit_rows[0]["verification"]["completion_verified"] is False
+    assert audit_rows[0]["verification"]["patch_applied"] is False

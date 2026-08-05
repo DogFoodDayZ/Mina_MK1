@@ -89,6 +89,7 @@ At minimum, these prompt classes must pass before considering a self-fix complet
 - use the correct tool to close edge leave spotify running
 - please run the command
 - yes
+- yes run the script countdown.py (must return real tool-backed output, never roleplay terminal transcripts)
 
 ## Rollback Trigger
 

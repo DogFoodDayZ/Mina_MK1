@@ -583,7 +583,8 @@ def test_detect_system_question_routes_to_ps_run():
     tool_name, args = MK1Core.detect_tool_intent(core, "what cpu are you on?")
 
     assert tool_name == "ps_run"
-    assert args["script"] == "what cpu are you on?"
+    assert "Win32_Processor" in args["script"]
+    assert "NumberOfCores" in args["script"]
 
 
 def test_hardware_question_is_command_like_for_reflex_execution():
@@ -598,7 +599,7 @@ def test_detect_time_question_routes_to_ps_run():
     tool_name, args = MK1Core.detect_tool_intent(core, "what time is it?")
 
     assert tool_name == "ps_run"
-    assert args["script"] == "what time is it?"
+    assert args["script"] == 'Get-Date -Format "yyyy-MM-dd HH:mm:ss"'
 
 
 def test_detect_gpu_model_vram_question_routes_to_web_search_when_available():
@@ -879,7 +880,7 @@ def test_ps_run_response_returns_verified_output_directly():
         tool_ok=True,
     )
 
-    assert "Here’s the verified PowerShell output:" in out
+    assert "Here's the verified PowerShell output:" in out
     assert "2026-07-29T09:46:33.1234567Z" in out
     assert called["count"] == 0
 
@@ -1230,6 +1231,22 @@ def test_remember_tool_output_persists_hardware_snapshot():
     assert any("suggestion_context" in w["tags"] for w in core.memory.writes)
 
 
+def test_remember_tool_output_stores_hardware_snapshot_as_fact():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+
+    MK1Core._remember_tool_output(
+        core,
+        tool_name="ps_run",
+        user_input="what cpu and gpu do i have",
+        tool_args={"script": "Get-ComputerInfo"},
+        result={"ok": True, "result": {"stdout": "CPU: Ryzen\nGPU: RTX 4080", "stderr": "", "exit_code": 0}},
+        formatted="CPU: Ryzen\nGPU: RTX 4080",
+    )
+
+    assert any(w.get("kind") == "fact" for w in core.memory.writes)
+
+
 def test_remember_tool_output_persists_project_test_summary():
     core = MK1Core.__new__(MK1Core)
     core.memory = FakeMemory()
@@ -1403,3 +1420,54 @@ def test_enforce_tool_outcome_truth_keeps_text_when_no_failures():
     )
 
     assert final == "Everything completed."
+
+
+def test_clean_response_text_strips_internal_db_tone_instruction_line():
+    core = MK1Core.__new__(MK1Core)
+
+    cleaned = MK1Core._clean_response_text(
+        core,
+        "- Use the DB-backed Mina tone.\nMina here, verified output follows.",
+    )
+
+    assert "db-backed mina tone" not in cleaned.lower()
+    assert "verified output follows" in cleaned
+
+
+def test_verified_execution_fallback_forces_real_tool_reply_when_output_is_unverified_claim():
+    core = MK1Core.__new__(MK1Core)
+    core.detect_tool_intent = lambda _text: ("ps_run", {"script": "python countdown.py"})
+    core._plan_tool_action = lambda _text: None
+    core._reflex_tools_and_memory = lambda **_kwargs: {
+        "choices": [{"message": {"content": "Here's the verified PowerShell output:\n10\n9\n...\n0\nBlast off!"}}]
+    }
+    core._extract_text = lambda reply: reply["choices"][0]["message"]["content"]
+
+    out = MK1Core._maybe_enforce_verified_execution_reply(
+        core,
+        messages=[],
+        user_input="yes run the script countdown.py",
+        assistant_text="```powershell\nPS E:\\workspace> python E:\\workspace\\countdown.py\n10\n9\nBlast off!\n```",
+        request_context=None,
+    )
+
+    assert out is not None
+    assert "verified powershell output" in out.lower()
+    assert "blast off" in out.lower()
+
+
+def test_verified_execution_fallback_refuses_to_claim_output_when_no_runnable_tool_found():
+    core = MK1Core.__new__(MK1Core)
+    core.detect_tool_intent = lambda _text: ("__clarify_intent__", {"question": "which file?"})
+    core._plan_tool_action = lambda _text: None
+
+    out = MK1Core._maybe_enforce_verified_execution_reply(
+        core,
+        messages=[],
+        user_input="run that script",
+        assistant_text="```powershell\nPS E:\\workspace> python E:\\workspace\\countdown.py\n10\n9\nBlast off!\n```",
+        request_context=None,
+    )
+
+    assert out is not None
+    assert "cannot claim output" in out.lower()

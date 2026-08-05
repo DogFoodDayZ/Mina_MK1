@@ -14165,26 +14165,38 @@ IMPORTANT RULES:
         ]
         return [name for name in preferred if name in self._tool_registry()]
 
+    def _strip_think_tags(self, text: str) -> str:
+        """Remove qwen3.5 <think>...</think> reasoning blocks from response text."""
+        if not text or "<think>" not in text:
+            return text
+        # Strip all think blocks; keep everything after the last closing tag
+        cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+        return cleaned.strip()
+
     def _extract_json_dict(self, text: str) -> Optional[Dict[str, Any]]:
-        raw = (text or "").strip()
+        raw = self._strip_think_tags((text or "").strip())
         if not raw:
             return None
 
+        # Try fenced JSON first
         fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw, re.IGNORECASE)
         if fenced:
-            raw = fenced.group(1).strip()
+            try:
+                parsed = json.loads(fenced.group(1).strip())
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                pass
 
-        if not (raw.startswith("{") and raw.endswith("}")):
-            m = re.search(r"(\{[\s\S]*\})", raw)
-            if not m:
-                return None
-            raw = m.group(1).strip()
+        # Try first {...} block in the text (handles raw JSON or JSON after preamble)
+        m = re.search(r"(\{[\s\S]*\})", raw)
+        if m:
+            try:
+                parsed = json.loads(m.group(1).strip())
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                pass
 
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else None
-        except Exception:
-            return None
+        return None
 
     def _sanitize_planned_tool_args(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         clean = dict(args or {})
@@ -14264,7 +14276,7 @@ IMPORTANT RULES:
         ]
 
         try:
-            plan_reply = self.model.chat(messages=messages, tools=None, temperature=0.0)
+            plan_reply = self.model.chat(messages=messages, tools=None, temperature=0.1)
             plan_text = self._extract_text(plan_reply)
             plan = self._extract_json_dict(plan_text)
             if not plan:
@@ -14521,11 +14533,11 @@ IMPORTANT RULES:
                         parsed.pop("reasoning_content", None)
                         inner = parsed.get("content")
                         if isinstance(inner, str):
-                            return inner
+                            return self._strip_think_tags(inner)
                 except Exception:
                     pass
 
-            return text
+            return self._strip_think_tags(text)
 
         return ""
 

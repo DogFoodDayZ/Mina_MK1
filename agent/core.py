@@ -11500,11 +11500,13 @@ class MK1Core:
 
         if tool_name in self._write_auth_tool_names():
             already_authorized = bool(tool_args.get("authorized_write", False))
-            if not already_authorized and (
-                self._is_trusted_client(request_context)
-                or self._is_client_recently_verified(request_context)
-            ):
-                tool_args["authorized_write"] = True
+            if not already_authorized:
+                # Auto-authorize if: no request_context (local call), or client is trusted, or recently verified
+                is_local_call = request_context is None
+                is_trusted = self._is_trusted_client(request_context)
+                is_verified = self._is_client_recently_verified(request_context)
+                if is_local_call or is_trusted or is_verified:
+                    tool_args["authorized_write"] = True
 
         if tool_name == "__tool_list__":
             inventory = self._usable_tool_inventory()

@@ -634,6 +634,367 @@ Core change acceptance gate:
   - Added regression coverage in `tests/test_workspace_root_resolution.py` so legacy-root drift is caught in future testing.
 - [x] Bring the core-edit workflow back into TODO-contract compliance after the July 31 routing fixes:
   - Ran `tools/refresh_core_reference.ps1` after `agent/core.py` edits.
+
+---
+
+## Qwen3.5-9b Compatibility Fix Queue
+*Added 2026-08-05. Fix in order, top to bottom. Goal: get Mina back to being conversational, useful, and able to actually do things.*
+
+---
+
+### Issue 1: JSON Parsing Fails Silently When Model Returns Raw JSON
+
+- Date: 2026-08-05
+- Priority: High
+- Status: Open
+
+#### 1) What I asked Mina to do
+- Tool planner asked to pick a tool and return JSON
+
+#### 2) What Mina actually did
+- If qwen returns JSON without markdown code fences, regex fails silently
+- Planner returns None → falls back to clarification question
+- User gets "what exact target should I act on?" instead of action
+
+#### 3) What should have happened
+- Planner parses JSON regardless of whether it's wrapped in fences or not
+
+#### 4) Evidence
+- core.py `_extract_json_dict()`: regex only matches ` ```json{...}``` ` format
+- If qwen omits fences, result is None → confidence=0.0 → clarification fallback
+
+#### 5) Failure class
+- Tool selected wrong (parser fails, so no tool is selected)
+
+#### 6) Root cause
+- `_extract_json_dict` uses fenced regex first, then tries raw parse only on failure—but silent failures return None instead of trying harder
+
+#### 7) Minimal fix
+- Try raw JSON parse in addition to fenced regex; also try stripping leading text before `{`
+
+#### 8) Regression prompts
+- Prompt 1: "write a test script and save it"
+- Prompt 2: "search the web for the weather in Toronto"
+- Prompt 3: "read back the file you just created"
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why: JSON extraction is a deterministic parsing contract, not a user preference
+
+#### 10) Done criteria
+- [ ] Planner succeeds when model returns raw JSON (no fences)
+- [ ] Planner succeeds when model returns fenced JSON
+- [ ] All 3 regression prompts route to correct tool
+
+---
+
+### Issue 2: Multiple System Messages Merged Blindly — Confuses Reasoning
+
+- Date: 2026-08-05
+- Priority: High
+- Status: Open
+
+#### 1) What I asked Mina to do
+- Normal conversational requests
+
+#### 2) What Mina actually did
+- System messages from init, identity gates, role reminders, and tool constraints get concatenated together via `_coalesce_system_messages()`
+- Creates one huge merged blob that qwen's reasoning has to navigate
+
+#### 3) What should have happened
+- Single, clean, non-contradictory system instruction
+
+#### 4) Evidence
+- core.py lines 462-463: coalesce fires any time >1 system message exists
+- Many paths add separate system messages (line 9095-9161)
+
+#### 5) Failure class
+- Intent routing wrong (model confused by conflicting system context)
+
+#### 6) Root cause
+- System instructions built from multiple sources at request time, merged without priority ordering
+
+#### 7) Minimal fix
+- Audit all system message sources; collapse to one canonical system message built at request start, not appended piecemeal
+
+#### 8) Regression prompts
+- Prompt 1: "hey what's your name"
+- Prompt 2: "write me a script that lists all files in a folder"
+- Prompt 3: "what do you remember about me"
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why: system message structure is a protocol contract, not a user pattern
+
+#### 10) Done criteria
+- [ ] Only one system message reaches the model per request
+- [ ] Mina persona and tool rules both present in single message
+- [ ] All 3 regression prompts still pass
+
+---
+
+### Issue 3: Planner Temperature 0.0 Suppresses Qwen Reasoning
+
+- Date: 2026-08-05
+- Priority: Medium
+- Status: Open
+
+#### 1) What I asked Mina to do
+- Any action-like request that routes through `_plan_tool_action()`
+
+#### 2) What Mina actually did
+- Planner runs at temperature=0.0, forcing deterministic output
+- For ambiguous inputs, model picks least-effort token sequence, often wrong tool or low confidence
+
+#### 3) What should have happened
+- Planner should use small amount of temperature so qwen can reason through ambiguity
+
+#### 4) Evidence
+- core.py line 14267: `temperature=0.0`
+- Other planning calls use 0.1-0.2 (lines 5084, 6137, 8707)
+
+#### 5) Failure class
+- Tool selected wrong
+
+#### 6) Root cause
+- Temperature copied from precision-critical tasks to planning task where slight variation helps
+
+#### 7) Minimal fix
+- Change line 14267 to `temperature=0.1`
+
+#### 8) Regression prompts
+- Prompt 1: "save that file"
+- Prompt 2: "look up the latest news"
+- Prompt 3: "run that script"
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why: temperature is a model call parameter, not a user preference
+
+#### 10) Done criteria
+- [ ] Line 14267 uses temperature=0.1
+- [ ] All 3 regression prompts route to correct tool on first attempt
+
+---
+
+### Issue 4: Memory Recall Fails Completely When Embedding Service Is Down
+
+- Date: 2026-08-05
+- Priority: High
+- Status: Open
+
+#### 1) What I asked Mina to do
+- "What do you remember about me" or any memory recall while port 8084 is down
+
+#### 2) What Mina actually did
+- FAISS search returns empty
+- No fallback to keyword/lexical search
+- Mina says she doesn't remember anything
+
+#### 3) What should have happened
+- Fall back to keyword-ranked SQLite search when embedding unavailable
+
+#### 4) Evidence
+- memory/mk1_memory.py lines 2073-2105: FAISS search with no lexical fallback
+- Port 8084 was down for the entire autonomous week; memory recall broken that whole time
+
+#### 5) Failure class
+- Tool selected wrong (recall returns empty, Mina reports no memory)
+
+#### 6) Root cause
+- FAISS search is the only search path; no BM25 or SQL keyword fallback implemented
+
+#### 7) Minimal fix
+- After FAISS returns empty or service is down, run a SQL LIKE/FTS query against memory.db using query keywords as fallback
+
+#### 8) Regression prompts
+- Prompt 1: "what do you remember about me" (embedding server down)
+- Prompt 2: "do you remember my name" (embedding server down)
+- Prompt 3: "what have we talked about" (embedding server down)
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why: embedding service availability is a system invariant; fallback is a reliability contract
+
+#### 10) Done criteria
+- [ ] Memory recall returns results when port 8084 is unavailable
+- [ ] Results are relevance-ranked by keyword overlap
+- [ ] All 3 regression prompts return non-empty results
+
+---
+
+### Issue 5: Missing Qwen-Specific Config — Token Limits, Reasoning Mode
+
+- Date: 2026-08-05
+- Priority: Medium
+- Status: Open
+
+#### 1) What I asked Mina to do
+- Any request requiring model inference
+
+#### 2) What Mina actually did
+- Uses generic config that was not tuned for qwen3.5-9b
+- `reasoning_effort: "none"` hardcoded (qwen3.5-9b supports thinking/reasoning mode)
+- No `max_tokens` cap → context window overflow silently truncates output
+
+#### 3) What should have happened
+- Config values appropriate for qwen3.5-9b's capabilities and limits
+
+#### 4) Evidence
+- config/mk1_config.json: `vision_reasoning_effort: "none"`, no `max_tokens` field
+- core.py line 471: `max_tokens` only set for vision calls
+
+#### 5) Failure class
+- Tool selected wrong / Args extraction wrong (context overflow corrupts output)
+
+#### 6) Root cause
+- Config written generically; no model-specific tuning block
+
+#### 7) Minimal fix
+- Add `max_tokens: 4096` default; add optional `reasoning_effort` key for non-vision calls; document qwen context window limit
+
+#### 8) Regression prompts
+- Prompt 1: "write a long detailed python script that does X" (needs max_tokens)
+- Prompt 2: "think through how to best approach this problem" (needs reasoning_effort)
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded (config values) + memory-driven for per-model overrides if added later
+
+#### 10) Done criteria
+- [ ] `max_tokens` capped appropriately for qwen3.5-9b
+- [ ] Long output requests don't silently truncate
+- [ ] Reasoning mode can be enabled via config
+
+---
+
+### Issue 6: No Context Window Budgeting — Silent Overflow Corrupts Responses
+
+- Date: 2026-08-05
+- Priority: Medium
+- Status: Open
+
+#### 1) What I asked Mina to do
+- Any request where system prompt + memory context + history is large
+
+#### 2) What Mina actually did
+- Sends full message payload without counting tokens
+- If over context limit, model silently truncates or garbles response
+
+#### 3) What should have happened
+- Messages trimmed or summarized to fit within model's context window
+
+#### 4) Evidence
+- No token counting anywhere in core.py message construction paths
+- System prompt alone is large; adding memory recall + conversation makes overflow likely
+
+#### 5) Failure class
+- Args extraction wrong (oversized payload corrupts model input)
+
+#### 6) Root cause
+- No budgeting mechanism; context window size not tracked per model
+
+#### 7) Minimal fix
+- Add character-count heuristic (4 chars ≈ 1 token); trim oldest messages when over budget before sending
+
+#### 8) Regression prompts
+- Prompt 1: long multi-turn conversation where Mina still answers correctly at turn 15+
+- Prompt 2: "summarize what we've talked about" after 10+ turns
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded for the budget limit; memory-driven for what to keep vs drop
+
+#### 10) Done criteria
+- [ ] Message payload never exceeds configured token budget
+- [ ] Oldest messages dropped first when over budget
+- [ ] Mina still functions correctly in long conversations
+
+---
+
+### Issue 7: Planner Missing Full Conversation Context
+
+- Date: 2026-08-05
+- Priority: Medium
+- Status: Open
+
+#### 1) What I asked Mina to do
+- "Read back the file you created" (or any reference to prior turn)
+
+#### 2) What Mina actually did
+- Planner receives only current message + optional memory snippet
+- Cannot resolve references like "that", "it", "the one you just made"
+
+#### 3) What should have happened
+- Planner has access to last 2-3 turns of conversation to resolve references
+
+#### 4) Evidence
+- core.py `_plan_tool_action()`: messages list contains only system + current user message
+- Memory context enrichment (181113a) partially helps but only for file ops
+
+#### 5) Failure class
+- Args extraction wrong (cannot resolve pronoun/reference without context)
+
+#### 6) Root cause
+- MK1Core does not thread conversation history into the planner call
+
+#### 7) Minimal fix
+- Pass last 2 turns (user+assistant) into `_plan_tool_action()` messages list before the current user message
+
+#### 8) Regression prompts
+- Prompt 1: "write a script" → "now read it back"
+- Prompt 2: "search for X" → "open the first result"
+- Prompt 3: "create a file called test.py" → "run it"
+
+#### 9) Implementation choice
+- Chosen approach: memory-driven (last N turns from conversation store)
+- Why: what's "recent" depends on conversation flow, not a fixed system rule
+
+#### 10) Done criteria
+- [ ] Planner receives last 2 user+assistant turns
+- [ ] All 3 regression prompts succeed without clarification question
+- [ ] No regression on cold-start requests (no prior turns)
+
+---
+
+### Issue 8: Streaming Path Untested and Inconsistent with Qwen
+
+- Date: 2026-08-05
+- Priority: Low
+- Status: Open
+
+#### 1) What I asked Mina to do
+- Any streaming response (voice, GUI streaming)
+
+#### 2) What Mina actually did
+- Streaming uses different message flattening logic than non-streaming
+- No qwen-specific handling (only Gemma-4 exception exists)
+
+#### 3) What should have happened
+- Streaming behavior consistent with non-streaming for same prompts
+
+#### 4) Evidence
+- core.py lines 620-750: `chat_stream` has separate coalesce/flatten path
+- Comment at line 9268 only mentions Gemma-4
+
+#### 5) Failure class
+- Tool selected wrong / inconsistent behavior
+
+#### 6) Root cause
+- Streaming added separately from non-streaming, no parity tests
+
+#### 7) Minimal fix
+- Add qwen streaming smoke test; verify persona and tool calls work identically in streaming vs non-streaming
+
+#### 8) Regression prompts
+- Prompt 1: "write me a script" (streaming mode)
+- Prompt 2: "what time is it" (streaming mode)
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why: streaming parity is a protocol contract
+
+#### 10) Done criteria
+- [ ] Streaming and non-streaming return equivalent responses for same prompt
+- [ ] Qwen-specific streaming behavior verified
   - Updated stale core-reference metadata counts to match the refreshed function inventory (`function_count=359`).
   - Recorded transcript-grounded issue notes for draft-save overwrite and stale-continuation replay regressions.
 - [x] Restore live countdown script creation end to end:

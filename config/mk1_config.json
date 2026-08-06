@@ -58,13 +58,6 @@
       "E:\\",
       "G:\\"
     ],
-    "excluded_roots": [
-      "D:\\minabackups",
-      "D:\\MinaBackups",
-      "D:\\Black Valt",
-      "E:\\Mina_MK1\\.venv",
-      "E:\\Mina_MK1\\memory\\backups"
-    ],
     "idle_seconds": 1800,
     "local_interval_seconds": 3600,
     "news_interval_seconds": 21600,

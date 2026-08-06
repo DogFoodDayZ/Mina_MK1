@@ -14354,6 +14354,8 @@ IMPORTANT RULES:
 
         if tool_name in {"ps_run", "powershell"}:
             script = str(clean.get("script") or "").strip()
+            # Strip conversational run/execute prefixes before the path
+            script = re.sub(r"^(?:run|execute|call|start|launch)\s+", "", script, flags=re.IGNORECASE).strip()
             # If model put a bare path as the script, wrap it as an invocation
             if script and not script.startswith("&") and not script.lower().startswith("powershell") and script.endswith((".ps1", ".py", ".cmd", ".bat")):
                 script = f"& '{script}'"

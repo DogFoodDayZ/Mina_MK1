@@ -14465,7 +14465,8 @@ IMPORTANT RULES:
                 return None
 
             args_raw = plan.get("args", {})
-            if not isinstance(args_raw, dict):
+            # Pass string args to sanitizer — it knows how to coerce them per tool
+            if not isinstance(args_raw, (dict, str)):
                 args_raw = {}
 
             args = self._sanitize_planned_tool_args(tool_name, args_raw)

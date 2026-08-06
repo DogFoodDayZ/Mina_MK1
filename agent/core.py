@@ -9479,6 +9479,22 @@ class MK1Core:
                 messages,
                 reply,
             )
+
+            # If Mina's response executed inline tool calls (e.g. file_read to prep a fix),
+            # call the model once more so she can act on the results rather than just display them.
+            if "[file_read result]" in final_text or "[ps_run result]" in final_text or "[dir_list result]" in final_text:
+                followup_messages = list(messages) + [
+                    {"role": "assistant", "content": final_text},
+                    {"role": "user", "content": "Now use that result to complete the original request."},
+                ]
+                try:
+                    followup_reply = self.model.chat(messages=followup_messages, temperature=0.7)
+                    followup_text = self._handle_model_response(followup_messages, followup_reply)
+                    if followup_text and followup_text.strip():
+                        final_text = followup_text
+                except Exception:
+                    pass
+
             final_text = self._enforce_tool_outcome_truth(final_text, executed_tool_events)
 
             if not executed_tool_events:

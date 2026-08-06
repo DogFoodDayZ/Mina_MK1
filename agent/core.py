@@ -9286,11 +9286,10 @@ class MK1Core:
                     "content": (
                         f"You have access to these tools: {', '.join(tool_names)}. "
                         f"Use them proactively when the user asks for information you can fetch, files to read/write, "
-                        f"or tasks you can perform. For example, use 'web_fetch' to get content from URLs, "
-                        f"'file_read' for files, and 'powershell' or 'ps_run' for PowerShell commands and batches. "
-                        f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>. "
-                        f"Never claim a tool was run unless you actually emitted a tool call token in this response. "
-                        f"If the user asks to list tools, output the COMPLETE inventory from this list without omissions."
+                        f"or tasks you can perform. "
+                        f"To call a tool, output a JSON code block like this:\n"
+                        f"```json\n{{\"tool\": \"tool_name\", \"args\": {{\"key\": \"value\"}}}}\n```\n"
+                        f"The system will detect and execute it. Do NOT use <|tool_call> syntax."
                     ),
                 })
 
@@ -9646,11 +9645,10 @@ class MK1Core:
                     "content": (
                         f"You have access to these tools: {', '.join(tool_names)}. "
                         f"Use them proactively when the user asks for information you can fetch, files to read/write, "
-                        f"or tasks you can perform. For example, use 'web_fetch' to get content from URLs, "
-                        f"'file_read' for files, and 'powershell' or 'ps_run' for PowerShell commands and batches. "
-                        f"When you call a tool, format it as: <|tool_call>call:tool_name{{key: value, key2: value2}}<tool_call|>. "
-                        f"Never claim a tool was run unless you actually emitted a tool call token in this response. "
-                        f"If the user asks to list tools, output the COMPLETE inventory from this list without omissions."
+                        f"or tasks you can perform. "
+                        f"To call a tool, output a JSON code block like this:\n"
+                        f"```json\n{{\"tool\": \"tool_name\", \"args\": {{\"key\": \"value\"}}}}\n```\n"
+                        f"The system will detect and execute it. Do NOT use <|tool_call> syntax."
                     ),
                 })
 
@@ -14283,12 +14281,15 @@ IMPORTANT RULES:
         return [name for name in preferred if name in self._tool_registry()]
 
     def _strip_think_tags(self, text: str) -> str:
-        """Remove qwen3.5 <think>...</think> reasoning blocks from response text."""
-        if not text or "<think>" not in text:
+        """Remove qwen3.5 <think>...</think> blocks and malformed <|tool_call> markers."""
+        if not text:
             return text
-        # Strip all think blocks; keep everything after the last closing tag
-        cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
-        return cleaned.strip()
+        if "<think>" in text:
+            text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+        # Strip qwen's non-standard tool call syntax so it doesn't leak into responses
+        if "<|tool_call>" in text or "<tool_call|>" in text:
+            text = re.sub(r"<\|tool_call>[\s\S]*?<tool_call\|>", "", text, flags=re.IGNORECASE)
+        return text.strip()
 
     def _extract_json_dict(self, text: str) -> Optional[Dict[str, Any]]:
         raw = self._strip_think_tags((text or "").strip())

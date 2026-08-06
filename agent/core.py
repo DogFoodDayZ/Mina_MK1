@@ -14293,6 +14293,10 @@ IMPORTANT RULES:
         if action_like_request:
             # If user addressed Mina by name, let the model handle it — don't clarify
             addressed_mina = bool(re.search(r"^(?:mina|hey\s+mina|ok\s+mina)\b", t, re.IGNORECASE))
+            # Multi-step verbs need the full model — planner can't reason across multiple tool calls
+            multi_step_verb = bool(re.search(r"^(?:fix|repair|debug|rewrite|update|improve|refactor|clean up|cleanup)\b", t, re.IGNORECASE))
+            if addressed_mina and multi_step_verb:
+                return None, {}
             planned = self._plan_tool_action(raw_text)
             if planned is not None:
                 return planned

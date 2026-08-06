@@ -109,6 +109,20 @@ class LMStudioClient:
                 os.getenv("MK1_VISION_REASONING_EFFORT", "none"),
             )
         ).strip()
+        # Non-vision token cap; 0 means no explicit cap sent to the model
+        self.max_tokens: int = int(
+            model_cfg.get(
+                "max_tokens",
+                os.getenv("MK1_MAX_TOKENS", "0"),
+            )
+        )
+        # Non-vision reasoning effort (e.g. "none", "low", "medium", "high")
+        self.reasoning_effort: str = str(
+            model_cfg.get(
+                "reasoning_effort",
+                os.getenv("MK1_REASONING_EFFORT", ""),
+            )
+        ).strip()
         self.request_timeout_seconds: int = int(
             model_cfg.get(
                 "request_timeout_seconds",
@@ -472,6 +486,13 @@ class LMStudioClient:
             payload["max_tokens"] = self.vision_max_tokens
         if has_image and self.vision_reasoning_effort:
             payload["reasoning_effort"] = self.vision_reasoning_effort
+
+        # Apply non-vision token cap and reasoning effort when configured
+        if not has_image:
+            if self.max_tokens > 0:
+                payload["max_tokens"] = self.max_tokens
+            if self.reasoning_effort:
+                payload["reasoning_effort"] = self.reasoning_effort
 
         print("\n========================================")
         print("MK1 → LM STUDIO REQUEST")

@@ -11810,6 +11810,24 @@ class MK1Core:
             result=result if isinstance(result, dict) else None,
         )
 
+        # Store tool failures as memory so Mina can learn from them
+        if isinstance(result, dict) and not bool(result.get("ok", True)):
+            error = str(result.get("error") or "unknown_error")
+            safe_args = {k: v for k, v in (tool_args or {}).items() if k not in {"content", "auth_token"}}
+            failure_text = (
+                f"Tool '{tool_name}' failed: {error}. "
+                f"User asked: {str(user_input or '')[:120]}. "
+                f"Args used: {str(safe_args)[:120]}."
+            )
+            try:
+                self.memory.add_memory(
+                    failure_text,
+                    kind="procedure",
+                    tags=["failed_decision", "tool_failure", tool_name],
+                )
+            except Exception:
+                pass
+
         if tool_name == "file_write" and isinstance(result, dict) and bool(result.get("ok", False)):
             self._remember_code_artifact_memory(
                 target_path=str(tool_args.get("path", "") or "").strip(),

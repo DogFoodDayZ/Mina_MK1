@@ -14081,6 +14081,11 @@ IMPORTANT RULES:
             path_like = re.search(r'([A-Za-z]:\\|[.]{1,2}[\\/]|\.(ps1|py|bat|cmd)\b)', raw_text, re.IGNORECASE) is not None
             alias_hit = self._resolve_path_alias(raw_text) is not None
             if path_like or alias_hit:
+                # Extract the path directly rather than passing the whole phrase
+                path_match = re.search(r'([A-Za-z]:\\[\w\\ .-]+)', raw_text)
+                if path_match:
+                    path_val = path_match.group(1).strip()
+                    return "ps_run", {"script": f"& '{path_val}'"}
                 return "ps_run", {
                     "script": _infer_ps_command(raw_text)
                 }

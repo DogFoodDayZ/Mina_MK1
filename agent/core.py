@@ -3715,11 +3715,12 @@ class MK1Core:
                 tags=user_tags,
             )
 
-            self.memory.add_memory(
-                assistant_mem,
-                kind="interaction",
-                tags=assistant_tags,
-            )
+            if assistant_mem:  # skip empty responses (e.g. qwen think-only output)
+                self.memory.add_memory(
+                    assistant_mem,
+                    kind="interaction",
+                    tags=assistant_tags,
+                )
 
             # Why: turn storage is the best place to convert corrections and Ostranauts play sessions into lessons.
             # Guard: keeps memory reinforcement additive instead of changing the live routing path.

@@ -33,7 +33,8 @@
     "interaction_retention_days": 90,
     "failed_decision_retention_days": 14,
     "retention_interval_seconds": 86400,
-    "retention_max_delete": 1000
+    "retention_max_delete": 1000,
+    "obsidian_vault": "D:\\Black Valt\\Mina"
   },
   "tools": {
     "directory": "E:\\mina_mk1\\tools"

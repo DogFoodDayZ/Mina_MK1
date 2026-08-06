@@ -61,6 +61,7 @@ class MK1Memory:
         backup_dir: str = BACKUP_DIR_DEFAULT,
         embed_small_url: str = "http://127.0.0.1:8084/embed_small",
         embed_base_url: str = "http://127.0.0.1:8084/embed_base",
+        obsidian_vault: str = "",
         # maintenance / backup knobs
         auto_backup_every_writes: int = 100,
         auto_backup_every_seconds: int = 3600,
@@ -128,6 +129,10 @@ class MK1Memory:
         self._write_counter = 0
         self._init_operation_tracking()
 
+        # Obsidian vault export path — writes a .md copy of every memory
+        obsidian_env = os.getenv("MK1_OBSIDIAN_VAULT", "").strip()
+        self.obsidian_vault: Optional[str] = (obsidian_vault.strip() or obsidian_env) or None
+
         for path in [
             os.path.dirname(self.db_path),
             os.path.dirname(self.faiss_small_path),
@@ -140,8 +145,78 @@ class MK1Memory:
         self._last_backup_signature: Optional[str] = None
         self._load_last_backup_signature()
 
-        self.small_index: Optional[faiss.IndexIDMap2] = None
-        self.base_index: Optional[faiss.IndexIDMap2] = None
+    def _obsidian_export(self, mem_id: int, text: str, kind: str, tags: List[str], timestamp: float) -> None:
+        """Write memory to Obsidian vault as a markdown file. Fire-and-forget."""
+        vault = self.obsidian_vault
+        if not vault:
+            return
+        try:
+            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            month_dir = os.path.join(vault, "mina-memory", dt.strftime("%Y-%m"))
+            os.makedirs(month_dir, exist_ok=True)
+            filename = f"memory-{mem_id}.md"
+            filepath = os.path.join(month_dir, filename)
+            tag_str = " ".join(f"#{t}" for t in (tags or []))
+            frontmatter = (
+                f"---\n"
+                f"id: {mem_id}\n"
+                f"kind: {kind}\n"
+                f"tags: [{', '.join(tags or [])}]\n"
+                f"timestamp: {dt.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"---\n\n"
+            )
+            body = f"{frontmatter}{text}\n"
+            if tag_str:
+                body += f"\n{tag_str}\n"
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(body)
+        except Exception:
+            pass  # never let vault export break memory writes
+
+    def _sqlite_keyword_search(
+        self,
+        query: str,
+        top_k: int,
+        include_kinds: Optional[List[str]],
+        include_tags: Optional[List[str]],
+        since_ts: Optional[float],
+    ) -> List[Dict[str, Any]]:
+        """Keyword fallback when FAISS/embed unavailable. Ranks by token overlap."""
+        stop = {"a","an","and","are","as","at","be","by","do","for","from",
+                "how","i","in","is","it","me","my","of","on","or","so",
+                "that","the","to","was","what","when","who","you","your"}
+        tokens = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if t not in stop and len(t) > 1]
+        if not tokens:
+            tokens = [query.lower().strip()]
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            sql = "SELECT id, text, kind, tags, timestamp FROM memories WHERE 1=1"
+            params: List[Any] = []
+            if since_ts is not None:
+                sql += " AND timestamp >= ?"
+                params.append(since_ts)
+            sql += " ORDER BY timestamp DESC LIMIT 500"
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            conn.close()
+        except Exception:
+            return []
+
+        scored = []
+        for row in rows:
+            rid, text, kind, tags_raw, ts = row
+            row_tags = json.loads(tags_raw) if tags_raw else []
+            if not self._matches_filters(kind, row_tags, ts, include_kinds, include_tags, since_ts):
+                continue
+            text_lower = (text or "").lower()
+            score = sum(1 for t in tokens if t in text_lower)
+            if score > 0:
+                scored.append((score, {"id": rid, "text": text, "kind": kind, "tags": row_tags, "timestamp": ts}))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in scored[:top_k]]
 
         try:
             self._validate_embed_startup()
@@ -545,6 +620,15 @@ class MK1Memory:
         ):
             self.backup(reason="scheduled_writes")
             self._write_counter = 0
+
+        # Export to Obsidian vault if configured
+        self._obsidian_export(
+            mem_id=int(mem_id),
+            text=text,
+            kind=kind,
+            tags=tags,
+            timestamp=time.time(),
+        )
 
         return int(mem_id) if mem_id is not None else None
 
@@ -2059,7 +2143,8 @@ class MK1Memory:
         vec_b = self._embed(query, use_base=True)
 
         if not vec_s and not vec_b:
-            return []
+            # Embed unavailable — fall back to keyword search over SQLite
+            return self._sqlite_keyword_search(query, top_k, include_kinds, include_tags, since_ts)
 
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()

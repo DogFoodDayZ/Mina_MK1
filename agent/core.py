@@ -877,6 +877,12 @@ class MK1Core:
                 "retention_max_delete",
                 1000,
             ),
+
+            obsidian_vault=self.config.get(
+                "memory",
+                "obsidian_vault",
+                os.getenv("MK1_OBSIDIAN_VAULT", ""),
+            ),
         )
 
         tools_dir = self.config.get(

@@ -4290,7 +4290,7 @@ class MK1Core:
     def _extract_memory_slots(self, user_query: str) -> Dict[str, bool]:
         q = (user_query or "").lower()
         return {
-            "name": bool(re.search(r"\b(what\s+is\s+my\s+name|my\s+name|who\s+am\s+i)\b", q)),
+            "name": bool(re.search(r"\b(what\s+is\s+my\s+name|who\s+am\s+i)\b", q)),
             "birthdate": bool(re.search(r"\b(birthdate|birthday|date of birth|dob)\b", q)),
             "eye_color": bool(re.search(r"\b(eye color|eyes color|eye|eyes)\b", q)),
             "favorite_color": bool(re.search(r"\b(favorite|favourite)\s+color\b", q)),

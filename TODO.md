@@ -113,6 +113,7 @@ Preserves Mina tone and concise style.
 Shows verification evidence for actions.
 No new scripted derailment in adjacent prompt classes.
 User can use normal phrasing and still complete the task.
+If a fix creates a barrier to learning — intercepting requests before Mina can reason, injecting data instead of letting her discover it, or bypassing her model — find a different fix.
 
 11) Implementation Choice Check (Memory vs Hardcoding)
 

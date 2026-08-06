@@ -708,6 +708,15 @@ class LMStudioClient:
         if self._system_message_count(payload.get("messages", [])) > 1:
             payload["messages"] = self._coalesce_system_messages(payload.get("messages", []))
 
+        # Trim to context window budget (same as non-streaming path)
+        payload["messages"] = self._trim_messages_to_budget(payload["messages"])
+
+        # Apply token cap and reasoning effort (same as non-streaming path)
+        if self.max_tokens > 0:
+            payload["max_tokens"] = self.max_tokens
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -720,6 +729,9 @@ class LMStudioClient:
             attempted_models = [str(self.default_model or "local-model")]
 
         last_http_error: Optional[Exception] = None
+        # State for stripping qwen3.5 <think>...</think> blocks across stream chunks
+        in_think_block: bool = False
+        think_buf: List[str] = []
 
         for model_idx, model_name in enumerate(attempted_models):
             attempt_base = dict(payload)
@@ -808,7 +820,28 @@ class LMStudioClient:
                             piece = str(choice0.get("text"))
 
                         if piece:
-                            yield piece
+                            think_buf.append(piece)
+                            combined = "".join(think_buf)
+                            # Once think block is fully closed, flush everything after it
+                            if in_think_block:
+                                if "</think>" in combined:
+                                    after = combined.split("</think>", 1)[1]
+                                    in_think_block = False
+                                    think_buf = []
+                                    if after:
+                                        yield after
+                                # else: still inside think block, keep buffering
+                            else:
+                                if "<think>" in combined:
+                                    # think block starting mid-stream
+                                    before = combined.split("<think>", 1)[0]
+                                    in_think_block = True
+                                    think_buf = [combined.split("<think>", 1)[1]]
+                                    if before:
+                                        yield before
+                                else:
+                                    think_buf = []
+                                    yield combined
 
                     if model_idx > 0 and model_name != self.default_model:
                         print(f"LM STUDIO MODEL FALLBACK: switched from '{self.default_model}' to '{model_name}'")

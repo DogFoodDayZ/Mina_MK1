@@ -1149,7 +1149,6 @@ Continuity docs: `integrations/ostranauts/BUILD_STATUS.md` and `integrations/ost
 ---
 
 ## Mina as a Buddy — Not Just a Tool
-*Added 2026-08-05.*
 
 Mina is supposed to interject, comment, share things she noticed, and just talk — not only respond when tasked. The 36-hour OpenClaw version did this naturally.
 
@@ -1183,3 +1182,14 @@ Mina is supposed to interject, comment, share things she noticed, and just talk 
 - [ ] Update avatar image set in `public/avatar/states/` — Travis to confirm which states to keep/add
 - [ ] Hook Mina's tool execution events to avatar reactions (writing → focused, done → satisfied, error → not-happy)
 - [ ] Make sure GUI reconnects gracefully when API restarts (currently may hang)
+
+---
+
+## Mina Needs to Learn: PowerShell Emoji Encoding
+*Added 2026-08-05. Let her figure this out herself.*
+
+When Mina writes PS1 scripts with emoji, they show as garbage in a Windows terminal.
+
+**Fix she needs to discover:** Add `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8` at the top of PS1 scripts with emoji.
+
+**How to trigger the lesson:** Tell her the emoji don't show in PowerShell and let her debug it.

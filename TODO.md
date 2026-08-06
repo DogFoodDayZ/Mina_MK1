@@ -1147,7 +1147,26 @@ Continuity docs: `integrations/ostranauts/BUILD_STATUS.md` and `integrations/ost
 
 ---
 
-## GUI Overhaul — C:\dev\mina-gui
+## Mina as a Buddy — Not Just a Tool
+*Added 2026-08-05.*
+
+Mina is supposed to interject, comment, share things she noticed, and just talk — not only respond when tasked. The 36-hour OpenClaw version did this naturally.
+
+### What's Missing
+- Autonomy discoveries surface as notifications, not woven into conversation
+- Every input goes through intent detection first — if it doesn't look like a command she stalls
+- No mechanism for her to initiate conversation unprompted when she has something to say
+
+### Goal
+- Mina should be able to say "hey I found something interesting" in the chat flow, not just a side panel
+- Idle moments should feel like she's present, not silent
+- Conversational inputs should go to the model first, intent detection second
+
+### Work Items
+- [ ] Route low-confidence intent inputs directly to model instead of clarification prompt
+- [ ] Allow autonomy discoveries to feed into conversational context naturally
+- [ ] Reduce intent detection surface — let the model decide if action is needed
+- [ ] Audit what's intercepting chat before the model sees it and strip what doesn't need to be there
 *Added 2026-08-05. Do after Qwen fix queue is verified live.*
 
 ### Goals

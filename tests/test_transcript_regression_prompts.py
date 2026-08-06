@@ -152,13 +152,14 @@ def test_execution_followup_runs_from_explicit_python_path_handoff_context():
 
 
 def test_spotify_typo_spotiy_routes_current_playback_action():
+    # Contract update 2026-08-05: Spotify keyword routing removed — model handles music requests
     core = _core_for_intent_tests()
     core.tools = SimpleNamespace(tools={"spotify_link": object()})
 
     tool_name, args = MK1Core.detect_tool_intent(core, "whats on spotiy right now?")
 
-    assert tool_name == "spotify_link"
-    assert str(args.get("action") or "") == "current_playback"
+    # Goes to model for conversational handling, not keyword-matched
+    assert tool_name is None
 
 
 def test_transcript_prompt_yes_confirms_pending_external_write():
@@ -243,6 +244,7 @@ def test_operational_incident_detector_stays_false_for_story_chat():
 
 
 def test_cpu_gpu_conversational_prompt_routes_ps_run_with_executable_script():
+    # Contract update 2026-08-05: hardware keyword routing removed — model decides
     core = _core_for_intent_tests()
 
     tool_name, args = MK1Core.detect_tool_intent(
@@ -250,11 +252,11 @@ def test_cpu_gpu_conversational_prompt_routes_ps_run_with_executable_script():
         "TRAVIS hay mina tell me about our gpu and cpu",
     )
 
-    assert tool_name == "ps_run"
-    assert "Get-CimInstance" in str(args.get("script") or "")
+    assert tool_name is None
 
 
 def test_cpu_ping_prompt_routes_ps_run_with_cores_speed_usage_script():
+    # Contract update 2026-08-05: hardware keyword routing removed — model decides
     core = _core_for_intent_tests()
 
     tool_name, args = MK1Core.detect_tool_intent(
@@ -262,10 +264,7 @@ def test_cpu_ping_prompt_routes_ps_run_with_cores_speed_usage_script():
         "TRAVIS ping the cpu get me speed cores and use %",
     )
 
-    assert tool_name == "ps_run"
-    script = str(args.get("script") or "")
-    assert "Win32_Processor" in script
-    assert "LoadPercent" in script or "LoadPercentage" in script
+    assert tool_name is None
 
 
 def test_bare_powershell_command_routes_to_ps_run():
@@ -282,6 +281,7 @@ def test_bare_powershell_command_routes_to_ps_run():
 
 
 def test_how_many_gpus_prompt_routes_to_ps_run_count_command():
+    # Contract update 2026-08-05: hardware keyword routing removed — model decides
     core = _core_for_intent_tests()
     core.tools = SimpleNamespace(tools={"ps_run": object()})
 
@@ -290,14 +290,11 @@ def test_how_many_gpus_prompt_routes_to_ps_run_count_command():
         "TRAVIS how many gpu's are there ?",
     )
 
-    assert tool_name == "ps_run"
-    script = str(args.get("script") or "")
-    assert "Win32_VideoController" in script
-    assert ".Count" in script
-    assert "Measure-Object" not in script
+    assert tool_name is None
 
 
 def test_number_of_hard_drives_prompt_routes_to_ps_run_count_command():
+    # Contract update 2026-08-05: hardware keyword routing removed — model decides
     core = _core_for_intent_tests()
     core.tools = SimpleNamespace(tools={"ps_run": object()})
 
@@ -306,11 +303,7 @@ def test_number_of_hard_drives_prompt_routes_to_ps_run_count_command():
         "TRAVIS what is the number of hard drives ?",
     )
 
-    assert tool_name == "ps_run"
-    script = str(args.get("script") or "")
-    assert "Win32_DiskDrive" in script
-    assert ".Count" in script
-    assert "Measure-Object" not in script
+    assert tool_name is None
 
 
 def test_take_a_look_with_pending_write_routes_directory_scan_with_focus_hint(tmp_path):
@@ -412,6 +405,7 @@ def test_try_again_with_last_draft_artifact_prefers_write_retry_over_directory_s
 
 
 def test_hardware_chat_phrase_routes_to_ps_run():
+    # Contract update 2026-08-05: hardware keyword routing removed — model handles these
     core = _core_for_intent_tests()
 
     tool_name, _args = MK1Core.detect_tool_intent(
@@ -419,10 +413,11 @@ def test_hardware_chat_phrase_routes_to_ps_run():
         "TRAVIS hay mina tell me about our gpu and cpu",
     )
 
-    assert tool_name == "ps_run"
+    assert tool_name is None
 
 
 def test_ping_cpu_phrase_routes_to_ps_run():
+    # Contract update 2026-08-05: hardware keyword routing removed — model handles these
     core = _core_for_intent_tests()
 
     tool_name, _args = MK1Core.detect_tool_intent(
@@ -430,7 +425,7 @@ def test_ping_cpu_phrase_routes_to_ps_run():
         "TRAVIS ping the cpu get me speed cores and use %",
     )
 
-    assert tool_name == "ps_run"
+    assert tool_name is None
 
 
 def test_context_continuation_style_shift_targets_last_python_file():

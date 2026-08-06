@@ -14495,6 +14495,51 @@ IMPORTANT RULES:
     # HANDLE MODEL RESPONSE
     # ========================================================
 
+    def _execute_inline_tool_calls(self, text: str) -> str:
+        """Detect JSON tool call blocks in Mina's response and execute them, replacing with results."""
+        if "\"tool\"" not in text:
+            return text
+
+        import re as _re
+        pattern = _re.compile(r"```(?:json)?\s*(\{[\s\S]*?\"tool\"[\s\S]*?\})\s*```", _re.IGNORECASE)
+
+        def _replace_call(m: re.Match) -> str:
+            try:
+                plan = json.loads(m.group(1))
+            except Exception:
+                return m.group(0)
+
+            tool_name = str(plan.get("tool") or "").strip()
+            if not tool_name or tool_name not in self._tool_registry():
+                return m.group(0)
+
+            args_raw = plan.get("args", {})
+            if isinstance(args_raw, str):
+                args_raw = {"path": args_raw} if tool_name in {"file_read", "file_write"} else {"script": args_raw}
+            if not isinstance(args_raw, dict):
+                args_raw = {}
+
+            args = self._sanitize_planned_tool_args(tool_name, args_raw)
+
+            try:
+                result = self.tools.run(tool_name, args)
+            except Exception as e:
+                return f"[Tool '{tool_name}' error: {e}]"
+
+            if not isinstance(result, dict) or not result.get("ok"):
+                err = result.get("error", "failed") if isinstance(result, dict) else "failed"
+                return f"[Tool '{tool_name}' failed: {err}]"
+
+            inner = result.get("result") or result
+            if isinstance(inner, dict):
+                content = inner.get("content") or inner.get("msg") or str(inner)
+            else:
+                content = str(inner)
+
+            return f"[{tool_name} result]\n{content}"
+
+        return pattern.sub(_replace_call, text)
+
     def _handle_model_response(
         self,
         messages: List[Dict[str, str]],
@@ -14535,6 +14580,10 @@ IMPORTANT RULES:
             ).strip()
 
         text = self._strip_tool_call_markup(text)
+
+        # Detect and execute JSON tool call blocks Mina embedded in her response
+        text = self._execute_inline_tool_calls(text)
+
         return text or ""
 
     def _enforce_tool_outcome_truth(

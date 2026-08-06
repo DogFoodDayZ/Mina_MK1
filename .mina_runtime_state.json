@@ -1,12 +1,12 @@
 {
-  "updated_at": "2026-08-05T17:36:23",
-  "reason": "heartbeat",
+  "updated_at": "2026-08-05T17:37:19",
+  "reason": "shutdown",
   "turn_clock_started_at": "2026-08-05T16:23:05",
-  "turn_clock_tick": 881,
-  "turn_clock_last_tick_at": "2026-08-05T17:36:23",
-  "turn_clock_last_elapsed_seconds": 4398.5220513,
+  "turn_clock_tick": 892,
+  "turn_clock_last_tick_at": "2026-08-05T17:37:19",
+  "turn_clock_last_elapsed_seconds": 4453.662900900001,
   "last_user_activity_at": "2026-08-05T17:30:33",
-  "last_shutdown_at": "2026-08-05T12:51:04",
+  "last_shutdown_at": "2026-08-05T17:37:19",
   "idle_checkin_pending": false,
   "idle_checkin_due_since_at": null
 }

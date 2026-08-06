@@ -145,6 +145,10 @@ class MK1Memory:
         self._last_backup_signature: Optional[str] = None
         self._load_last_backup_signature()
 
+        self.small_index: Optional[faiss.IndexIDMap2] = None
+        self.base_index: Optional[faiss.IndexIDMap2] = None
+        self._init_indexes()
+
     def _obsidian_export(self, mem_id: int, text: str, kind: str, tags: List[str], timestamp: float) -> None:
         """Write memory to Obsidian vault as a markdown file. Fire-and-forget."""
         vault = self.obsidian_vault
@@ -218,6 +222,7 @@ class MK1Memory:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in scored[:top_k]]
 
+    def _init_indexes(self) -> None:
         try:
             self._validate_embed_startup()
             self._init_db()

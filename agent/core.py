@@ -14254,9 +14254,13 @@ IMPORTANT RULES:
                 }
 
         if action_like_request:
+            # If user addressed Mina by name, let the model handle it — don't clarify
+            addressed_mina = bool(re.search(r"^(?:mina|hey\s+mina|ok\s+mina)\b", t, re.IGNORECASE))
             planned = self._plan_tool_action(raw_text)
             if planned is not None:
                 return planned
+            if addressed_mina:
+                return None, {}
             return "__clarify_intent__", {
                 "question": (
                     "I can run that with tools, but I need one detail first: "

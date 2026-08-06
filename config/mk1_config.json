@@ -7,6 +7,7 @@
     "request_timeout_seconds": 240,
     "max_tokens": 4096,
     "reasoning_effort": "",
+    "context_window": 32768,
     "switch_allowed": [
       "qwen2.5-7b-instruct",
       "mistral-nemo-2407-12b-thinking-claude-gemini-gpt5.2-uncensored-heretic",

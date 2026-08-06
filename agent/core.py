@@ -123,12 +123,58 @@ class LMStudioClient:
                 os.getenv("MK1_REASONING_EFFORT", ""),
             )
         ).strip()
+        # Context window in tokens; used to budget message trimming before sending
+        self.context_window: int = int(
+            model_cfg.get(
+                "context_window",
+                os.getenv("MK1_CONTEXT_WINDOW", "32768"),
+            )
+        )
         self.request_timeout_seconds: int = int(
             model_cfg.get(
                 "request_timeout_seconds",
                 os.getenv("MK1_LMSTUDIO_TIMEOUT_SECONDS", "240"),
             )
         )
+
+    def _estimate_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        """Rough token estimate: 4 chars ≈ 1 token, plus 4 overhead per message."""
+        total = 0
+        for m in messages:
+            content = m.get("content") or ""
+            if isinstance(content, list):
+                content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+            total += len(str(content)) // 4 + 4
+        return total
+
+    def _trim_messages_to_budget(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drop oldest non-system messages until payload fits within context_window budget."""
+        if not self.context_window or self.context_window <= 0:
+            return messages
+        # Reserve headroom for the model's own output
+        budget = self.context_window - (self.max_tokens if self.max_tokens > 0 else 2048)
+        if budget <= 0 or self._estimate_tokens(messages) <= budget:
+            return messages
+
+        system = [m for m in messages if str(m.get("role", "")).lower() == "system"]
+        non_system = [m for m in messages if str(m.get("role", "")).lower() != "system"]
+
+        # Always keep the last user message
+        if non_system:
+            pinned = [non_system[-1]]
+            trimmable = non_system[:-1]
+        else:
+            return messages
+
+        # Drop from oldest end until we fit
+        while trimmable and self._estimate_tokens(system + trimmable + pinned) > budget:
+            trimmable.pop(0)
+
+        trimmed = system + trimmable + pinned
+        if len(trimmed) < len(messages):
+            dropped = len(messages) - len(trimmed)
+            print(f"[context budget] trimmed {dropped} message(s) to fit {self.context_window}-token window")
+        return trimmed
 
     def _has_system_messages(self, messages: List[Dict[str, Any]]) -> bool:
         return any(str(m.get("role", "")).strip().lower() == "system" for m in (messages or []))
@@ -475,6 +521,9 @@ class LMStudioClient:
         # system message before user/assistant alternation.
         if self._system_message_count(payload.get("messages", [])) > 1:
             payload["messages"] = self._coalesce_system_messages(payload.get("messages", []))
+
+        # Trim to context window budget before sending
+        payload["messages"] = self._trim_messages_to_budget(payload["messages"])
 
         # Add tools if provided
         if tools:

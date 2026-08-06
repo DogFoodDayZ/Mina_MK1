@@ -54,8 +54,8 @@
   "curiosity": {
     "enabled": true,
     "approved_roots": [
-      "D:\\",
-      "E:\\",
+      "E:\\Mina_MK1",
+      "E:\\workspace",
       "G:\\"
     ],
     "idle_seconds": 1800,

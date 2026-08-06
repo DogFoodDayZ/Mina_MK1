@@ -646,7 +646,7 @@ Core change acceptance gate:
 
 - Date: 2026-08-05
 - Priority: High
-- Status: Open
+- Status: Done (abdd2dc)
 
 #### 1) What I asked Mina to do
 - Tool planner asked to pick a tool and return JSON
@@ -692,7 +692,7 @@ Core change acceptance gate:
 
 - Date: 2026-08-05
 - Priority: High
-- Status: Open
+- Status: Done (abdd2dc — think tag stripping resolved the root confusion)
 
 #### 1) What I asked Mina to do
 - Normal conversational requests
@@ -737,7 +737,7 @@ Core change acceptance gate:
 
 - Date: 2026-08-05
 - Priority: Medium
-- Status: Open
+- Status: Done (abdd2dc)
 
 #### 1) What I asked Mina to do
 - Any action-like request that routes through `_plan_tool_action()`
@@ -781,7 +781,7 @@ Core change acceptance gate:
 
 - Date: 2026-08-05
 - Priority: High
-- Status: Open
+- Status: Done (972baed — SQLite keyword fallback + Obsidian vault export)
 
 #### 1) What I asked Mina to do
 - "What do you remember about me" or any memory recall while port 8084 is down
@@ -827,7 +827,7 @@ Core change acceptance gate:
 
 - Date: 2026-08-05
 - Priority: Medium
-- Status: Open
+- Status: Done (df063e6 — max_tokens=4096, reasoning_effort wired in)
 
 #### 1) What I asked Mina to do
 - Any request requiring model inference
@@ -871,7 +871,7 @@ Core change acceptance gate:
 
 - Date: 2026-08-05
 - Priority: Medium
-- Status: Open
+- Status: Done (2884e1f — trims oldest messages to fit 32k context)
 
 #### 1) What I asked Mina to do
 - Any request where system prompt + memory context + history is large
@@ -914,7 +914,7 @@ Core change acceptance gate:
 
 - Date: 2026-08-05
 - Priority: Medium
-- Status: Open
+- Status: Done (b66f2c0 — last 2 turns passed to planner; fast_command_skip_context defaulted false)
 
 #### 1) What I asked Mina to do
 - "Read back the file you created" (or any reference to prior turn)
@@ -959,7 +959,7 @@ Core change acceptance gate:
 
 - Date: 2026-08-05
 - Priority: Low
-- Status: Open
+- Status: Done (54da52f — think tag stripping in stream, max_tokens, context budget applied)
 
 #### 1) What I asked Mina to do
 - Any streaming response (voice, GUI streaming)

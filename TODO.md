@@ -1144,3 +1144,22 @@ Continuity docs: `integrations/ostranauts/BUILD_STATUS.md` and `integrations/ost
 
 - [ ] Review the current uncommitted backend, Android, memory, and fancy-GUI changes as one integration batch.
 - [ ] Run final targeted backend, GUI build, and Android build checks before committing.
+
+---
+
+## GUI Overhaul — C:\dev\mina-gui
+*Added 2026-08-05. Do after Qwen fix queue is verified live.*
+
+### Goals
+- Streamline `c:\dev\mina-gui` to feel like Mina's actual interface, not a demo shell
+- **Update avatar** — give Mina visual states she can control (idle, thinking, talking, reacting)
+- Use the GUI as a live status panel: model state, memory health, last tool run, Ostranauts bridge status
+- Avatar should reflect what Mina is doing, not just sit there
+
+### Work Items
+- [ ] Audit current `src/` — remove dead components, identify what's actually wired to the API
+- [ ] Wire avatar state to `/status` endpoint so Mina controls her own expression
+- [ ] Add a status strip: model online/offline, embed server, last action, Ostranauts active
+- [ ] Update avatar image set in `public/avatar/states/` — Travis to confirm which states to keep/add
+- [ ] Hook Mina's tool execution events to avatar reactions (writing → focused, done → satisfied, error → not-happy)
+- [ ] Make sure GUI reconnects gracefully when API restarts (currently may hang)

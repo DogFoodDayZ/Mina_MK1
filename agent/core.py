@@ -1076,7 +1076,7 @@ class MK1Core:
             self.config.get(
                 "performance",
                 "fast_command_skip_context",
-                True,
+                False,
             )
         )
         self.maintenance_min_interval_seconds = int(
@@ -7408,7 +7408,7 @@ class MK1Core:
             },
             "performance": {
                 "fast_command_mode": bool(getattr(self, "fast_command_mode", True)),
-                "fast_command_skip_context": bool(getattr(self, "fast_command_skip_context", True)),
+                "fast_command_skip_context": bool(getattr(self, "fast_command_skip_context", False)),
                 "maintenance_min_interval_seconds": int(getattr(self, "maintenance_min_interval_seconds", 20)),
             },
             "reflex": {
@@ -8997,7 +8997,7 @@ class MK1Core:
                 rescued_tool = None
 
             if not rescued_tool:
-                planned = self._plan_tool_action(user_text)
+                planned = self._plan_tool_action(user_text, prior_messages=messages)
                 if planned is not None:
                     rescued_tool = planned[0]
 
@@ -9027,7 +9027,7 @@ class MK1Core:
             return None
 
         if not tool_name:
-            planned = self._plan_tool_action(user_text)
+            planned = self._plan_tool_action(user_text, prior_messages=messages)
             if planned is None:
                 return None
             tool_name, _tool_args = planned
@@ -9148,7 +9148,7 @@ class MK1Core:
             self._maybe_run_maintenance_tick()
 
             fast_command_mode = bool(getattr(self, "fast_command_mode", True))
-            fast_command_skip_context = bool(getattr(self, "fast_command_skip_context", True))
+            fast_command_skip_context = bool(getattr(self, "fast_command_skip_context", False))
 
             command_like = fast_command_mode and self._is_command_like_query(user_input)
             ostranauts_context = build_ostranauts_context()
@@ -14318,7 +14318,7 @@ IMPORTANT RULES:
 
         return clean
 
-    def _plan_tool_action(self, user_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    def _plan_tool_action(self, user_text: str, prior_messages: Optional[List[Dict[str, Any]]] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
         candidates = self._planner_candidate_tools()
         if not candidates:
             return None
@@ -14346,10 +14346,15 @@ IMPORTANT RULES:
             except Exception:
                 pass
 
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text + context_addition},
-        ]
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+
+        # Include last 2 turns of conversation so planner can resolve references like "run it", "read it back"
+        if prior_messages:
+            non_system = [m for m in prior_messages if str(m.get("role", "")).lower() != "system"]
+            for m in non_system[-4:]:  # last 2 user+assistant pairs
+                messages.append({"role": m["role"], "content": str(m.get("content") or "")[:800]})
+
+        messages.append({"role": "user", "content": user_text + context_addition})
 
         try:
             plan_reply = self.model.chat(messages=messages, tools=None, temperature=0.1)

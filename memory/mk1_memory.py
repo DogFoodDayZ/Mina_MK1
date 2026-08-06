@@ -669,6 +669,15 @@ class MK1Memory:
                 vec_base = self._embed(text, use_base=True)
 
                 if not vec_small or not vec_base:
+                    # Permanently discard items that will never embed (e.g. empty text)
+                    last_error = str(self.status.get("last_error") or "embed_failed")
+                    if last_error == "embed_empty_text" or not str(text).strip():
+                        write_conn = sqlite3.connect(self.db_path)
+                        write_cur = write_conn.cursor()
+                        write_cur.execute("DELETE FROM pending_memories WHERE id = ?", (pid,))
+                        write_conn.commit()
+                        write_conn.close()
+                        continue
                     failed += 1
                     write_conn = sqlite3.connect(self.db_path)
                     write_cur = write_conn.cursor()
@@ -1492,6 +1501,10 @@ class MK1Memory:
 
         if tags is None:
             tags = []
+
+        # Silently discard empty text — embed server rejects it and fills the buffer
+        if not str(text or "").strip():
+            return None
 
         due_at = kwargs.get("due_at")
         task_status = str(kwargs.get("task_status") or "stored")

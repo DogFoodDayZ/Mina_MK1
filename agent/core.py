@@ -14335,7 +14335,29 @@ IMPORTANT RULES:
         return None
 
     def _sanitize_planned_tool_args(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        # If model returned args as a string instead of dict, coerce it to the right field
+        if isinstance(args, str):
+            if tool_name in {"ps_run", "powershell"}:
+                args = {"script": args}
+            elif tool_name == "file_read":
+                args = {"path": args}
+            elif tool_name == "file_write":
+                args = {"path": args}
+            elif tool_name == "web_search":
+                args = {"query": args}
+            elif tool_name == "web_fetch":
+                args = {"url": args}
+            else:
+                args = {}
+
         clean = dict(args or {})
+
+        if tool_name in {"ps_run", "powershell"}:
+            script = str(clean.get("script") or "").strip()
+            # If model put a bare path as the script, wrap it as an invocation
+            if script and not script.startswith("&") and not script.lower().startswith("powershell") and script.endswith((".ps1", ".py", ".cmd", ".bat")):
+                script = f"& '{script}'"
+            clean["script"] = script
 
         if tool_name == "web_search":
             q = str(clean.get("query") or "").strip()

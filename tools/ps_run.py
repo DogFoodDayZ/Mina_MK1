@@ -127,11 +127,6 @@ def _normalize_command(script: str) -> str:
     if re.search(r"\b(probe|check|inspect|query|scan)\b.*\b(cpu|processor)\b", lowered) or re.search(r"\b(cpu|processor)\b.*\b(probe|check|inspect|query|scan)\b", lowered):
         return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
 
-    if re.search(r"\b(run|execute|show|list|get)\b", lowered):
-        if "powershell" in lowered or "ps" in lowered:
-            text = text.replace("powershell", "", 1).strip()
-            text = text.replace("ps", "", 1).strip()
-
     if text.startswith("\"") and text.endswith("\""):
         text = text[1:-1]
 

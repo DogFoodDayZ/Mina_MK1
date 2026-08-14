@@ -7430,6 +7430,16 @@ class MK1Core:
         except Exception:
             traceback.print_exc()
 
+    @staticmethod
+    def _normalize_snapshot_path(path: Any) -> str:
+        # Why: Windows can hand back the same real path with different drive-letter
+        # casing across restarts (E:\ vs e:\), which otherwise changes the capability
+        # digest every time and spams duplicate rows that crowd out real recall.
+        s = str(path or "")
+        if len(s) >= 2 and s[1] == ":" and s[0].isalpha():
+            return s[0].upper() + s[1:]
+        return s
+
     def _build_runtime_capability_snapshot(self) -> Dict[str, Any]:
         tool_names: List[str] = []
         try:
@@ -7441,11 +7451,12 @@ class MK1Core:
         if not isinstance(model_switch_allowed, list):
             model_switch_allowed = []
 
+        norm = self._normalize_snapshot_path
         return {
             "identity": "Mina",
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "workspace_root": self.workspace_root,
-            "projects_root": self._projects_root(),
+            "workspace_root": norm(self.workspace_root),
+            "projects_root": norm(self._projects_root()),
             "model": {
                 "default_model": self.config.get("model", "default_model", ""),
                 "switch_allowed": [str(x) for x in model_switch_allowed],
@@ -7453,10 +7464,10 @@ class MK1Core:
                 "vision_reasoning_effort": self.config.get("model", "vision_reasoning_effort", None),
             },
             "memory": {
-                "db_path": getattr(self.memory, "db_path", ""),
-                "faiss_small_path": getattr(self.memory, "faiss_small_path", ""),
-                "faiss_base_path": getattr(self.memory, "faiss_base_path", ""),
-                "backup_dir": getattr(self.memory, "backup_dir", ""),
+                "db_path": norm(getattr(self.memory, "db_path", "")),
+                "faiss_small_path": norm(getattr(self.memory, "faiss_small_path", "")),
+                "faiss_base_path": norm(getattr(self.memory, "faiss_base_path", "")),
+                "backup_dir": norm(getattr(self.memory, "backup_dir", "")),
                 "auto_backup_every_writes": self.config.get("memory", "auto_backup_every_writes", None),
                 "auto_backup_every_seconds": self.config.get("memory", "auto_backup_every_seconds", None),
             },
@@ -9254,6 +9265,10 @@ class MK1Core:
             else:
                 context = self.build_context(user_input)
 
+            autonomy_awareness_context = self._build_autonomy_awareness_context(user_input)
+            if autonomy_awareness_context:
+                context = f"{context}\n\n{autonomy_awareness_context}".strip() if context else autonomy_awareness_context
+
             working_memory = self._build_turn_working_memory(user_input)
 
             messages: List[Dict[str, Any]] = []
@@ -9631,6 +9646,10 @@ class MK1Core:
                 context = self._build_ostranauts_memory_context(user_input)
             else:
                 context = self.build_context(user_input)
+
+            autonomy_awareness_context = self._build_autonomy_awareness_context(user_input)
+            if autonomy_awareness_context:
+                context = f"{context}\n\n{autonomy_awareness_context}".strip() if context else autonomy_awareness_context
 
             working_memory = self._build_turn_working_memory(user_input)
 
@@ -10168,6 +10187,39 @@ class MK1Core:
             lines.append(f"- {txt}")
 
         return "\n".join(lines) if len(lines) > 1 else ""
+
+    _AUTONOMY_AWARENESS_QUERY_PATTERN = re.compile(
+        r"\bself[-\s]?(edit|improve|repair|fix|modify)\b"
+        r"|\bautonomous(?:ly)?\b.{0,30}\b(code|edit|patch|source|self)\b"
+        r"|\b(edit|modify|rewrite|change|update|patch|improve|work\s+on|fix)\b.{0,25}\b(your(?:self)?|own)\b.{0,20}\b(code|source)\b"
+        r"|\baware\b.{0,40}\b(edit|modify|change|work\s+on|improve|patch)\b.{0,20}\b(own|your)\b.{0,20}\b(code|source)\b",
+        re.IGNORECASE,
+    )
+
+    def _build_autonomy_awareness_context(self, query: str) -> str:
+        # Why: the real self-editing capability is easily crowded out of ranked semantic
+        # recall by unrelated memories, so a direct question about it must always surface
+        # the grounded fact rather than let the model fall back to its trained "I can't
+        # modify my own code" disclaimer (verified live 2026-08-13 as a false denial).
+        if not self._AUTONOMY_AWARENESS_QUERY_PATTERN.search(str(query or "")):
+            return ""
+
+        try:
+            rows = self.memory.search(
+                "autonomous self-improvement capability",
+                top_k=1,
+                include_kinds=["procedure"],
+                include_tags=["autonomy_awareness"],
+            )
+        except Exception:
+            rows = []
+
+        for item in rows or []:
+            txt = str(item.get("text") or "").strip()
+            if txt:
+                return txt
+
+        return ""
 
     def _build_ostranauts_memory_context(self, query: str, top_k: int = 6) -> str:
         learned = self._build_learned_lesson_context(query, top_k=top_k)

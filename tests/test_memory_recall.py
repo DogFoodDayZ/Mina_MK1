@@ -1383,6 +1383,30 @@ def test_seed_autonomy_awareness_memory_does_not_duplicate_existing_fact():
     assert rows == []
 
 
+def test_build_autonomy_awareness_context_surfaces_fact_for_self_edit_question():
+    class AwarenessMemory(FakeMemory):
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_tags == ["autonomy_awareness"]:
+                return [{"text": "Mina autonomous self-improvement capability: I can work on my own code."}]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = AwarenessMemory()
+
+    out = MK1Core._build_autonomy_awareness_context(core, "are you aware that you can edit your own source code autonomously?")
+
+    assert "autonomous self-improvement capability" in out
+
+
+def test_build_autonomy_awareness_context_empty_for_unrelated_question():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+
+    out = MK1Core._build_autonomy_awareness_context(core, "what's the weather like today?")
+
+    assert out == ""
+
+
 def test_build_turn_working_memory_includes_durable_tool_records():
     class WorkingMemoryFake(FakeMemory):
         def recent_memories(self, top_k=6, include_kinds=None, include_tags=None):

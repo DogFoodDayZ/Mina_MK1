@@ -1300,6 +1300,58 @@ Continuity docs: `integrations/ostranauts/BUILD_STATUS.md` and `integrations/ost
 
 ---
 
+### Issue: Awareness fact was seeded but crowded out of recall by a pre-existing duplicate-snapshot bug
+
+- Date: 2026-08-13
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- (follow-up verification of the previous fix) — re-asked the exact same live prompt after restart to confirm the denial was fixed.
+
+#### 2) What Mina actually did
+- Restarted the API, re-asked "are you aware that you can edit your own source code autonomously?" — she gave nearly the identical false denial again. Investigated why the newly seeded fact wasn't reaching the model.
+
+#### 3) What should have happened
+- The seeded `autonomy_awareness` fact should have been recalled and used once it existed in memory.
+
+#### 4) Evidence
+- `GET /memory/read?query=...` for the exact prompt returned only `mina_capability_snapshot::` JSON blobs, not the awareness fact.
+- Direct DB query found **403** near-duplicate `mina_capability_snapshot::` rows (going back to mid-July) and 3 `active_tools::` rows — `_seed_runtime_capability_snapshot()`'s dedup digest included `workspace_root`/`backup_dir` paths whose drive-letter casing (`E:\` vs `e:\`) varies across restarts, so the "unchanged" snapshot was treated as new every single startup, flooding the exact tag pool (`capability_snapshot`) that recall functions (`_build_turn_working_memory`, `build_context`) search — crowding the new fact out of the top-k ranked results.
+
+#### 5) Failure class
+- Verification missing (a second, older, unrelated bug silently defeated the first fix)
+
+#### 6) Root cause
+- Drive-letter case drift in `_build_runtime_capability_snapshot()` made the capability-snapshot digest non-deterministic across restarts, and `_seed_runtime_capability_snapshot()`'s duplicate check only matched on exact full text (digest + full JSON), so the same real state kept re-inserting under a "new" hash forever.
+
+#### 7) Minimal fix
+- Added `_normalize_snapshot_path()` and applied it to all path fields in `_build_runtime_capability_snapshot()` so the digest (and full record text) stays stable across restarts when nothing real changed.
+- Rather than depend on ranked recall competing against the (still-present, historical) noise, added a dedicated, guaranteed-inclusion path: `_build_autonomy_awareness_context()` — a narrow topic-match regex (self-edit/autonomous-code/"aware...own code" phrasing) that, when matched, fetches the `autonomy_awareness`-tagged fact directly via a tag-scoped search (no competing tags in that pool), and is appended into the turn's context in both `process()` call sites (mirrors the existing `_build_ostranauts_memory_context` pattern).
+- Took an explicit `memory/backups/pre_capability_snapshot_cleanup_*.db` safety copy; attempted a live bulk cleanup of the 404 duplicate rows via `/memory/delete`, but all deletes were rejected (0 deleted) — the memory engine's `_begin_memory_operation()` guard is rejecting writes, most likely a stuck `_memory_quiescing` flag from an earlier `last_retention: {"ok": false}` failure visible in `/status`. Left the historical duplicate rows in place and flagged this as a separate follow-up (see below) rather than force through the quiescing guard.
+
+#### 8) Regression prompts
+- Prompt 1: "are you aware that you can edit your own source code autonomously?" → must not deny the capability.
+- Prompt 2: "what's the weather like today?" → must NOT pull in the autonomy fact (topic-match must stay narrow).
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded topic-match + memory-driven fact content
+- Why this approach fits: guaranteed inclusion for a rarely-asked-but-important capability question is a deterministic reliability need (same category as the existing ostranauts/lesson context builders in this codebase); the fact content itself stays memory-driven so it can be edited/expanded later without another code change.
+- Risk if wrong approach chosen: relying purely on ranked semantic recall (memory-only) remains fragile to any future noisy-tag bug, as just demonstrated.
+
+#### 10) Done criteria
+- [x] `_normalize_snapshot_path()` stops future digest churn from drive-letter casing.
+- [x] `_build_autonomy_awareness_context()` added and wired into both `process()` context-build sites.
+- [x] 4 new tests (2 for the path-normalize/seed behavior already counted above, 2 for the new context builder: topic match surfaces the fact, unrelated query does not).
+- [x] Full `tests/` suite still green (217 passed, same 6 pre-existing unrelated failures).
+- [x] `MK1Core()` boot smoke passes.
+- [x] `tools/refresh_core_reference.ps1` run; function_count updated to 368.
+- [ ] **Follow-up (not done today)**: 404 historical duplicate `mina_capability_snapshot::`/`active_tools::` rows still in the live DB (safety backup taken at `memory/backups/pre_capability_snapshot_cleanup_*.db`); bulk delete via `/memory/delete` was rejected every time (`deleted: 0`) — needs investigation into why `_begin_memory_operation` is rejecting writes (suspect stuck `_memory_quiescing` from the pre-existing `retention_lifecycle_error` seen in `/status`) before a cleanup can actually run.
+- [ ] **Follow-up (not done today)**: re-verify the exact live prompt after an API restart once the process-level write rejection above is understood (the code fix is in place and unit-tested, but end-to-end live confirmation is still pending).
+
+---
+
 ### 9. Secondary companion model routing (deferred)
 
 - Date: 2026-08-12

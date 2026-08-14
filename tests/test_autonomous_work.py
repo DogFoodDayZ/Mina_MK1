@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from agent.core import MK1Core
@@ -341,3 +342,34 @@ def test_autonomous_executor_writes_structured_audit(tmp_path):
     assert audit_rows[0]["evidence"] == ["sample.py contains the relevant implementation"]
     assert audit_rows[0]["verification"]["completion_verified"] is False
     assert audit_rows[0]["verification"]["patch_applied"] is False
+
+
+def test_autonomous_work_task_defers_when_user_just_became_active(tmp_path):
+    # Why: a background autonomous model call can take minutes; if the user resumes
+    # chatting mid-call both requests hit LM Studio concurrently and contend for the
+    # same KV-cache slots (observed live as context-loss/cache-restore failures).
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "sample.py").write_text("def improve_worker():\n    return True\n", encoding="utf-8")
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({
+        ("curiosity", "project_roots"): [str(project_root)],
+        ("curiosity", "allow_source_edits"): True,
+    })
+    core.model = FakeModel()
+    core.tools = FakeTools()
+    core._last_user_activity_monotonic = time.monotonic()
+
+    result = core._run_autonomous_work_task({
+        "key": "todo:improve-worker",
+        "title": "Improve worker implementation",
+        "details": ["Inspect the existing worker."],
+        "reference": str(project_root / "sample.py"),
+        "project_root": str(project_root),
+    })
+
+    assert result["ok"] is False
+    assert result["deferred"] is True
+    assert core.model.chat_kwargs is None

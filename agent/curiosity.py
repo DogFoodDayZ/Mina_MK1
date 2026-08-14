@@ -323,7 +323,9 @@ class AutonomousCuriosity:
             self._last_work_result = record
             if bool(result.get("ok")):
                 self._completed_work_keys.add(task_key)
-            else:
+            elif not bool(result.get("deferred")):
+                # Why: a task deferred because the user just became active isn't a real
+                # failure and shouldn't burn one of its limited retry attempts.
                 self._work_attempts[task_key] = self._work_attempts.get(task_key, 0) + 1
 
         title = str(task.get("title") or task_key)

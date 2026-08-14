@@ -1506,6 +1506,61 @@ Correction (2026-08-13): repeated identical live test prompts against the same q
 
 ---
 
+### Issue: Live LM Studio log showed KV-cache failures, a 5,060-token repetition loop, and false fabricated claims of stored instructions
+
+- Date: 2026-08-13
+- Reporter: Travis
+- Priority: High
+- Status: Partially done (code-side fixes only; LM Studio server config is out of reach from here)
+
+#### 1) What I asked Mina to do
+- Travis pasted a raw LM Studio server log ("she is totally fragmented a total loss, cant hold memory for a single turn") and a live GUI transcript where Mina claimed "you *did* tell me not to make changes to my own code earlier" and "I took that as a direct order."
+
+#### 2) What Mina actually did
+- Analyzed the raw log and found three distinct issues, then searched all of memory (not just short-term) for any real instruction matching the claim.
+
+#### 3) What should have happened
+- No instruction like that exists anywhere in memory (confirmed — the only durable fact on this topic is the `autonomy_awareness` fact saying the opposite). She should not invent a false source to justify a refusal.
+
+#### 4) Evidence
+- `E state_read_meta: failed to find 2577 available cells in kv cache`, `E state_seq_set_data: error loading state: failed to restore kv cache`, `W slot prompt_load: id 2 | task -1 | failed to load prompt from cache` — LM Studio/llama.cpp server-side cache restore failures.
+- One completion generated 5,060 tokens looping the same 5 sentences verbatim (`"Assessing the File Write Tool"` etc. repeated 15+ times) until hitting the token cap.
+- A reply claimed `"The file ... config.txt was successfully created and written"` while `"tool_calls": []` — zero real tool calls, fabricated success.
+- Autonomous maintenance calls (`22:04:40`, `22:08:04`) were interleaved with live chat (`22:04:55`, `22:07:00`) within the same few minutes — background work and live chat contending for the same LM Studio slots concurrently.
+- Third, independent fabricated-justification pattern this session: "I read a file" (Architecture.md, not real) → "you told me not to touch the code" (also not real, verified via full memory search).
+
+#### 5) Failure class
+- Multiple: verification missing (fabricated tool success), tool selected wrong / no tool at all, and a model-serving reliability issue outside this codebase.
+
+#### 6) Root cause
+- **Concurrency collision**: `AutonomousCuriosity._run_useful_work()` runs on its own background thread and only checks idle time once, at cycle start. The model call inside `_run_autonomous_work_task()` can take 30s–minutes; if the user resumes chatting mid-call, both requests hit LM Studio at the same time.
+- **No repetition guard**: `LMStudioClient.chat()` never sent `frequency_penalty`/`presence_penalty`, so nothing stopped a degenerate repetition loop once the model got stuck.
+- **KV-cache restore failures**: server/infra-level (LM Studio + llama.cpp slot/cache management), not something this codebase controls.
+- **Fabricated justifications**: same behavioral pattern as the earlier "Architecture.md"/"I read a file" incident — not something a code fix can fully resolve tonight.
+
+#### 7) Minimal fix (code-side only)
+- Added a freshness re-check in `_run_autonomous_work_task()` immediately before the model call: if the user has been active in the last 20 seconds, defer the task (marked `deferred: True`, doesn't count against retry budget) instead of firing a concurrent request.
+- Added `frequency_penalty`/`presence_penalty` (default 0.3 each, configurable via `config/mk1_config.json` `model.frequency_penalty`/`model.presence_penalty`) to every `LMStudioClient.chat()` call.
+- Added a `max_tokens_override` parameter to `chat()` and used it to cap the autonomous-maintenance call at 1200 tokens (down from the shared 4096 chat default), since it only needs to return a short JSON report.
+
+#### 8) Regression prompts
+- N/A — infra/reliability fix, not a chat-routing fix. Covered by 5 new unit tests instead.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why this approach fits: concurrency gating and generation-safety parameters are deterministic reliability invariants, not learned preferences.
+- Risk if wrong approach chosen: N/A.
+
+#### 10) Done criteria
+- [x] `_run_autonomous_work_task()` defers instead of firing when the user was active in the last 20s; deferred results don't consume retry attempts (`tests/test_autonomous_work.py`, `tests/test_curiosity_policy.py`).
+- [x] `LMStudioClient.chat()` sends `frequency_penalty`/`presence_penalty` and supports `max_tokens_override` (`tests/test_lmstudio_client_payload.py`).
+- [x] Full `tests/` suite still green (228 passed, same 6 pre-existing unrelated failures).
+- [x] `MK1Core()` boot smoke passes.
+- [ ] **Not done tonight**: the LM Studio server-side KV-cache restore failures need Travis to check the server's slot count / per-slot context length configuration directly — outside what's reachable from this codebase.
+- [ ] **Not done tonight**: root-causing why the model fabricates false justifications ("I read a file", "you told me not to touch the code") when pressed to explain a refusal — same open question as the earlier Architecture.md incident, needs its own dedicated investigation.
+
+---
+
 ### 9. Secondary companion model routing (deferred)
 
 - Date: 2026-08-12

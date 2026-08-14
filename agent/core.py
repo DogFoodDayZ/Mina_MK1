@@ -116,6 +116,19 @@ class LMStudioClient:
                 os.getenv("MK1_MAX_TOKENS", "0"),
             )
         )
+        # Modest anti-repetition penalties; 0 disables. See chat() for rationale.
+        self.frequency_penalty: float = float(
+            model_cfg.get(
+                "frequency_penalty",
+                os.getenv("MK1_FREQUENCY_PENALTY", "0.3"),
+            )
+        )
+        self.presence_penalty: float = float(
+            model_cfg.get(
+                "presence_penalty",
+                os.getenv("MK1_PRESENCE_PENALTY", "0.3"),
+            )
+        )
         # Non-vision reasoning effort (e.g. "none", "low", "medium", "high")
         self.reasoning_effort: str = str(
             model_cfg.get(
@@ -500,6 +513,7 @@ class LMStudioClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         allow_fallback: bool = False,
         allow_model_load: bool = False,
+        max_tokens_override: Optional[int] = None,
     ) -> Dict[str, Any]:
 
         has_image = False
@@ -516,6 +530,14 @@ class LMStudioClient:
             "temperature": temperature,
             "stream": False,
         }
+
+        # Why: nothing was bounding runaway repetition (observed live: a single completion
+        # looping the same few sentences for 5,000+ tokens). Modest, universally-supported
+        # OpenAI-style penalties without being aggressive enough to hurt normal chat quality.
+        if self.frequency_penalty:
+            payload["frequency_penalty"] = self.frequency_penalty
+        if self.presence_penalty:
+            payload["presence_penalty"] = self.presence_penalty
 
         # Normalize role layout for templates that allow only one optional
         # system message before user/assistant alternation.
@@ -538,8 +560,9 @@ class LMStudioClient:
 
         # Apply non-vision token cap and reasoning effort when configured
         if not has_image:
-            if self.max_tokens > 0:
-                payload["max_tokens"] = self.max_tokens
+            effective_max_tokens = int(max_tokens_override) if max_tokens_override is not None else self.max_tokens
+            if effective_max_tokens > 0:
+                payload["max_tokens"] = effective_max_tokens
             if self.reasoning_effort:
                 payload["reasoning_effort"] = self.reasoning_effort
 
@@ -6262,12 +6285,25 @@ class MK1Core:
             f"TASK: {title}\nDETAILS: {json.dumps(task.get('details', []))}\nPROJECT: {project_root}\n\n"
             f"SOURCE CONTEXT:\n{context_text[:30000]}\n\nWEB RESEARCH:\n{research_text}"
         )
+
+        # Why: this runs on a background thread once the user has been idle long enough
+        # to start, but the model call itself can take minutes -- if the user resumes
+        # chatting mid-call, both requests hit LM Studio concurrently and contend for the
+        # same KV-cache slots (observed live: cache-restore failures + context loss).
+        # Guard: re-check freshness right before the expensive call, not just at cycle start.
+        fresh_idle_seconds = max(0.0, time.monotonic() - float(getattr(self, "_last_user_activity_monotonic", 0.0)))
+        if fresh_idle_seconds < 20.0:
+            result = {"ok": False, "deferred": True, "summary": "Deferred: user became active just before the model call.", "error": "user_active_deferred"}
+            self._write_autonomy_audit({"ts": time.time(), "task_key": task.get("key"), "task": task, **result})
+            return result
+
         reply = self.model.chat(
             [{"role": "user", "content": prompt}],
             temperature=0.2,
             tools=None,
             allow_fallback=False,
             allow_model_load=False,
+            max_tokens_override=1200,
         )
         model_text = self._extract_text(reply)
         if model_text.strip().lower().startswith("(lm studio error:"):

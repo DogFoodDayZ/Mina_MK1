@@ -91,6 +91,25 @@ def test_failed_useful_work_stops_after_retry_limit():
     assert len(executions) == 2
 
 
+def test_deferred_useful_work_does_not_consume_a_retry_attempt():
+    executions = []
+    curiosity = AutonomousCuriosity(
+        memory=FakeMemory(),
+        tools=object(),
+        approved_roots=ROOTS,
+        max_work_retries=2,
+        work_provider=lambda: [{"key": "todo:deferred", "title": "Deferred task"}],
+        work_executor=lambda task: executions.append(task) or {"ok": False, "deferred": True, "summary": "user active"},
+    )
+
+    for _ in range(5):
+        curiosity._run_cycle(do_local=False, do_news=False, do_work=True)
+
+    # A task that only ever defers should keep being retried, not get burned through
+    # its retry budget and disappear.
+    assert len(executions) == 5
+
+
 def test_news_scan_accepts_ostranauts_wiki_results_and_stores_memory():
     memory = FakeMemory()
     tools = FakeTools([

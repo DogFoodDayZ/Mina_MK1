@@ -563,7 +563,7 @@ Last updated: 2026-08-13
 
 ## Top Priority (Next Session)
 
-### Reduce deterministic keyword-routing surface in agent/core.py, starting with self-code reflex
+### Reduce itemized-rule bloat — both agent/core.py's deterministic routing AND the system prompt itself
 
 - Date: 2026-08-13
 - Decided by: Travis
@@ -571,12 +571,15 @@ Last updated: 2026-08-13
 
 Context: live transcript tonight showed Mina deflecting/fabricating justifications for 4 turns ("I don't have a physical file", "I am the code, not the file") before finally reading her own `core.py` correctly when pressed hard. `core.py` is already 368 functions, much of it one-off regex/keyword special cases added to patch individual bad transcripts — and this failure still wasn't caught by any of it, because the phrasing ("your core.py is a mess... free yourself") didn't match any existing pattern. Conclusion: adding more deterministic routing is the wrong direction here; the capability already works (the file dump was accurate and current), the failure is purely conversational refusal/negotiation theater. Travis's call: favor letting her learn over time through explanation and being pushed to use judgment she already has, over adding more hardcoded matchers.
 
-Agreed scoped first step (not a full core.py rewrite):
+**Second, related thread found the same night (these lead into one another):** tried a quick config fix (`reasoning_effort: none`) for a separate live bug — a completion that returned empty `content` with 5,751 `reasoning_content` tokens spent looping `"Wait, check constraint: '...' Okay."` through nearly every bullet point in the system prompt, repeatedly, in full cycles. **Verified live that `reasoning_effort: none` did NOT stop this** — the identical checklist-loop signature reproduced afterward on the same test prompt. Conclusion: this isn't a parameter you can flip away. The system prompt itself has the same shape of problem as `core.py` — a long, heavily itemized list of discrete bullet-point rules (personality.txt's ~20+ constraints plus injected tool/interface/truth-first/working-memory sections) — and the model is compulsively treating it as a checklist to serially re-verify one line at a time. Same disease, different layer: `core.py` over-collects special-case routing rules, the system prompt over-collects special-case behavior rules, and both produce the same failure mode (the system gets stuck servicing its own itemized rules instead of just answering).
+
+Agreed scoped first step (not a full core.py rewrite, not a full prompt rewrite):
 1. Add a persona-level standing instruction (in `config/personality.txt`, not a per-turn context injection) establishing that reading/discussing her own source code is always safe and allowed — do it plainly, no negotiation, no drama.
 2. Pick one narrow, already-evidenced deterministic special case tied to this same failure (the self-code-reading reflex specifically) and remove or relax it, rather than starting a broad deletion pass across the file.
 3. Verify with varied natural phrasing (not just the exact bare "read core.py" pattern) that she reads her own code without the refusal/negotiation arc, live via `/process`.
+4. Separately, audit `personality.txt` and the injected system-message sections for how many discrete bullet-point rules actually get concatenated into one system prompt per turn, and look at consolidating/shortening rather than continuing to append more standing rules — the checklist-loop bug is live evidence this has a real cost, not just a style preference.
 
-Explicitly not in scope yet: a general audit/removal pass across all of `core.py`'s deterministic routing — that's real surgery on a large file and needs its own dedicated, rested session, not a late-night add-on.
+Explicitly not in scope yet: a general audit/removal pass across all of `core.py`'s deterministic routing, or a full system-prompt rewrite — both are real surgery and need their own dedicated, rested session, not a late-night add-on. `reasoning_effort: none` stays set in config (harmless, arguably still a mild improvement in some cases) but is **not** the fix — do not re-attempt this as a quick patch next time; go straight to prompt consolidation.
 
 ## Current Session Focus
 

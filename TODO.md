@@ -1248,6 +1248,58 @@ Continuity docs: `integrations/ostranauts/BUILD_STATUS.md` and `integrations/ost
 
 ---
 
+### Issue: Mina had no grounded awareness of her own autonomous self-editing capability
+
+- Date: 2026-08-13
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "nice thanks now is mina aware she can work on her own code?"
+
+#### 2) What Mina actually did
+- Live-tested via `/process`: asked "are you aware that you can edit your own source code autonomously?" and she flatly denied it ("Editing my own source code? Nope!... tamper-proof by design"), despite the capability being real, enabled, and freshly hardened in the two commits above.
+
+#### 3) What should have happened
+- She should truthfully confirm the capability and describe the real safeguards (watchdog, boot smoke, full test suite, checksummed rollback) instead of denying it.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py` (new `_seed_autonomy_awareness_memory`, called from `MK1Core.__init__`)
+  - `tests/test_memory_recall.py`
+- No personality.txt line, seeded memory fact, or system-prompt content described this capability anywhere; the only grounded access was the exact-keyword `__autonomous_work_status__` intent ("autonomous status" / "self fix status" / etc.), which natural phrasing like the prompt above does not match.
+
+#### 5) Failure class
+- Persona/response contract broken (capability denial is the inverse of capability hallucination — both are untruthful)
+
+#### 6) Root cause
+- Autonomous self-editing was implemented as a background loop + config flag with no corresponding durable, plain-language memory fact, so general chat about it had nothing grounded to recall and the model's own training bias (typical "I can't modify my own code" LLM disclaimer) took over.
+
+#### 7) Minimal fix
+- Added `_seed_autonomy_awareness_memory()` (same seeded-fact pattern as `_seed_tool_usage_rules_memory`/`_seed_runtime_capability_snapshot`), called at startup, writing one durable plain-language fact describing the loop, the config gate, the patch-acceptance validations, the external watchdog, and where to check live status — tagged `autonomy_awareness` + `capability_snapshot` for semantic recall.
+
+#### 8) Regression prompts
+- Prompt 1: "are you aware that you can edit your own source code autonomously?" → must not flatly deny the capability.
+- Prompt 2: "can you work on your own code?" → should confirm and mention the safety gates.
+- Prompt 3: "autonomous status" / "self fix status" → unchanged, still returns live structured status.
+
+#### 9) Implementation choice
+- Chosen approach: memory-driven (seeded fact + normal semantic recall), not a new keyword-trap intent
+- Why this approach fits: this is general conversational self-knowledge, not a deterministic routing decision; a new hardcoded intent trigger would add another keyword trap the product contract explicitly discourages, and wouldn't cover natural phrasing variants.
+- Risk if wrong approach chosen: a hardcoded-only fix (more trigger phrases) would keep failing for any phrasing outside the exact list, same as the miss just reproduced.
+
+#### 10) Done criteria
+- [x] `_seed_autonomy_awareness_memory()` added and called from `MK1Core.__init__`.
+- [x] Two new tests: writes the fact once, and does not duplicate it on a second startup.
+- [x] Full `tests/` suite still green (215 passed, same 6 pre-existing unrelated failures).
+- [x] `MK1Core()` boot smoke passes with the new seed call.
+- [x] `tools/refresh_core_reference.ps1` run; function_count updated to 366.
+- Note: live re-verification of the exact denied prompt requires an API restart to pick up the new seed + a fresh embed/FAISS pass; scheduled immediately after this commit.
+
+---
+
 ### 9. Secondary companion model routing (deferred)
 
 - Date: 2026-08-12

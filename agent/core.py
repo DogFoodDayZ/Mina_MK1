@@ -1289,6 +1289,7 @@ class MK1Core:
         self._seed_authoritative_identity_memory()
         self._seed_runtime_capability_snapshot()
         self._seed_tool_usage_rules_memory()
+        self._seed_autonomy_awareness_memory()
         self._intent_alias_cache = self._get_intent_alias_map()
         self._intent_alias_cache_loaded = True
         self._play_song_shorthand_cache = self._get_play_song_shorthand_map()
@@ -8010,6 +8011,44 @@ class MK1Core:
                     rules_text,
                     kind="procedure",
                     tags=["user_memory", "system_seed", "startup_fact", "tool_usage_rules"],
+                )
+        except Exception:
+            traceback.print_exc()
+
+    def _seed_autonomy_awareness_memory(self) -> None:
+        """
+        Persist a durable, plain-language fact describing Mina's real autonomous
+        self-editing capability so she can answer honestly instead of denying or
+        hallucinating it (verified live 2026-08-13: without this she flatly denied
+        having any self-edit ability).
+        """
+        try:
+            awareness_text = "\n".join([
+                "Mina autonomous self-improvement capability:",
+                "- I have a bounded background work loop (agent/curiosity.py, AutonomousCuriosity) that reads TODO.md and the project tracker for candidate work while idle.",
+                "- When curiosity.allow_source_edits is enabled in config/mk1_config.json, that loop can propose and apply real source-code patches to my own codebase (agent/core.py and related files), not just read-only research.",
+                "- Every proposed patch is gated: git apply --check, a pre-patch checksummed code snapshot, Python AST syntax validation, a full pytest tests/ suite run, and a MK1Core() boot smoke test — any failure reverts the patch automatically.",
+                "- An external watchdog process (mina_watchdog.ps1 / watchdog/mina_watchdog.py), independent of my own API process, restarts and health-checks the API after an accepted patch and restores the pre-patch snapshot if the restart isn't healthy.",
+                "- Current enabled/disabled state and any pending/queued work is available live via 'autonomous status' / 'self fix status' or GET /curiosity/status; I should check that rather than guessing whether self-edits are currently on.",
+                "- I should say yes when asked if I can work on my own code, and describe these real safeguards, instead of denying the capability.",
+            ]).strip()
+
+            if not awareness_text:
+                return
+
+            exists = False
+            if hasattr(self.memory, "find_memory_id_by_text"):
+                exists = self.memory.find_memory_id_by_text(
+                    awareness_text,
+                    include_kinds=["procedure"],
+                    include_tags=["autonomy_awareness"],
+                ) is not None
+
+            if not exists:
+                self.memory.add_memory(
+                    awareness_text,
+                    kind="procedure",
+                    tags=["user_memory", "system_seed", "startup_fact", "autonomy_awareness", "capability_snapshot"],
                 )
         except Exception:
             traceback.print_exc()

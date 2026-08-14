@@ -1356,6 +1356,33 @@ def test_seed_runtime_capability_snapshot_writes_delta_when_changed():
     assert any("capability_delta" in (w.get("tags") or []) for w in delta_rows)
 
 
+def test_seed_autonomy_awareness_memory_writes_capability_fact():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+
+    MK1Core._seed_autonomy_awareness_memory(core)
+
+    rows = [w for w in core.memory.writes if "autonomy_awareness" in (w.get("tags") or [])]
+    assert rows
+    assert "can work on my own code" in rows[0]["text"].lower() or "self-editing capability" in rows[0]["text"].lower()
+    assert "watchdog" in rows[0]["text"].lower()
+
+
+def test_seed_autonomy_awareness_memory_does_not_duplicate_existing_fact():
+    class ExistingAwarenessMemory(FakeMemory):
+        def find_memory_id_by_text(self, text, include_kinds=None, include_tags=None):
+            self.lookups.append({"text": text, "include_kinds": include_kinds, "include_tags": include_tags})
+            return 1
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = ExistingAwarenessMemory()
+
+    MK1Core._seed_autonomy_awareness_memory(core)
+
+    rows = [w for w in core.memory.writes if "autonomy_awareness" in (w.get("tags") or [])]
+    assert rows == []
+
+
 def test_build_turn_working_memory_includes_durable_tool_records():
     class WorkingMemoryFake(FakeMemory):
         def recent_memories(self, top_k=6, include_kinds=None, include_tags=None):

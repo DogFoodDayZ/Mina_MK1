@@ -2529,6 +2529,17 @@ def memory_buffer_status():
         return {"ok": False, "error": str(e), "result": None}
 
 
+@app.get("/memory/activity_status")
+def memory_activity_status_route():
+    mem = getattr(core, "memory", None)
+    if mem is None or not hasattr(mem, "memory_activity_status"):
+        return {"ok": False, "error": "activity_status_not_supported", "result": None}
+    try:
+        return {"ok": True, "result": mem.memory_activity_status(), "error": None}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "result": None}
+
+
 @app.post("/memory/flush_buffer")
 def memory_flush_buffer(max_items: int = 200):
     mem = getattr(core, "memory", None)

@@ -1352,6 +1352,61 @@ Continuity docs: `integrations/ostranauts/BUILD_STATUS.md` and `integrations/ost
 
 Live re-verification result (2026-08-13, after restart): the guaranteed-recall context now reliably reaches the model (unit-tested), and it was additionally strengthened to a direct imperative ("answer honestly, do not deny this... instead of any trained refusal instinct"). The model **still** produced the same "Gremlin brakes applied ... tamper-proof by design ... I can't edit my own source code autonomously" refusal on 3 separate live prompts (including one explicitly telling it Travis said it's okay), with only minor wording variation between calls — this is not a caching artifact. This points to a strong persona/fine-tune-level refusal reflex for "can you modify yourself" style questions that isn't overridden by system-prompt context alone at this model's current settings. Retrieval/memory-layer fix is complete and verified in isolation; the last-mile model behavior override is a separate, harder problem (likely needs a temperature adjustment for this instruction to compete, or persona fine-tuning) and is out of scope for this session — flagged for a dedicated follow-up rather than continuing to chase it with more prompt text.
 
+Correction (2026-08-13): repeated identical live test prompts against the same question polluted `short_term`/`interaction` memory with near-duplicate refusal turns; `build_context`'s recency-based recall (`recent_memories`, last 6 short-term turns regardless of query relevance) fed those prior refusals back into every subsequent call as "recalled conversation," so the model was effectively conditioned to repeat its own last answer. Confirmed this wasn't a model issue: switching the active model to an allowlisted uncensored alternative (`mistral-nemo-...-heretic`) via `/model/select` and re-asking produced a near-identical refusal, which ruled out persona/fine-tune bias as the sole cause and pointed at the shared recalled short-term history instead. Switched back to the configured default afterward.
+
+---
+
+### Issue: `/memory/delete` silently reported false failures (`deleted: 0`) on real deletes
+
+- Date: 2026-08-13
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "that is not the issue i can fix that my self the memory bug is the issue you are to address now!! tell me how you plan to fix it ?"
+  - "ok sounds good proceed." / "yes" (commit)
+
+#### 2) What Mina actually did
+- Investigated a bulk `/memory/delete` cleanup (from the capability-snapshot duplicate-row fix) that reported `deleted: 0` for every one of 404 rows. Initial hypothesis (stuck `_memory_quiescing` flag) was wrong — added a read-only `GET /memory/activity_status` endpoint and confirmed `quiescing`/`closing`/`closed` were all `false` on a clean restart, yet a fresh known-good row still reported `deleted: 0`.
+
+#### 3) What should have happened
+- `/memory/delete` should truthfully report how many rows were actually removed from the database.
+
+#### 4) Evidence
+- `/status` showed `memory_engine.status.last_error: "delete_memory_ids_error: "` — an **empty** exception message — right after a failed-looking delete.
+- Direct DB query proved the target row was **already gone** despite the API reporting `deleted: 0`: the SQL `DELETE` had committed, but an exception afterward made the function return `0` anyway.
+- Found 8 pre-existing rows (`id` 7142–7145, 7153–7156 — real family facts: Travis's brother Rodger, mom Reichel, sister Alisha) with `dim_small=0`/`dim_base=0`/zero-length embedding blobs, likely inserted by an older seed path that bypassed the normal embed-then-insert flow.
+
+#### 5) Failure class
+- Verification missing (a function's return value did not match its actual side effect)
+
+#### 6) Root cause
+- `MK1Memory._rebuild_indexes()` assumed every row shares the first row's embedding dimension. Hitting one of the 8 zero-dimension rows threw a near-empty FAISS/dimension-mismatch exception.
+- `delete_memory_ids()` wrapped the SQL `DELETE`+commit **and** the subsequent `_rebuild_indexes()` call in a single `try/except`, so the unrelated rebuild crash overwrote a true, already-committed delete with a reported `0`.
+
+#### 7) Minimal fix
+- `_rebuild_indexes()` now determines the target dimension from the first row with a non-zero declared dimension, skips any row whose actual decoded vector length doesn't match (logging the skipped ids) instead of crashing the whole rebuild.
+- `delete_memory_ids()` now commits and computes the true `deleted` count in its own try/except, then attempts the index rebuild in a **separate** try/except that can no longer erase a real delete count — a rebuild failure is now recorded as its own `delete_memory_ids_rebuild_error` without lying about the delete result.
+- Added `GET /memory/activity_status` (read-only) so quiescing/closing/closed and active-operation counts are visible without triggering shutdown.
+
+#### 8) Regression prompts
+- N/A — this is a memory-engine correctness fix, not a chat-routing fix. Covered by 2 new unit tests instead.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why this approach fits: return-value truthfulness and index-rebuild robustness are deterministic correctness invariants, not user preferences.
+- Risk if wrong approach chosen: N/A — this is a straightforward bug fix, not a policy choice.
+
+#### 10) Done criteria
+- [x] `tests/test_memory_rebuild_and_delete.py`: rebuild skips corrupt zero-dim rows without crashing; delete reports the true count even when rebuild fails afterward.
+- [x] Full `tests/` suite still green (219 passed, same 6 pre-existing unrelated failures).
+- [x] `MK1Core()` boot smoke passes.
+- [x] Live end-to-end proof: wrote a probe memory, deleted it, got `{"deleted": 1}` (previously always `0`).
+- [ ] **Follow-up (not done today)**: the 8 corrupted zero-embedding family-fact rows (7142–7145, 7153–7156) are duplicated and currently unsearchable via semantic recall (though still visible via recency-based recall); should be re-embedded/repaired properly rather than just tolerated by the rebuild-skip fix.
+- [ ] **Follow-up (not done today)**: the 404 duplicate `mina_capability_snapshot::`/`active_tools::` rows from the earlier digest-churn bug can now actually be deleted (this fix unblocks that cleanup) but the bulk cleanup itself hasn't been re-run yet.
+
 ---
 
 ### 9. Secondary companion model routing (deferred)

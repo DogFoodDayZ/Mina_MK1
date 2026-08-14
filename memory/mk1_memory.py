@@ -822,17 +822,37 @@ class MK1Memory:
             self.status["last_rebuild"] = time.time()
             return None, None
 
-        dim_small = rows[0][2]
-        dim_base = rows[0][4]
+        # Why: a handful of rows can carry corrupt/zero-length embeddings (e.g. inserted
+        # by an older seed path that bypassed the embed pipeline). Blindly trusting the
+        # first row's declared dimension crashed the whole rebuild on any such row with a
+        # near-empty FAISS error, which silently swallowed unrelated delete/retention
+        # results that call this function afterward.
+        valid_rows = [row for row in rows if int(row[2] or 0) > 0 and int(row[4] or 0) > 0]
+        skipped_ids = [row[0] for row in rows if row not in valid_rows]
+
+        if not valid_rows:
+            self.status["last_rebuild"] = time.time()
+            if skipped_ids:
+                self._set_error(f"rebuild_indexes_skipped_all_rows_no_valid_embeddings:{skipped_ids[:20]}")
+            return None, None
+
+        dim_small = valid_rows[0][2]
+        dim_base = valid_rows[0][4]
 
         small = faiss.IndexIDMap2(faiss.IndexFlatL2(dim_small))
         base = faiss.IndexIDMap2(faiss.IndexFlatL2(dim_base))
 
-        for mem_id, emb_s, _, emb_b, _ in rows:
+        for mem_id, emb_s, row_dim_small, emb_b, row_dim_base in valid_rows:
             vs = np.frombuffer(emb_s, dtype=np.float32)
             vb = np.frombuffer(emb_b, dtype=np.float32)
+            if len(vs) != dim_small or len(vb) != dim_base:
+                skipped_ids.append(mem_id)
+                continue
             small.add_with_ids(np.array([vs]), np.array([mem_id], dtype=np.int64))
             base.add_with_ids(np.array([vb]), np.array([mem_id], dtype=np.int64))
+
+        if skipped_ids:
+            print(f">>> Rebuild skipped {len(skipped_ids)} row(s) with corrupt/mismatched embeddings: {skipped_ids[:20]}")
 
         faiss.write_index(small, self.faiss_small_path)
         faiss.write_index(base, self.faiss_base_path)
@@ -1927,13 +1947,20 @@ class MK1Memory:
             deleted = int(cur.rowcount or 0)
             conn.commit()
             conn.close()
-
-            if deleted > 0:
-                self.small_index, self.base_index = self._rebuild_indexes()
-            return deleted
         except Exception as e:
             self._set_error(f"delete_memory_ids_error: {e}")
             return 0
+
+        # Why: an index-rebuild failure here is unrelated to whether the delete itself
+        # committed. Letting it escape used to make this function report 0 rows deleted
+        # even though the DELETE had already succeeded, hiding real deletions from callers.
+        if deleted > 0:
+            try:
+                self.small_index, self.base_index = self._rebuild_indexes()
+            except Exception as e:
+                self._set_error(f"delete_memory_ids_rebuild_error: {e}")
+
+        return deleted
 
     @_tracked_memory_operation("delete_memory_by_text", rejected=0)
     def delete_memory_by_text(

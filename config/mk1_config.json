@@ -33,7 +33,7 @@
     "backup_keep_weekly_weeks": 26,
     "backup_max_total": 120,
     "retention_enabled": true,
-    "interaction_retention_days": 90,
+    "interaction_retention_days": 30,
     "failed_decision_retention_days": 14,
     "retention_interval_seconds": 86400,
     "retention_max_delete": 1000,

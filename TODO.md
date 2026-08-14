@@ -1457,6 +1457,55 @@ Correction (2026-08-13): repeated identical live test prompts against the same q
 
 ---
 
+### Issue: Both remaining memory follow-ups closed (corrupt family facts + duplicate-snapshot spam)
+
+- Date: 2026-08-13
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s): "fix them please" (repair the 8 corrupt family-fact rows and re-run the duplicate-snapshot cleanup)
+
+#### 2) What Mina actually did
+- Found the 4 family facts already existed cleanly and correctly embedded (`id` 7069–7072, `dim_small=384`/`dim_base=768`) from before the corruption; the 8 rows (7142–7145, 7153–7156) were pure redundant duplicates with broken zero-length embeddings. Deleted all 8 via the now-fixed `/memory/delete` — no re-write needed, nothing lost.
+- Re-ran the duplicate `mina_capability_snapshot::`/`active_tools::` cleanup plan: found only **27** rows now (down from 404), confirming the earlier digest-normalization fix helped — but a restart still added exactly 1 more, proving that fix was incomplete.
+- Root-caused the remaining leak: `_seed_runtime_capability_snapshot()`'s dedup check compared the **full record text** (which embeds a fresh `timestamp` on every run) via `find_memory_id_by_text`, so it could never match even when nothing real had changed — every single startup guaranteed a new row forever.
+- Fixed: dedup now compares the previously-stored row's parsed **digest** (already timestamp-independent) instead of exact full-text match. Verified live: restarted the API twice after the fix, row count stayed at 27 (no new duplicate), then deleted all 26 non-newest duplicates — final count is 1 snapshot + 1 active_tools row, `/status` clean (`ok: true`, no errors).
+
+#### 3) What should have happened
+- Both follow-ups from the delete-bug fix session should be fully resolved: corrupt rows repaired/removed without data loss, and the duplicate-row source stopped for good (not just cleaned up once).
+
+#### 4) Evidence
+- Family fact counts before: 3 copies of each of 4 facts (1 clean + 2 corrupt) → after: 1 clean copy of each, `dim_small=384`/`dim_base=768` confirmed on all 4 survivors.
+- Snapshot duplicate count: 404 (original bug) → 27 (after first partial fix) → held at 27 across 2 restarts (after this fix) → 1 (after cleanup).
+
+#### 5) Failure class
+- Verification missing (the earlier "fix" addressed digest computation but not the actual dedup comparison, so the leak continued at a lower rate)
+
+#### 6) Root cause
+- `_seed_runtime_capability_snapshot()` used `find_memory_id_by_text(record_text, ...)` for dedup, but `record_text` embeds a live `datetime.now()` timestamp every call, so exact-text matching could never succeed even with an otherwise-identical snapshot.
+
+#### 7) Minimal fix
+- Changed the dedup check to `exists = bool(previous_digest) and previous_digest == digest`, reusing the digest already parsed from the most recent prior row (via `_parse_capability_snapshot_record`) instead of comparing full text.
+
+#### 8) Regression prompts
+- N/A — memory-engine correctness fix. Covered by a new unit test proving no duplicate is written when the digest is unchanged (previously this always wrote a duplicate regardless of digest).
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why this approach fits: dedup-by-digest is a deterministic correctness fix, not a policy choice; doesn't touch what facts get learned/remembered, only prevents redundant technical snapshot spam.
+- Risk if wrong approach chosen: N/A.
+
+#### 10) Done criteria
+- [x] `tests/test_memory_recall.py::test_seed_runtime_capability_snapshot_does_not_duplicate_when_unchanged` added and passing.
+- [x] Full `tests/` suite still green (224 passed, same 6 pre-existing unrelated failures).
+- [x] `MK1Core()` boot smoke passes; live-verified across 2 real restarts with no new duplicate row.
+- [x] 8 corrupt family-fact rows removed live; 26 duplicate snapshot/tools rows removed live; `/status` clean with no errors.
+- [x] No family facts lost — the clean originals were already present and untouched.
+
+---
+
 ### 9. Secondary companion model routing (deferred)
 
 - Date: 2026-08-12

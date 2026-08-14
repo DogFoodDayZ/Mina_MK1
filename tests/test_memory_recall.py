@@ -1356,6 +1356,37 @@ def test_seed_runtime_capability_snapshot_writes_delta_when_changed():
     assert any("capability_delta" in (w.get("tags") or []) for w in delta_rows)
 
 
+def test_seed_runtime_capability_snapshot_does_not_duplicate_when_unchanged():
+    # Regression: record_text embeds a fresh per-run timestamp, so exact-text dedup
+    # never matched and spammed a new row on every restart even with identical config
+    # (confirmed live: 400+ duplicate rows). Dedup must compare by digest instead.
+    class SameDigestMemory(FakeMemory):
+        def __init__(self, prior_text):
+            super().__init__()
+            self.prior_text = prior_text
+
+        def recent_memories(self, top_k=6, include_kinds=None, include_tags=None):
+            if include_tags and "capability_snapshot" in include_tags:
+                return [{"text": self.prior_text}]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    fixed_payload = {"identity": "Mina", "workspace_root": "E:/workspace"}
+    core._build_runtime_capability_snapshot = lambda: dict(fixed_payload, timestamp="2026-08-13T00:00:00")
+
+    canonical = json.dumps(fixed_payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+    # Same digest, but a different (older) embedded timestamp -- simulates a prior restart.
+    prior_text = f"mina_capability_snapshot::{digest}::{json.dumps(dict(fixed_payload, timestamp='2020-01-01T00:00:00'), sort_keys=True, ensure_ascii=True)}"
+
+    core.memory = SameDigestMemory(prior_text)
+
+    MK1Core._seed_runtime_capability_snapshot(core)
+
+    snap_rows = [w for w in core.memory.writes if str(w.get("text", "")).startswith("mina_capability_snapshot::")]
+    assert snap_rows == []
+
+
 def test_seed_autonomy_awareness_memory_writes_capability_fact():
     core = MK1Core.__new__(MK1Core)
     core.memory = FakeMemory()

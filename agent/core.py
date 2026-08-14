@@ -7899,13 +7899,12 @@ class MK1Core:
                     previous_snapshot = snap
                     break
 
-            exists = False
-            if hasattr(self.memory, "find_memory_id_by_text"):
-                exists = self.memory.find_memory_id_by_text(
-                    record_text,
-                    include_kinds=["procedure"],
-                    include_tags=["capability_snapshot"],
-                ) is not None
+            # Why: record_text embeds a fresh per-run timestamp, so exact-text dedup
+            # against find_memory_id_by_text never matches and spammed a new row on
+            # every single startup (confirmed live: 400+ duplicate rows accumulated).
+            # Guard: compare against the previous row's parsed digest instead, since the
+            # digest itself is already timestamp-independent (see _snapshot_without_timestamp).
+            exists = bool(previous_digest) and previous_digest == digest
 
             if not exists:
                 self.memory.add_memory(

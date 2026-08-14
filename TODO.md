@@ -1409,6 +1409,54 @@ Correction (2026-08-13): repeated identical live test prompts against the same q
 
 ---
 
+### Issue: Same false-failure pattern existed in trim/retention/hygiene, not just delete
+
+- Date: 2026-08-13
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "what is the status of mina's memory system i feel where missing somthing with the way it was silenly failing ?"
+  - "yes as long as it does not effect her abiliy to learn and rember."
+
+#### 2) What Mina actually did
+- Audited every other caller of `_rebuild_indexes()` for the same "delete+commit and rebuild wrapped in one try/except" shape that caused `delete_memory_ids` to misreport. Found the identical pattern in `trim_by_age`, `trim_by_size`, `run_retention_lifecycle`, and `memory_hygiene`.
+
+#### 3) What should have happened
+- Any of these four should report their true delete/cleanup result even if an unrelated index-rebuild hiccup happens afterward.
+
+#### 4) Evidence
+- The very first `/status` check of this whole session showed `"last_retention": {"ok": false, "dry_run": false, "error": ""}` — same empty-error signature as the delete bug, now explained: `run_retention_lifecycle` was hitting the same corrupt-row rebuild crash and discarding its fully-built `report` (with the correct `deleted`/`digests_created` counts) in favor of a generic `{"ok": False, "error": ""}`.
+
+#### 5) Failure class
+- Verification missing (same root-cause class as the delete bug, repeated in 4 places)
+
+#### 6) Root cause
+- All four functions committed their SQL DELETE first, then called `self._rebuild_indexes()` **inside the same try block** as the delete itself, so any rebuild exception (guaranteed by the 8 corrupt zero-dim rows) wiped out an already-successful result.
+
+#### 7) Minimal fix
+- Applied the identical decoupling used for `delete_memory_ids` to all four: commit/compute the true result first (in its own try/except), then attempt `_rebuild_indexes()` in a separate try/except that can only record a `*_rebuild_error`, never overwrite the real result.
+- **No retention policy, deletion criteria, or what gets kept/summarized changed** — this only fixes whether the true outcome is reported truthfully.
+
+#### 8) Regression prompts
+- N/A — memory-engine correctness fix. Covered by 4 new unit tests (one per function) that simulate a rebuild failure and assert the true result still comes back correctly.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why this approach fits: same as the delete fix — this is a deterministic correctness invariant, and explicitly does not touch retention/hygiene policy (per Travis's requirement that it not affect her ability to learn/remember).
+- Risk if wrong approach chosen: N/A.
+
+#### 10) Done criteria
+- [x] `tests/test_memory_rebuild_and_delete.py`: `trim_by_age`, `trim_by_size`, `memory_hygiene` each report the true result when rebuild fails afterward.
+- [x] `tests/test_memory_retention.py`: `run_retention_lifecycle` reports the true `deleted` count and preserves recent/digest behavior when rebuild fails afterward.
+- [x] Full `tests/` suite still green (223 passed, same 6 pre-existing unrelated failures).
+- [x] `MK1Core()` boot smoke passes.
+- [x] Confirmed no change to what gets kept, deleted, summarized, or promoted — only the truthfulness of the reported result.
+
+---
+
 ### 9. Secondary companion model routing (deferred)
 
 - Date: 2026-08-12

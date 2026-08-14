@@ -7,7 +7,7 @@ import numpy as np
 from memory.mk1_memory import MK1Memory
 
 
-def _make_memory(tmp_path, rows):
+def _make_memory(tmp_path, rows, kinds=None):
     db_path = tmp_path / "memory.db"
     conn = sqlite3.connect(db_path)
     conn.execute(
@@ -16,10 +16,12 @@ def _make_memory(tmp_path, rows):
         "timestamp REAL, due_at REAL, task_status TEXT, "
         "emb_small BLOB, dim_small INTEGER, emb_base BLOB, dim_base INTEGER)"
     )
+    kinds = kinds or ["fact"] * len(rows)
+    insert_rows = [(kind,) + row for kind, row in zip(kinds, rows)]
     conn.executemany(
-        "INSERT INTO memories(text, kind, tags, timestamp, emb_small, dim_small, emb_base, dim_base) "
-        "VALUES (?, 'fact', ?, ?, ?, ?, ?, ?)",
-        rows,
+        "INSERT INTO memories(kind, text, tags, timestamp, emb_small, dim_small, emb_base, dim_base) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        insert_rows,
     )
     conn.commit()
     conn.close()
@@ -82,3 +84,49 @@ def test_delete_memory_ids_reports_true_count_even_if_rebuild_fails(tmp_path, mo
     remaining = conn.execute("SELECT id FROM memories").fetchall()
     conn.close()
     assert (target_id,) not in remaining
+
+
+def test_trim_by_age_reports_true_count_even_if_rebuild_fails(tmp_path, monkeypatch):
+    old_ts = time.time() - 1000
+    rows = [
+        ("old one", json.dumps(["user_memory"]), old_ts, _vec_blob(4), 4, _vec_blob(8), 8),
+        ("recent one", json.dumps(["user_memory"]), time.time(), _vec_blob(4), 4, _vec_blob(8), 8),
+    ]
+    mem = _make_memory(tmp_path, rows)
+    monkeypatch.setattr(mem, "_rebuild_indexes", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    deleted = mem.trim_by_age(max_age_seconds=500)
+
+    assert deleted == 1
+    assert any("trim_by_age_rebuild_error" in message for message in mem._errors)
+
+
+def test_trim_by_size_reports_true_count_even_if_rebuild_fails(tmp_path, monkeypatch):
+    rows = [
+        (f"row {i}", json.dumps(["user_memory"]), time.time() + i, _vec_blob(4), 4, _vec_blob(8), 8)
+        for i in range(5)
+    ]
+    mem = _make_memory(tmp_path, rows)
+    monkeypatch.setattr(mem, "_rebuild_indexes", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    deleted = mem.trim_by_size(max_rows=3)
+
+    assert deleted == 2
+    assert any("trim_by_size_rebuild_error" in message for message in mem._errors)
+
+
+def test_memory_hygiene_reports_true_result_even_if_rebuild_fails(tmp_path, monkeypatch):
+    rows = [
+        ("what is my name?", json.dumps([]), time.time(), _vec_blob(4), 4, _vec_blob(8), 8),
+        ("kept fact", json.dumps(["user_memory"]), time.time(), _vec_blob(4), 4, _vec_blob(8), 8),
+    ]
+    mem = _make_memory(tmp_path, rows, kinds=["interaction", "fact"])
+    mem.backup = lambda reason="hygiene", force=False: "backup-path"
+    monkeypatch.setattr(mem, "_rebuild_indexes", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    result = mem.memory_hygiene(dry_run=False, max_delete=500)
+
+    assert result["ok"] is True
+    assert result["delete_count"] == 1
+    assert any("memory_hygiene_rebuild_error" in message for message in mem._errors)
+

@@ -128,3 +128,47 @@ def test_retention_apply_creates_digest_before_deleting(tmp_path):
     assert any(text == "recent user turn" for text, _kind, _tags in remaining)
     assert any("Conversation digest" in text and kind == "procedure" for text, kind, _tags in remaining)
     assert not any(text == "old bad route" for text, _kind, _tags in remaining)
+
+
+def test_retention_apply_reports_true_result_even_if_rebuild_fails(tmp_path):
+    db_path = tmp_path / "memory.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE memories ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, kind TEXT, tags TEXT, timestamp REAL)"
+    )
+    now = time.time()
+    rows = [
+        ("old bad route", "interaction", json.dumps(["short_term", "assistant_turn", "failed_decision"]), now - 20 * DAY),
+        ("recent user turn", "interaction", json.dumps(["short_term", "user_turn"]), now - 2 * DAY),
+    ]
+    conn.executemany("INSERT INTO memories(text, kind, tags, timestamp) VALUES (?, ?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+    mem = MK1Memory.__new__(MK1Memory)
+    mem.db_path = str(db_path)
+    mem.interaction_retention_days = 90
+    mem.failed_decision_retention_days = 14
+    mem.retention_max_delete = 1000
+    mem.status = {}
+    mem._errors = []
+    mem._set_error = lambda message: mem._errors.append(message)
+    mem.backup = lambda reason, force=False: "backup-path"
+
+    def boom():
+        raise RuntimeError("simulated faiss failure")
+
+    mem._rebuild_indexes = boom
+
+    report = mem.run_retention_lifecycle(dry_run=False, now_ts=now)
+
+    assert report["ok"] is True
+    assert report["deleted"] == 1
+    assert any("retention_lifecycle_rebuild_error" in message for message in mem._errors)
+
+    check_conn = sqlite3.connect(db_path)
+    remaining = [row[0] for row in check_conn.execute("SELECT text FROM memories").fetchall()]
+    check_conn.close()
+    assert "old bad route" not in remaining
+    assert "recent user turn" in remaining

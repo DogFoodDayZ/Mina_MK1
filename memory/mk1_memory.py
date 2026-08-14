@@ -1090,12 +1090,18 @@ class MK1Memory:
             deleted = cur.rowcount
             conn.commit()
             conn.close()
-            # rebuild indexes after trim
-            self.small_index, self.base_index = self._rebuild_indexes()
-            return deleted
         except Exception as e:
             self._set_error(f"trim_by_age_error: {e}")
             return 0
+
+        # Why: a rebuild hiccup here is unrelated to whether the trim itself committed;
+        # it must not overwrite an already-successful delete with a false 0.
+        if deleted > 0:
+            try:
+                self.small_index, self.base_index = self._rebuild_indexes()
+            except Exception as e:
+                self._set_error(f"trim_by_age_rebuild_error: {e}")
+        return deleted
 
     @_tracked_memory_operation("trim_by_size", rejected=0)
     def trim_by_size(self, max_rows: int) -> int:
@@ -1120,11 +1126,17 @@ class MK1Memory:
             deleted = cur.rowcount
             conn.commit()
             conn.close()
-            self.small_index, self.base_index = self._rebuild_indexes()
-            return deleted
         except Exception as e:
             self._set_error(f"trim_by_size_error: {e}")
             return 0
+
+        # Why: same rationale as trim_by_age -- a rebuild failure must not hide a real delete.
+        if deleted > 0:
+            try:
+                self.small_index, self.base_index = self._rebuild_indexes()
+            except Exception as e:
+                self._set_error(f"trim_by_size_rebuild_error: {e}")
+        return deleted
 
     @_tracked_memory_operation(
         "memory_hygiene",
@@ -1233,19 +1245,8 @@ class MK1Memory:
                 placeholders = ",".join(["?"] * len(delete_ids))
                 cur.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", tuple(delete_ids))
                 conn.commit()
-                self.small_index, self.base_index = self._rebuild_indexes()
 
             conn.close()
-
-            return {
-                "ok": True,
-                "dry_run": dry_run,
-                "total_rows": len(rows),
-                "delete_count": len(delete_ids),
-                "delete_ids": delete_ids,
-                "samples": samples,
-            }
-
         except Exception as e:
             self._set_error(f"memory_hygiene_error: {e}")
             return {
@@ -1257,6 +1258,23 @@ class MK1Memory:
                 "samples": [],
                 "error": str(e),
             }
+
+        # Why: a rebuild failure here is unrelated to whether the hygiene delete above
+        # already committed; it must not turn a real, successful cleanup into ok=False.
+        if not dry_run and delete_ids:
+            try:
+                self.small_index, self.base_index = self._rebuild_indexes()
+            except Exception as e:
+                self._set_error(f"memory_hygiene_rebuild_error: {e}")
+
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "total_rows": len(rows),
+            "delete_count": len(delete_ids),
+            "delete_ids": delete_ids,
+            "samples": samples,
+        }
 
     # ================= MAINTENANCE CYCLE =================
 
@@ -1411,14 +1429,22 @@ class MK1Memory:
                 conn.commit()
                 conn.close()
                 conn = None
-                self.small_index, self.base_index = self._rebuild_indexes()
-
-            return report
         except Exception as e:
             if conn is not None:
                 conn.close()
             self._set_error(f"retention_lifecycle_error: {e}")
             return {"ok": False, "dry_run": bool(dry_run), "error": str(e)}
+
+        # Why: a rebuild failure here is unrelated to whether the retention delete and
+        # digests above already committed; it must not turn a real, successful report
+        # into a generic ok=False with the true deleted/digest counts lost.
+        if report.get("deleted"):
+            try:
+                self.small_index, self.base_index = self._rebuild_indexes()
+            except Exception as e:
+                self._set_error(f"retention_lifecycle_rebuild_error: {e}")
+
+        return report
 
     @_tracked_memory_operation("maintenance")
     def maintenance_tick(self):

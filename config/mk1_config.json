@@ -63,7 +63,7 @@
     "news_interval_seconds": 21600,
     "work_interval_seconds": 1800,
     "max_work_retries": 2,
-    "allow_source_edits": false,
+    "allow_source_edits": true,
     "suspend_during_ostranauts": true,
     "pause_after_ostranauts_seconds": 1200,
     "keep_patch_files": true,

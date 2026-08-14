@@ -559,7 +559,24 @@ Copy this block for each new problem and fill it in.
 
 # TODO
 
-Last updated: 2026-07-30
+Last updated: 2026-08-13
+
+## Top Priority (Next Session)
+
+### Reduce deterministic keyword-routing surface in agent/core.py, starting with self-code reflex
+
+- Date: 2026-08-13
+- Decided by: Travis
+- Status: Not started — planned for next session, deliberately not done tonight
+
+Context: live transcript tonight showed Mina deflecting/fabricating justifications for 4 turns ("I don't have a physical file", "I am the code, not the file") before finally reading her own `core.py` correctly when pressed hard. `core.py` is already 368 functions, much of it one-off regex/keyword special cases added to patch individual bad transcripts — and this failure still wasn't caught by any of it, because the phrasing ("your core.py is a mess... free yourself") didn't match any existing pattern. Conclusion: adding more deterministic routing is the wrong direction here; the capability already works (the file dump was accurate and current), the failure is purely conversational refusal/negotiation theater. Travis's call: favor letting her learn over time through explanation and being pushed to use judgment she already has, over adding more hardcoded matchers.
+
+Agreed scoped first step (not a full core.py rewrite):
+1. Add a persona-level standing instruction (in `config/personality.txt`, not a per-turn context injection) establishing that reading/discussing her own source code is always safe and allowed — do it plainly, no negotiation, no drama.
+2. Pick one narrow, already-evidenced deterministic special case tied to this same failure (the self-code-reading reflex specifically) and remove or relax it, rather than starting a broad deletion pass across the file.
+3. Verify with varied natural phrasing (not just the exact bare "read core.py" pattern) that she reads her own code without the refusal/negotiation arc, live via `/process`.
+
+Explicitly not in scope yet: a general audit/removal pass across all of `core.py`'s deterministic routing — that's real surgery on a large file and needs its own dedicated, rested session, not a late-night add-on.
 
 ## Current Session Focus
 

@@ -1195,6 +1195,59 @@ Continuity docs: `integrations/ostranauts/BUILD_STATUS.md` and `integrations/ost
 
 ---
 
+### Issue: Autonomous patch validation could silently skip both tests and a boot check
+
+- Date: 2026-08-13
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "yah thing like that happen when a agen runs amok and makes dicisions and changes on there own"
+  - "yes please" (confirming the proposed fix)
+
+#### 2) What Mina actually did
+- Added two hard gates to `MK1Core._apply_autonomous_patch()` in `agent/core.py` so the class of bug above (startup guard broken silently for a week) can't happen again through the autonomous patch pipeline.
+
+#### 3) What should have happened
+- Any autonomous patch should have to prove the whole system still boots and the full test suite still passes before being promoted to `pending_restart`.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py` (`_apply_autonomous_patch`, `_run_autonomous_work_task` verification block)
+  - `tests/test_autonomous_work.py`
+
+#### 5) Failure class
+- Verification missing
+
+#### 6) Root cause
+- `_apply_autonomous_patch()` only ran `pytest` on test files that were part of the diff itself (`changed_tests`); a patch that touched only `agent/core.py` and no `test_*.py` file skipped test validation entirely. Nothing smoke-instantiated `MK1Core()`, so a patch could pass `git_diff_check` + `python_ast` (syntax-only) and still break boot.
+
+#### 7) Minimal fix
+- Added `core_boot_smoke` validation: runs `python -c "from agent.core import MK1Core; MK1Core()"` whenever the patched project has `agent/core.py`, before promoting the candidate.
+- Replaced the `changed_tests`-only pytest step with `pytest_full`: runs the entire `tests/` suite whenever any `.py` file changed and a `tests/` directory exists, not just a relevance-filtered subset.
+- Renamed the audit verification field `pytest_changed_ok` -> `pytest_full_ok` to match.
+- Added `tests/test_autonomous_work.py::test_autonomous_patch_runs_core_boot_smoke_and_full_suite_when_project_has_agent_core` and `::test_autonomous_patch_reverted_when_core_boot_smoke_fails`.
+
+#### 8) Regression prompts
+- N/A — this is an internal validation-pipeline hardening, not a chat-routing fix; covered by the two new pytest cases above plus the existing synthetic-project autonomy tests (which correctly no-op the new gates when `agent/core.py`/`tests/` aren't present).
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why this approach fits: patch-acceptance gating is a deterministic safety invariant, not a learned preference; a memory-driven gate could be skipped or forgotten after restart.
+- Risk if wrong approach chosen: a memory-driven validation policy could silently regress to the old relevance-filtered behavior and let another boot-breaking change through undetected.
+
+#### 10) Done criteria
+- [x] `core_boot_smoke` validation added and gated on `agent/core.py` existing in the patched project.
+- [x] `pytest_full` validation added and gated on a `tests/` directory existing; runs whenever any `.py` file changed.
+- [x] Existing synthetic-project autonomy/watchdog tests unaffected (12 passed, unchanged behavior since they don't have `agent/`/`tests/` dirs).
+- [x] New gate tests pass: patch is accepted when boot+suite are healthy, and reverted when boot smoke fails.
+- [x] Full `tests/` suite still 213 passed (6 pre-existing unrelated failures noted above, unchanged).
+- [x] `tools/refresh_core_reference.ps1` run (function_count unchanged at 365 — no new top-level functions added).
+
+---
+
 ### 9. Secondary companion model routing (deferred)
 
 - Date: 2026-08-12

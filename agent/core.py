@@ -6081,16 +6081,32 @@ class MK1Core:
                     timeout=60,
                 )
                 validations.append({"name": "python_ast", "ok": compile_check.returncode == 0, "output": (compile_check.stdout + compile_check.stderr).strip()[:2000]})
-            changed_tests = [path for path in relative_paths if path.lower().endswith(".py") and os.path.basename(path).lower().startswith("test_")]
-            if changed_tests:
-                test_check = subprocess.run(
-                    [sys.executable, "-m", "pytest", "-q", *changed_tests],
+            # Why: a patch can be syntactically valid yet still break MK1Core() construction
+            # (e.g. the 2026-08-05 startup-guard regression that shipped undetected for a week).
+            # Guard: smoke-instantiate the real core before promoting any candidate that touches it.
+            core_module = os.path.join(project_root, "agent", "core.py")
+            if os.path.isfile(core_module):
+                boot_check = subprocess.run(
+                    [sys.executable, "-c", "from agent.core import MK1Core; MK1Core()"],
                     cwd=project_root,
                     capture_output=True,
                     text=True,
-                    timeout=600,
+                    timeout=90,
                 )
-                validations.append({"name": "pytest_changed", "ok": test_check.returncode == 0, "output": (test_check.stdout + test_check.stderr).strip()[-4000:]})
+                validations.append({"name": "core_boot_smoke", "ok": boot_check.returncode == 0, "output": (boot_check.stdout + boot_check.stderr).strip()[-4000:]})
+            # Why: validating only the test files a patch happened to touch let unrelated regressions
+            # (like the startup guard above) slip through untested for over a week.
+            # Guard: run the full suite whenever any Python file changed, not a relevance-filtered subset.
+            tests_dir = os.path.join(project_root, "tests")
+            if python_files and os.path.isdir(tests_dir):
+                test_check = subprocess.run(
+                    [sys.executable, "-m", "pytest", "-q", "tests"],
+                    cwd=project_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=900,
+                )
+                validations.append({"name": "pytest_full", "ok": test_check.returncode == 0, "output": (test_check.stdout + test_check.stderr).strip()[-4000:]})
             if not all(item["ok"] for item in validations):
                 subprocess.run(["git", "-C", project_root, "apply", "-R", patch_path], capture_output=True, timeout=30)
                 candidate["phase"] = "validation_failed_reverted"
@@ -6281,15 +6297,15 @@ class MK1Core:
         raw_validations: List[Any] = validations_value if isinstance(validations_value, list) else []
         validation_items: List[Dict[str, Any]] = [item for item in raw_validations if isinstance(item, dict)]
         validations_ok = bool(validation_items) and all(bool(item.get("ok")) for item in validation_items)
-        pytest_changed_ok = any(
-            item.get("name") == "pytest_changed" and bool(item.get("ok"))
+        pytest_full_ok = any(
+            item.get("name") == "pytest_full" and bool(item.get("ok"))
             for item in validation_items
         )
         result["verification"] = {
             "policy": "verified_completion_requires_structured_proof",
             "patch_applied": patch_applied,
             "validations_ok": validations_ok,
-            "pytest_changed_ok": pytest_changed_ok,
+            "pytest_full_ok": pytest_full_ok,
             "live_api_proof": False,
             "completion_verified": patch_applied and bool(patch_result.get("ok", False)),
         }

@@ -150,6 +150,75 @@ def test_clean_autonomous_patch_applies_and_validates(tmp_path):
     assert candidate["created_files"] == []
 
 
+def test_autonomous_patch_runs_core_boot_smoke_and_full_suite_when_project_has_agent_core(tmp_path):
+    project_root = tmp_path / "project"
+    agent_dir = project_root / "agent"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "__init__.py").write_text("", encoding="utf-8")
+    (agent_dir / "core.py").write_text("class MK1Core: pass\n", encoding="utf-8")
+    tests_dir = project_root / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    initialize_git_project(project_root)
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    watchdog_dir = tmp_path / "watchdog"
+    core.config = FakeConfig({
+        ("curiosity", "keep_patch_files"): False,
+        ("curiosity", "watchdog_dir"): str(watchdog_dir),
+    })
+
+    patch = make_patch("class MK1Core: pass", "class MK1Core: pass  # patched").replace("sample.py", "agent/core.py")
+
+    result = core._apply_autonomous_patch(patch, str(project_root))
+
+    assert result["ok"] is True
+    names = [item["name"] for item in result["validations"]]
+    assert "core_boot_smoke" in names
+    assert "pytest_full" in names
+    assert all(item["ok"] for item in result["validations"])
+
+
+def test_autonomous_patch_reverted_when_core_boot_smoke_fails(tmp_path):
+    project_root = tmp_path / "project"
+    agent_dir = project_root / "agent"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "__init__.py").write_text("", encoding="utf-8")
+    (agent_dir / "core.py").write_text(
+        "class MK1Core:\n    def __init__(self):\n        pass\n",
+        encoding="utf-8",
+    )
+    initialize_git_project(project_root)
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    watchdog_dir = tmp_path / "watchdog"
+    core.config = FakeConfig({
+        ("curiosity", "keep_patch_files"): False,
+        ("curiosity", "watchdog_dir"): str(watchdog_dir),
+    })
+
+    patch = (
+        "diff --git a/agent/core.py b/agent/core.py\n"
+        "--- a/agent/core.py\n"
+        "+++ b/agent/core.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " class MK1Core:\n"
+        "     def __init__(self):\n"
+        "-        pass\n"
+        "+        raise RuntimeError(\"boom\")\n"
+    )
+
+    result = core._apply_autonomous_patch(patch, str(project_root))
+
+    assert result["ok"] is False
+    assert result["error"] == "validation_failed_patch_reverted"
+    boot_check = next(item for item in result["validations"] if item["name"] == "core_boot_smoke")
+    assert boot_check["ok"] is False
+    assert (agent_dir / "core.py").read_text(encoding="utf-8") == "class MK1Core:\n    def __init__(self):\n        pass\n"
+
+
 def test_autonomous_patch_refuses_preexisting_user_changes(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()

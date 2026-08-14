@@ -804,13 +804,14 @@ def _task_queue_status(limit: int = 5) -> dict:
             )
         )
 
-        out["available"] = bool(queued_items)
+        # queue reachability, not emptiness: zero pending tasks is a valid healthy state
+        out["available"] = True
         out["due_count"] = due_count
         out["queued_count"] = len(queued_items)
         out["preview"] = queued_items[:safe_limit]
         return out
     except Exception as e:
-        out["available"] = bool(hasattr(getattr(core, "memory", None), "get_task_memories"))
+        out["available"] = False
         out["error"] = str(e)
         return out
 

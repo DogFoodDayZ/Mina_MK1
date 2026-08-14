@@ -45,10 +45,12 @@ def test_powershell_tool_runs_multiple_commands_in_one_call():
 
 
 def test_core_detects_system_queries_for_ps_run():
+    # Contract update 2026-08-05: broad "what system am I running on" keyword
+    # routing was removed (model decides); only the narrow probe-cpu phrasing
+    # required by _validate_required_tool_routes() still forces ps_run.
     core = MK1Core()
-    name, args = core.detect_tool_intent('what system am i running on?')
-    assert name == 'ps_run'
-    assert 'Get-ComputerInfo' in args['script']
+    name, _args = core.detect_tool_intent('what system am i running on?')
+    assert name != 'ps_run'
 
 
 def test_ps_run_rejects_unapproved_directory_paths():

@@ -13710,6 +13710,17 @@ IMPORTANT RULES:
             or re.search(r"\b(cpu|gpu|gpus|graphics|ram|memory|disk|storage|hard drive|hard drives|drive|drives)\b.*\b(number of|count of|how many|how much)\b", t) is not None
         )
 
+        # Why: _validate_required_tool_routes() fails startup unless "probe the CPU" routes to ps_run.
+        # Guard: narrow probe/check/inspect verb + cpu/processor noun only; does not resurrect the
+        # removed hardware_count_query/system_query_terms keyword routing (model decides those; see
+        # tests/test_transcript_regression_prompts.py "Contract update 2026-08-05").
+        cpu_probe_query = bool(
+            re.search(r"\b(probe|check|inspect|query|scan)\b.*\b(cpu|processor)\b", t)
+            or re.search(r"\b(cpu|processor)\b.*\b(probe|check|inspect|query|scan)\b", t)
+        )
+        if cpu_probe_query and "ps_run" in self._tool_registry():
+            return "ps_run", {"script": _infer_ps_command(raw_text)}
+
         if re.match(r'^(run|execute|start)\b', t):
             path_like = re.search(r'([A-Za-z]:\\|[.]{1,2}[\\/]|\.(ps1|py|bat|cmd)\b)', raw_text, re.IGNORECASE) is not None
             alias_hit = self._resolve_path_alias(raw_text) is not None

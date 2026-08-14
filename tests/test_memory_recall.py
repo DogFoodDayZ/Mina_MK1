@@ -577,14 +577,14 @@ def test_detect_memory_write_strips_save_suffix():
     assert args["text"] == "my eyes are deep water blue"
 
 
-def test_detect_system_question_routes_to_ps_run():
+def test_detect_system_question_does_not_force_ps_run():
+    # Contract update 2026-08-05: hardware/system keyword routing removed — model decides
     core = MK1Core.__new__(MK1Core)
+    core.tools = SimpleNamespace(tools={"ps_run": object()})
 
-    tool_name, args = MK1Core.detect_tool_intent(core, "what cpu are you on?")
+    tool_name, _args = MK1Core.detect_tool_intent(core, "what cpu are you on?")
 
-    assert tool_name == "ps_run"
-    assert "Win32_Processor" in args["script"]
-    assert "NumberOfCores" in args["script"]
+    assert tool_name is None
 
 
 def test_hardware_question_is_command_like_for_reflex_execution():
@@ -593,13 +593,13 @@ def test_hardware_question_is_command_like_for_reflex_execution():
     assert MK1Core._is_command_like_query(core, "how much physical ram is on a rx 6700 tx") is True
 
 
-def test_detect_time_question_routes_to_ps_run():
+def test_detect_time_question_does_not_force_ps_run():
+    # Contract update 2026-08-05: hardware/system keyword routing removed — model decides
     core = MK1Core.__new__(MK1Core)
 
-    tool_name, args = MK1Core.detect_tool_intent(core, "what time is it?")
+    tool_name, _args = MK1Core.detect_tool_intent(core, "what time is it?")
 
-    assert tool_name == "ps_run"
-    assert args["script"] == 'Get-Date -Format "yyyy-MM-dd HH:mm:ss"'
+    assert tool_name is None
 
 
 def test_detect_gpu_model_vram_question_routes_to_web_search_when_available():
@@ -727,7 +727,11 @@ def test_detect_code_execute_for_powershell_phrase():
 
 
 def test_detect_ps_run_for_probe_cpu_phrase():
+    # Required by MK1Core._validate_required_tool_routes() startup guard; narrow
+    # probe/check + cpu/processor match only, does not resurrect removed hardware
+    # count/system keyword routing (see contract-update tests below).
     core = MK1Core.__new__(MK1Core)
+    core.tools = SimpleNamespace(tools={"ps_run": object()})
 
     tool_name, args = MK1Core.detect_tool_intent(core, "yes lets probe the CPU and see what comes up")
 

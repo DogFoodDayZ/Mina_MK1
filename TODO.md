@@ -1141,6 +1141,75 @@ Continuity docs: `integrations/ostranauts/BUILD_STATUS.md` and `integrations/ost
 - [x] Keep the initial bridge read-only with no save edits, console commands, patches, or game-changing actions.
 - [ ] Add an easy refresh command for rescanning changed saves, logs, and mods during a play session.
 
+### Issue: Startup route guard could crash the live API after the Aug 5 hardware-keyword removal
+
+- Date: 2026-08-13
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "well mina has been working on herself using her autonomous system we need to see if she has actually made any changes and get her to be useful"
+
+#### 2) What Mina actually did
+- Found an uncommitted, undocumented WIP edit in `agent/core.py` (a `cpu_probe_query` branch bundled with the already-dead `system_query_terms`/`hardware_count_query` variables) sitting in the working tree since a prior session, with no TODO entry or passing tests.
+
+#### 3) What should have happened
+- `MK1Core._validate_required_tool_routes()` (added 2026-07-13) fails fast at startup unless `"probe the CPU and see what comes up"` routes to `ps_run`. The Aug 5 commit `d4e32a6` ("remove Spotify and hardware keyword routing blocks ... model handles these now") deleted the only code path that satisfied this probe, without updating the guard or the three stale tests that depended on the old keyword routing. Committed HEAD currently crashes with `RuntimeError: required_tool_routes_missing` on any fresh `MK1Core()` instantiation (verified live: `python -c` construction and `pytest tests/test_ps_run.py::test_core_detects_system_queries_for_ps_run` both crash on unmodified HEAD).
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py` (`_validate_required_tool_routes`, `detect_tool_intent`)
+  - `tests/test_memory_recall.py`, `tests/test_ps_run.py`
+- Error text (exact):
+  - `RuntimeError: required_tool_routes_missing: probe the CPU and see what comes up -> expected ps_run, got None`
+
+#### 5) Failure class
+- Verification missing (Aug 5 commit removed routing without re-running the full test suite or the startup guard)
+
+#### 6) Root cause
+- `d4e32a6` deleted the combined system/hardware/cpu keyword-routing block wholesale to stop unwanted hardware-count keyword routing, but `_validate_required_tool_routes()` still hard-requires one specific phrase (`"probe the CPU..."`) to route to `ps_run`, and three old tests (`test_detect_system_question_routes_to_ps_run`, `test_detect_time_question_routes_to_ps_run`, `test_detect_ps_run_for_probe_cpu_phrase`, `test_core_detects_system_queries_for_ps_run`) still asserted the old keyword-routing behavior.
+
+#### 7) Minimal fix
+- Added a narrow, isolated `cpu_probe_query` check in `detect_tool_intent` (probe/check/inspect/query/scan + cpu/processor only, gated on `"ps_run" in self._tool_registry()`) that satisfies the startup guard's exact required phrase without resurrecting the removed `hardware_count_query`/`system_query_terms` keyword routing.
+- Updated the four stale tests to match the current "model decides" contract for general system/time/hardware questions, while keeping one narrow assertion for the literal probe-cpu phrase the guard requires.
+- Fixed `_task_queue_status()` in `agent/server/mk1_api.py` so `available` reflects queue reachability (not emptiness) — an unrelated pending fix found in the same uncommitted diff; added `tests/test_task_queue_status.py` covering both the empty-queue and lookup-error paths.
+
+#### 8) Regression prompts
+- Prompt 1: "probe the CPU and see what comes up" → must still route to `ps_run` (startup guard contract).
+- Prompt 2: "what cpu are you on?" / "what time is it?" / "what system am I running on?" → must NOT force `ps_run` (model decides, per Aug 5 contract).
+- Prompt 3: "how many gpu's are there?" / "what is the number of hard drives?" → must remain `None` (unchanged Aug 5 contract, still passing).
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded
+- Why this approach fits: the startup route guard is a deterministic boot-time safety invariant, not a learned preference; the fix must satisfy it without widening keyword-trap surface elsewhere.
+- Risk if wrong approach chosen: a memory-driven fix could stop satisfying the guard after restart/cold-start and reintroduce the boot crash, or could drift back into broad hardware-keyword routing the team deliberately removed.
+
+#### 10) Done criteria
+- [x] `_validate_required_tool_routes()` passes on a fresh `MK1Core()` instantiation.
+- [x] No regression on the Aug 5 "model decides" contract tests (gpu/hard-drive count, general system/time questions).
+- [x] `tools/refresh_core_reference.ps1` run; `agent/core_index.json` function_count updated to 365.
+- [x] Focused suite green: `tests/test_memory_recall.py`, `tests/test_ps_run.py`, `tests/test_task_queue_status.py`, `tests/test_status_cache.py`, `tests/test_transcript_regression_prompts.py` — 134 passed.
+- Note: `tests/test_api_memory_flow.py::test_api_process_save_then_recall` and 5 tests in `tests/test_intent_ambiguity.py` fail independently of this fix (reproduced on unmodified HEAD with `MK1_SKIP_ROUTE_GUARD=1`); left out of scope, flagged for separate follow-up.
+
+---
+
+### 9. Secondary companion model routing (deferred)
+
+- Date: 2026-08-12
+- Priority: Low (explicitly deferred, work on later)
+- Status: Not started
+
+Context: user asked about running a small NSFW companion model alongside Mina's current qwen setup. Confirmed live that LM Studio already keeps `qwen/qwen3.5-9b` and `tinyllama-nsfw-chatbot-i1` loaded simultaneously (no eviction) and RAM headroom is fine. Gap is entirely in `agent/core.py`, which has no per-call model override today.
+
+- [ ] Add `model_override` kwarg to `LMStudioClient.chat()` in `agent/core.py` so a request can target a non-default model without changing `self.default_model`.
+- [ ] Add a `model.companion_model` config key in `config/mk1_config.json` (separate from `switch_allowed`/`default_model`) for the secondary model id.
+- [ ] Add an explicit user-triggered toggle/command to route into companion mode (per product contract: no keyword-trap/hidden mode switching, must be an explicit action).
+- [ ] Decide whether companion turns share Mina's persona/memory or get a separate system prompt and memory tag/namespace so they don't pollute authoritative profile memory.
+- [ ] Implementation choice: hardcoded routing gate (explicit toggle contract) + memory-driven for the companion persona content itself.
+- [ ] Regression prompts (add once implemented): explicit companion-mode toggle phrase routes to `tinyllama-nsfw-chatbot-i1`; normal prompts with no toggle stay on `qwen/qwen3.5-9b`; toggling back to Mina restores default model routing.
+
 ## Release Hygiene
 
 - [ ] Review the current uncommitted backend, Android, memory, and fancy-GUI changes as one integration batch.
@@ -1193,3 +1262,19 @@ When Mina writes PS1 scripts with emoji, they show as garbage in a Windows termi
 **Fix she needs to discover:** Add `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8` at the top of PS1 scripts with emoji.
 
 **How to trigger the lesson:** Tell her the emoji don't show in PowerShell and let her debug it.
+
+---
+
+## Side Quest: Amuse Image Generation Bridge
+*Added 2026-08-12. Low priority, just for fun — work on it when there's nothing higher-value queued.*
+
+Goal: let Mina generate images locally using Amuse (`C:\Program Files\Amuse`, models in `C:\Users\Admin\AppData\Local\Amuse\Models`).
+
+Investigated live: Amuse v3.1.0 is a WPF app built on OnnxStack + DirectML (AMD RX 6700 XT), already has SD1.5/SDXL/SD3-medium/FLUX.1-Schnell/Dreamshaper/Juggernaut/ControlNet models downloaded. It hosts an internal ASP.NET Core Generic Host for DI/logging only — no listening port, no documented REST API, no CLI/batch/watch-folder automation found in logs or `appsettings.json`.
+
+- [ ] Decide path: (A) UI automation of the Amuse window (fast, fragile, hard to verify deterministically) vs (B) standalone .NET/OnnxStack sidecar service exposing a minimal local HTTP `/generate` endpoint (same pattern as `Memory_server/mk1_embed_server.py`), reusing the already-downloaded ONNX models.
+- [ ] If (B): scaffold a small C#/.NET project referencing OnnxStack, load one existing model folder, wire a DirectML pipeline, return image bytes/path from a local endpoint.
+- [ ] Add `tools/image_generate.py` (same shape as `tools/web_fetch.py`) that POSTs prompt/params to the sidecar and returns the result.
+- [ ] Add intent routing in `agent/core.py` for "generate an image of ..." / "draw ..." style prompts.
+- [ ] Verification: saved image file must exist at a known path before Mina reports success (per verification contract — no claiming an image was made without a real file on disk).
+- [ ] Regression prompts once implemented: "draw a picture of a raccoon playing guitar", "generate an image of a mountain landscape", "make me an image" (missing subject → should ask one clarification, not invent a prompt).

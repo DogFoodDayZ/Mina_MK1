@@ -2,7 +2,7 @@
   "model": {
     "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
     "load_endpoint": "http://127.0.0.1:1234/api/v1/models/load",
-    "default_model": "qwen/qwen3.5-9b",
+    "default_model": "mistral-nemo-2407-12b-thinking-claude-gemini-gpt5.2-uncensored-heretic",
     "auto_fallback_on_error": false,
     "request_timeout_seconds": 240,
     "max_tokens": 4096,

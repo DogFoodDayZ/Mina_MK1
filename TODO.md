@@ -248,6 +248,32 @@ Copy this block for each new problem and fill it in.
 
 ---
 
+### Issue: Core called memory APIs that MK1Memory does not implement
+
+- Date: 2026-08-25
+- Reporter: Pylance / runtime inspection
+- Priority: High
+- Status: Done
+
+#### Root cause
+- `agent/core.py` called `memory.store()` for file-operation history and `memory.recall()` for planner context, but `MK1Memory` only implements `add_memory()`, `recent_memories()`, and `search()`.
+- The old calls were hidden by `try/except`, so file locations were silently not being recorded and planner context silently failed.
+
+#### Minimal fix
+- Mapped file creation/read records to `add_memory()` with operation/path context and file-operation tags.
+- Mapped planner lookup to `search()` filtered to interaction/file-operation memories.
+- Updated the planner argument annotation to accept the existing dictionary-or-string input.
+- Did not remove important file-operation memory and did not add automatic retry-lesson writes.
+
+#### Verification
+- Focused memory, tool, and model tests: `102 passed`.
+- `core.py` and `ps_run.py` compile successfully.
+- Stale `self.memory.store()` calls: `0`.
+- Stale `self.memory.recall()` calls: `0`.
+- Four original Pylance errors resolved; remaining diagnostics are severity-4 unused-symbol hints.
+
+---
+
 ### Issue: Learned hardware tool call combined invalid CIM class with second command
 
 - Date: 2026-08-25

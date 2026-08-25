@@ -19,7 +19,7 @@ import mimetypes
 import py_compile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
@@ -12002,10 +12002,10 @@ class MK1Core:
             file_path = tool_args.get("path", "")
             if file_path:
                 try:
-                    self.memory.store(
-                        category="recent file operations",
-                        text=f"Created file: {file_path}",
-                        metadata={"operation": "write", "path": file_path, "turn_input": user_input},
+                    self.memory.add_memory(
+                        f"Recent file operation: created file at {file_path} (request: {user_input})",
+                        kind="interaction",
+                        tags=["short_term", "tool_result", "file_operation", "file_write"],
                     )
                 except Exception:
                     pass
@@ -12015,10 +12015,10 @@ class MK1Core:
             file_path = tool_args.get("path", "")
             if file_path:
                 try:
-                    self.memory.store(
-                        category="recent file operations",
-                        text=f"Read file: {file_path}",
-                        metadata={"operation": "read", "path": file_path, "turn_input": user_input},
+                    self.memory.add_memory(
+                        f"Recent file operation: read file at {file_path} (request: {user_input})",
+                        kind="interaction",
+                        tags=["short_term", "tool_result", "file_operation", "file_read"],
                     )
                 except Exception:
                     pass
@@ -14134,7 +14134,7 @@ IMPORTANT RULES:
 
         return None
 
-    def _sanitize_planned_tool_args(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def _sanitize_planned_tool_args(self, tool_name: str, args: Union[Dict[str, Any], str]) -> Dict[str, Any]:
         # If model returned args as a string instead of dict, coerce it to the right field
         if isinstance(args, str):
             if tool_name in {"ps_run", "powershell"}:
@@ -14222,9 +14222,14 @@ IMPORTANT RULES:
         context_addition = ""
         if any(phrase in user_text_lower for phrase in ["created", "just made", "the file you", "that file", "read back", "what did you"]):
             try:
-                recent = self.memory.recall("recent file operations", limit=3)
-                if recent and recent.get("results"):
-                    context_lines = [str(r.get("text", "")) for r in recent.get("results", [])[:2]]
+                recent = self.memory.search(
+                    "recent file operations",
+                    top_k=3,
+                    include_kinds=["interaction"],
+                    include_tags=["file_operation"],
+                )
+                if recent:
+                    context_lines = [str(r.get("text", "")) for r in recent[:2]]
                     if context_lines:
                         context_addition = "\n\nRecent context: " + " | ".join(context_lines)
             except Exception:

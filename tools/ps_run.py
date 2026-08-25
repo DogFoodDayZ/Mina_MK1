@@ -51,6 +51,23 @@ def _normalize_command(script: str) -> str:
 
     lowered = text.lower().strip()
 
+    if "win32_computersystemprocessor" in lowered and "get-ciminstance" in lowered:
+        return (
+            "$cpu = Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed; "
+            "$gpu = Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM; "
+            "Write-Output 'CPU:'; $cpu; Write-Output ''; Write-Output 'GPU:'; $gpu"
+        )
+
+    if (
+        re.search(r"get-wmiobject\s+win32_processor\s*,\s*win32_videocontroller", lowered)
+        or re.search(r"get-ciminstance\s+win32_processor\s*,\s*win32_videocontroller", lowered)
+    ):
+        return (
+            "$cpu = Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed; "
+            "$gpu = Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM; "
+            "Write-Output 'CPU:'; $cpu; Write-Output ''; Write-Output 'GPU:'; $gpu"
+        )
+
     if lowered in {"hardware info", "list hardware", "list the current hardware"}:
         return "Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsHardwareAbstractionLayer"
 

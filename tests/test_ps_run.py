@@ -112,6 +112,24 @@ def test_normalize_command_rewrites_invalid_get_processor_variant():
     assert "Win32_Processor" in cmd
 
 
+def test_normalize_command_repairs_malformed_combined_cim_query():
+    cmd = ps_run._normalize_command(
+        "Get-CimInstance Win32_ComputerSystemProcessor Get-CimInstance Win32_VideoController"
+    )
+    assert "Win32_Processor" in cmd
+    assert "Win32_VideoController" in cmd
+    assert "Win32_ComputerSystemProcessor" not in cmd
+
+
+def test_normalize_command_repairs_comma_separated_wmi_classes():
+    cmd = ps_run._normalize_command(
+        "Get-WmiObject Win32_Processor, Win32_VideoController | Format-List *"
+    )
+    assert "Win32_Processor" in cmd
+    assert "Win32_VideoController" in cmd
+    assert "Win32_Processor, Win32_VideoController" not in cmd
+
+
 def test_normalize_command_rewrites_probe_cpu_request_with_filler_words():
     cmd = ps_run._normalize_command("yes lets probe the CPU and see what comes up.")
     assert "Win32_Processor" in cmd

@@ -13,6 +13,8 @@ Use this before applying any autonomous or semi-autonomous change.
 
 ## Non-Negotiable Rules
 
+- Memory is Mina. Learned memory and user context are the default source of truth for normal behavior.
+- Do not bypass Mina's memory with hardcoded chat or routing rules for ordinary prompts.
 - Do not claim an action was run unless tool output for that action exists in the same turn.
 - If a required argument is missing, ask one targeted question and stop.
 - If user confirms run now, execute now. Do not re-explain.

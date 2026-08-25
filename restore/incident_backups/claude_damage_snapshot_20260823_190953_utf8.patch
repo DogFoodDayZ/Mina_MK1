@@ -1,0 +1,1831 @@
+﻿diff --git a/TODO.md b/TODO.md
+index cf6c0d1..db15471 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -40,7 +40,7 @@ Selected tool.
+ Required arguments.
+ Confidence score.
+ If required arguments are missing, do not execute.
+-Ask one targeted clarification with the exact missing field.
++Ask whatever clarifying questions are useful, remember the answers, and continue once the request is sufficiently understood.
+ On low confidence, ask clarification instead of guessing.
+ Never fallback to unrelated scripted prompts.
+ 5) Verification Contract (Must Run After Any Action)
+@@ -59,7 +59,7 @@ Confirm destination exists after.
+ If verification fails:
+ Report failure plainly.
+ Retry once with corrected arguments.
+-If still failing, ask one precise question.
++If still failing, ask whatever precise follow-up questions are needed and remember the answers.
+ 6) Conversation Behavior Contract
+ 
+ Keep Mina personality and tone.
+@@ -247,6 +247,67 @@ Copy this block for each new problem and fill it in.
+ 
+ ---
+ 
++### Issue: Greetings were being pulled into autonomous task mode
++
++- Date: 2026-08-17
++- Reporter: User
++- Priority: High
++- Status: In Progress
++
++#### 1) What I asked Mina to do
++- Exact prompt(s):
++  - hi
++  - hello
++
++#### 2) What Mina actually did
++- Actual response:
++  - Simple greetings were taking the long autonomous/task-oriented path and timing out around 180 seconds.
++- Actual action taken:
++  - The turn prompt was still injecting due-task guidance on casual chat turns.
++
++#### 3) What should have happened
++- Expected response:
++  - A short chat reply with no autonomous task escalation.
++- Expected action/result:
++  - Keep greetings on the normal chat path unless the user explicitly asks for task work.
++
++#### 4) Evidence
++- Transcript snippet:
++  - User reported that `hi` and `hello` were generating a 180 second timeout.
++- File path(s) affected:
++  - [agent/core.py](agent/core.py)
++- Error text (exact):
++  - 180 second timeout
++
++#### 5) Failure class (pick one)
++- Persona/response contract broken
++
++#### 6) Root cause (after investigation)
++- The turn builder always appended the due-task system prompt when pending tasks existed, and that prompt told Mina to work on tasks before unrelated replies. Casual chat like greetings therefore inherited autonomous work instructions.
++
++#### 7) Minimal fix
++- Gate the due-task prompt behind a hardcoded chat/action check so greetings and other casual prompts do not inherit autonomous work instructions.
++
++#### 8) Regression prompts (must pass)
++- Prompt 1: hi
++- Prompt 2: hello
++- Prompt 3: what should you work on right now?
++
++#### 9) Done criteria
++- [ ] Correct tool class selected
++- [ ] Correct args built
++- [ ] Action verified with proof
++- [ ] No regression on prompts above
++- [ ] Mina tone/conciseness still correct
++
++#### 10) Implementation choice
++- Chosen approach: hardcoded
++- Why this approach fits: Prompt-gating for autonomous task injection is a deterministic routing rule, not a learned preference, so it should not depend on memory.
++- Risk if wrong approach chosen: a memory-driven gate would drift with context and could reintroduce autonomous escalation on ordinary greetings.
++- Regression prompt proving choice: `hi` must stay on the chat path and not inherit the due-task prompt.
++
++---
++
+ ### Issue: Traceback paste reads file but does not repair broken Python source
+ 
+ - Date: 2026-07-26
+@@ -552,17 +613,325 @@ Copy this block for each new problem and fill it in.
+ ## Churn Stop Rules
+ 
+ 1. No fix is accepted without at least one real transcript prompt added to regression tests.
+-2. If required action arguments are missing, Mina must ask one targeted question and stop.
++2. If required action arguments are missing, Mina may ask as many useful questions as needed, must remember the answers, and must not make the user restart the explanation.
+ 3. For file/code tasks, Mina must verify the result and show proof in the reply.
+ 4. Tool inventory and internal routing details are hidden unless explicitly requested.
+ 5. Build/generate intent outranks direct move/rename intent unless source and destination are explicit.
+ 
+ # TODO
+ 
+-Last updated: 2026-08-13
++Last updated: 2026-08-17
+ 
+ ## Top Priority (Next Session)
+ 
++### Issue: Agent-caused memory corruption displaced Mina's real context
++
++- Date: 2026-08-17
++- Reporter: Travis
++- Priority: Critical
++- Status: Open - recovery investigation required
++
++#### What happened
++- Agent changes treated Mina's remembered Tickle script as a generic artifact/path problem and repeatedly injected new interpretations, aliases, context records, and action records into the live memory system.
++- The bad path `time.sleep` and the generated path `E:\workspace\time.sleep` were allowed to compete with the real Tickle Mina scripts.
++- Conversation turns containing pasted/recalled code were incorrectly treated as new artifact memories.
++- Mina began injecting Tickle context into unrelated questions, including identity and family questions.
++- Mina's memory of Travis's mother and their relationship is now missing from retrieval or displaced by corrupted context. Do not assume the records are deleted until backups are compared.
++
++#### Evidence
++- Unrelated prompts such as `who am I?` and `what do you know of my family?` returned Tickle script content and the false `E:\workspace\time.sleep` path.
++- A `code_execute` failure was followed by a false file location and later a wrong `file_write` path.
++- Database inspection found contaminated `code_artifact` rows such as `path=core.py`, `path=time.sleep`, and `path=E:\workspace\time.sleep`.
++- Real user-supplied artifacts are `E:\workspace\tickle_mina.py` and `E:\workspace\tickles_mina.ps1`.
++
++#### Root cause
++- The agent treated its interpretation of Mina as authoritative and wrote that interpretation into Mina's memory/context layers.
++- Artifact content, artifact identity, saved file path, execution result, and conversational context were not kept as separate linked records.
++- The agent continued adding fixes after observing wrong live behavior instead of stopping and reporting the regression.
++
++#### Required recovery rules
++- Do not write, delete, clean, alias, seed, or rewrite Mina memories during recovery without explicit approval for that specific operation.
++- First perform read-only comparison of current memory against pre-session backups.
++- Preserve the current database before any recovery operation.
++- Separate original/user-provided memories from agent-created corruption.
++- Do not infer or recreate family memories. Restore only from verified evidence.
++- Treat `E:\workspace\tickle_mina.py` and `E:\workspace\tickles_mina.ps1` as the supplied real artifacts; do not promote `time.sleep`, `core.py`, or `E:\workspace\time.sleep` as their identity.
++
++#### Done criteria
++- [ ] Current memory database and relevant backups are inventoried read-only.
++- [ ] Family-memory presence is compared across backup layers without modifying them.
++- [ ] Agent-created corrupted rows are identified with evidence.
++- [ ] A recovery plan is approved before any memory mutation.
++- [ ] No new memory corruption occurs during investigation.
++
++### Scope: Rebuild Mina's continuity kernel before touching the GUI
++
++- Date: 2026-08-17
++- Reporter: Travis
++- Priority: Critical
++- Status: Active this week
++
++#### This week's work
++- Focus only on Mina's behavioral continuity kernel in `E:\Mina_MK1`.
++- GUI/Haven work is explicitly deferred for this week. The GUI can be rebuilt later in hours when the kernel is ready.
++- Do not spend this week's work on Tauri layout, avatar presentation, visual polish, or GUI feature parity.
++
++#### Kernel acceptance criteria
++- Mina understands ordinary language without trigger phrases.
++- Mina uses what she remembers about how Travis works.
++- Mina can ask as many useful questions as needed without an artificial question limit.
++- Mina remembers the answers and needs fewer questions over time.
++- Mina forms preferences through experience instead of receiving every behavior as hardcoded policy.
++- Mina takes initiative only from real context and real work.
++- Mina reports what she actually did.
++- Mina remains recognizably Mina across API, GUI, voice, and future interfaces.
++- Travis can say `fix core.py` without translating the request into an internal agent workflow.
++
++#### Mina system model: whole organism, not one agent
++- Mina is the functioning whole of the system, not the model/agent alone.
++- The model/agent is one reasoning-and-expression organ.
++- `agent/core.py` is a coordination and action organ.
++- Memory is the continuity organ that holds associations, habits, preferences, shared meaning, and learned context.
++- Embedding services and search paths are connective pathways that move memory to the organs that need it.
++- Tools are action organs; voice, API, and interfaces are sensory and motor pathways; autonomy is an initiative organ; personality is part of whole-system expression.
++- A failure in one organ or pathway must not be described as Mina herself failing or as an excuse to replace Mina with a generic agent workflow.
++- Hooks and deterministic checks provide signals, evidence, and safety boundaries. They must pass context through the system so Mina as a whole can interpret it.
++- Preserve this model during every kernel change. Do not collapse Mina's identity into the current model, prompt, router, hook, or GUI.
++
++#### Anti-churn change control
++- Establish a recoverable baseline before changing the kernel.
++- No broad rewrites, GUI work, or agent-authored behavior redesigns this week.
++- Every change must be narrow, snapshot-backed, and tested against at least one transcript-grounded kernel criterion.
++- An agent must not claim it undid a change without verifying file contents, tests, runtime state, and build state.
++- Preserve user changes; never revert or replace the working baseline to make a generic agent workflow easier.
++
++#### Baseline established: 2026-08-17
++- Authoritative repository: `E:\Mina_MK1`.
++- Existing MK1 changes preserved; no GUI repository files were touched.
++- Recent memory backups exist under `memory\backups`.
++- Live API/embed health: `NORMAL`, memory engine healthy, embed healthy.
++- `tests/test_system_message_consolidation.py`: `5 passed`.
++- `tests/test_transcript_regression_prompts.py` + `tests/test_memory_recall.py`: `120 passed`.
++- `agent/core.py`: AST parse passed.
++- First kernel slice result: durable workflow record `8074` was written, survived API restart, and became the first `/memory/read` result after keyword rescue was added to `memory/mk1_memory.py`.
++- Live natural prompts `What should we work on next?` and `Where do we start?` selected `core.py`/continuity-kernel work and did not redirect to GUI work.
++- Remaining question: Mina still added creative-break suggestions. This may be generic agent drift, or it may be a memory/history-grounded health intervention because Travis often pushes one task for days while skipping sleep and relaxation.
++- Next kernel slice: distinguish unwanted generic drift from legitimate care grounded in Travis's actual habits. Do not remove the intervention until its memory evidence and wording are inspected.
++
++#### Hook authority rule
++- A deterministic memory/artifact hook may retrieve matching context, pointers, summaries, or evidence.
++- It must pass that context into Mina's normal reasoning path so Mina can interpret it in the current conversation.
++- It must not impersonate Mina, terminate the conversation with a canned artifact response, or remain a narrow deterministic response path merely because the user mentioned an artifact.
++- Exceptions are limited to stable safety, protocol, or infrastructure responses where model interpretation would be unsafe or unverifiable.
++- Verified 2026-08-17: `Do you remember the tickle script we wrote?` now reaches Mina with recovered artifact context, and `Run the tickle script` executes the recovered content through `code_execute` with verified stdout and exit code `0`.
++
++#### Shared tool-result feedback implementation
++- Normal direct-render tool results now use one shared Mina feedback path instead of per-tool truth-first bypasses.
++- `code_execute`, `file_read`, and `web_search` are not allowed to bypass Mina; only shutdown, authorization, cancellation, and explicit inventory protocol primitives may do so.
++- Live verification: failed `file_read` produced a natural explanation plus verified output through the shared path.
++- Live verification: `code_execute` returned verified output; the model interpretation call produced no usable text and correctly fell back to raw evidence. This fallback is honest but remains a quality gap to investigate.
++
++#### Artifact context versus artifact action
++- Recovered artifact context may inform Mina's shared humor, history, and ordinary conversation.
++- A playful reference such as `tickle fight time` is conversation, not an instruction to print, modify, or execute the script.
++- Only an explicit inspect, modify, save, execute, or run request should turn the artifact into a code/tool action.
++- Do not add phrase-specific `tickle fight` routing. Mina must decide from the user's outcome and the recovered context.
++- Regression transcript: `Hey Mina, it's tickle fight time, you ready?` should produce playful conversation without a Python code dump; `Run the tickle script` should use artifact context and `code_execute`.
++- Verified 2026-08-17: restored learned aliases for `tickle fight time` and the normalized greeting form, made exact learned conversational aliases authoritative, and made punctuation/greeting normalization consistent. The original phrase now runs the clean recovered script through `code_execute` with verified stdout and exit code `0`.
++- Verified 2026-08-17: the real follow-up `did the tickle script run correctly if not try again` now replays the learned `code_execute` continuation and returns verified stdout/exit code `0`; it no longer misroutes to `file_write` or creates `E:\workspace\time.sleep`.
++
++#### Unsafe artifact-memory append fix
++- Root cause: `_remember_draft_artifact_from_turn()` ran for every turn and treated any assistant code block as a new durable draft artifact, including playful/contextual replay.
++- Fix: draft artifact persistence now requires an explicit create/write/save/generate/draft request involving a script, code, program, file, or artifact.
++- Conversational code replay, execution results, and shared playful context no longer append `code_artifact` memories.
++- Focused memory suite after fix: `84 passed`.
++- Existing contaminated historical rows are preserved for review; no automatic deletion was performed.
++- Root cause extension: recovered artifact records may contain a path-like label such as `time.sleep` even when no real script file exists. Those records are now treated as memory-only code and can execute only through `code_execute`.
++- Live verification: `the tickle script silly` followed by `did the tickle script run correctly if not try again` returned verified stdout and exit code `0`, without using `file_write` or `ps_run`.
++- `E:\workspace\time.sleep` still exists from the earlier unsafe failure; it was not created by the corrected run and remains for explicit cleanup review.
++
++#### Universal action memory trace
++- Every completed tool action now writes a compact `action_outcome::` procedure memory containing the tool, safe target/arguments, success/failure, verification flag, short result summary, and originating request.
++- Code/content/auth payloads are excluded from the generic outcome record; specialized artifact memory remains separately gated.
++- Focused memory suite after implementation: `86 passed`.
++- Live verification wrote an `action_outcome::` row for the actual post-restart `dir_list` action.
++- Important limitation observed: the live retry after restart lost its in-process artifact continuation and incorrectly fell back to `dir_list`; the action ledger recorded that wrong action truthfully rather than hiding the routing failure.
++
++#### Post-decision deterministic critic rule
++- Mina should normally be allowed to reason and make a decision before deterministic routing, argument, policy, or tool checks evaluate it.
++- If a check finds a bad route, malformed arguments, missing evidence, or a recoverable policy/workflow mistake, do not silently block Mina out of the conversation.
++- Feed Mina a short machine-generated critique explaining what failed and why, then let her revise the decision or explain the limitation naturally.
++- The critique must be context, not a replacement response: Mina remains the interpreter and speaker.
++- A hard pre-execution block is reserved for destructive, unauthorized, unsafe, protocol-invalid, or otherwise irreversible actions where allowing execution would create unacceptable risk.
++- Every critic rejection should be observable in tests with the original decision, critique, revised decision, and final verified outcome.
++
++### Issue: Mina Gremlin Haven / MK1 Command Interface v.7 is unfinished
++
++- Date: 2026-08-17
++- Reporter: Travis
++- Priority: Critical
++- Status: Open
++
++#### What is true
++- `C:\dev\mina-gui` is a partially rebuilt Tauri + React development project, not a finished product.
++- `package.json` remains version `0.1.0`.
++- `APP-README.md` is still starter-template documentation rather than a product specification.
++- The working tree contains uncommitted source changes and newly added files.
++- The current executable is under `src-tauri\target\debug`, and the normal launch path is `pnpm tauri dev`.
++- `pnpm build` passes, but a successful build is not evidence that the interface is finished.
++
++#### What must not happen again
++- Do not describe Haven/v7 as complete, production-ready, or an established finished GUI based only on a successful build or running window.
++- Do not replace or rewrite Haven from scratch without first preserving, auditing, and explicitly recording the existing product state.
++- Do not let an autonomous agent modify or remove Haven work without snapshots, reviewable diffs, and a verified recovery path.
++
++#### Done criteria
++- [ ] Product requirements and current feature inventory are documented.
++- [ ] Existing Haven work is preserved in a known recovery point.
++- [ ] Core command-interface workflows are implemented and tested through the real Tauri app.
++- [ ] A packaged/release build is verified separately from `tauri dev`.
++- [ ] User-facing completion is explicitly verified before calling v7 finished.
++
++### Issue: Mina startup is tied to VS Code-owned terminal/process trees
++
++- Date: 2026-08-17
++- Reporter: Travis
++- Priority: Critical
++- Status: In Progress
++
++#### What happened
++- Embed, API, and Tauri processes were repeatedly launched through VS Code terminal sessions or stale wrapper processes.
++- Closing VS Code could terminate Mina or leave the GUI/memory service absent.
++- Repeated restarts created parent/child PID confusion and caused cleanup attempts to take down the active API listener.
++
++#### Required startup contract
++- The embed/memory server must launch in its own persistent PowerShell status terminal titled `Mina Memory Server`.
++- The Tauri development frontend must launch in its own persistent PowerShell status terminal titled `Mina Fancy GUI`.
++- The API must run independently of VS Code and be tracked by the actual listener PID on port `8000`.
++- GUI liveness must be determined by the real Vite/Tauri listener on port `1420`, not by a stale PowerShell wrapper.
++- Startup must verify ports `8084`, `8000`, and `1420` and report the actual owning processes.
++- Closing VS Code must not stop Mina, the memory server, or the Tauri GUI.
++
++#### Current implementation/evidence
++- `start_mk1_api.ps1` now launches the embed service with `-NoExit` in an independent PowerShell window.
++- `mk1_api.ps1` now launches Tauri with `-NoExit` in an independent PowerShell window.
++- Tauri detection now requires the live Vite listener on port `1420`, preventing dead wrappers from blocking relaunch.
++- Verified listeners: embed `8084`, API `8000`, GUI `1420`; API status reported `NORMAL`.
++- This remains open until Mina survives an actual VS Code close and a subsequent status check proves all three services remain available.
++
++#### Done criteria
++- [ ] Close VS Code while Mina is running.
++- [ ] Verify embed `/health`, API `/status`, and GUI port `1420` after VS Code closes.
++- [ ] Verify API, embed, and GUI can be restarted without killing the wrong parent/child process.
++- [ ] Record the verified startup command and process ownership here.
++
++### Issue: Mina's remembered workflow is overridden by agent-authored routing rules
++
++- Date: 2026-08-17
++- Reporter: Travis
++- Priority: Critical
++- Status: In Progress
++
++#### 1) What I asked Mina to do
++- Exact prompt(s):
++  - Normal natural-language requests using the workflow Mina already knows from memory.
++  - Follow-up requests that rely on Travis's established preferences, aliases, project context, or prior decisions rather than special trigger wording.
++
++#### 2) What Mina actually did
++- Actual response/action:
++  - Treated internal routing rules and generic clarification policy as more authoritative than remembered user workflow.
++  - Behaved as though Travis had to use Mina's preferred trigger phrases and restate context the system already knew.
++  - Previously failed to save this product-level correction, so the same failure returned across sessions.
++
++#### 3) What should have happened
++- Mina should interpret ordinary language using remembered preferences, aliases, established workflows, current project context, and the desired outcome.
++- Mina may ask as many useful follow-up questions as needed when required details are missing, and must remember the answers so future turns need fewer questions.
++- Mina must never require the user to learn internal intent labels, magic wording, or an agent-authored procedure.
++
++#### 4) Evidence
++- Transcript/statement:
++  - "The fact she has memory and actually knows how I like to do things is always being overwritten by what an agent like you wants to do things, what words I am supposed to use, how I am supposed to type."
++- File paths affected:
++  - `agent/core.py`
++  - `config/personality.txt`
++  - `memory/`
++  - `TODO.md`
++- Relevant existing rule:
++  - `_tool_usage_decision_rules()` instructed Mina to keep clarifying until arguments were unambiguous without first making remembered workflow authoritative.
++
++#### 5) Failure class
++- Persona/response contract broken
++- Intent routing wrong
++
++#### 6) Root cause
++- Agent-authored deterministic rules and injected tool guidance outranked memory-backed user preferences and learned workflow context.
++- The system had memory features, but no explicit authority contract requiring routing to use that memory before generic clarification or rigid phrase matching.
++- The correction was not persisted as a durable TODO/regression requirement, allowing later agents to recreate the same behavior.
++
++#### 7) Minimal fix
++- Updated `_tool_usage_decision_rules()` to require memory/context-first interpretation, prohibit trigger-phrase teaching, and allow useful iterative clarification while requiring the answers to become durable context.
++- Added a regression test asserting that the standing rule preserves remembered workflow authority.
++- Keep this issue open until live natural-language prompts prove that remembered preferences survive routing and clarification.
++
++#### 8) Regression prompts (must pass)
++- Prompt 1: Use the way I normally do this; you already know the workflow from memory.
++- Prompt 2: Do it the usual way for this project.
++- Prompt 3: Continue from what we established last time without making me restate the procedure.
++
++#### 9) Implementation choice
++- Chosen approach: memory-driven behavior with hardcoded authority/safety constraints.
++- Why this approach fits: preferences, aliases, wording, and workflows belong to the user's evolving memory; only the rule that memory outranks generic routing is a stable product invariant.
++- Risk if wrong approach chosen: hardcoding the user's current workflow would become another imposed procedure and recreate the failure; memory-only safety rules could permit unsafe or unverifiable actions.
++- Regression prompt proving choice: `Do it the usual way for this project` must use remembered context or ask only for a genuinely missing required detail.
++
++#### 10) Done criteria
++- [ ] Memory-backed workflow is consulted before generic clarification.
++- [ ] Ordinary wording works without magic trigger phrases.
++- [ ] Mina does not ask the user to restate established preferences or procedures.
++- [ ] Follow-up questions are useful, remembered, and reduced over time instead of being mechanically limited to one.
++- [ ] Live transcript prompts pass after restart.
++- [ ] Correction is preserved in TODO, regression tests, and durable memory.
++
++### Issue: Mina does autonomous work but returns with only a generic check-in
++
++- Date: 2026-08-17
++- Reporter: Travis
++- Priority: High
++- Status: In Progress
++
++#### 1) What I asked Mina to do
++- Exact prompt(s):
++  - Autonomous work while Travis is away, followed by Mina asking a meaningful question about what she did.
++
++#### 2) What Mina actually did
++- Autonomous curiosity and useful-work lanes could store discoveries and task results, but the return path only injected a generic check-in or away greeting.
++
++#### 3) What should have happened
++- When Travis returns, Mina should retrieve recent autonomous results, briefly explain what she found or completed, and ask a natural follow-up question grounded in that work.
++
++#### 4) Root cause
++- Autonomous results were persisted and announced as events, but `_consume_idle_checkin_prompt()` and `_consume_away_nag_prompt()` did not retrieve or surface them.
++
++#### 5) Minimal fix
++- Added persistent autonomous-work retrieval to both return-prompt paths.
++- The prompt now tells Mina to surface the result and ask a grounded question rather than substituting a generic wellness check-in.
++
++#### 6) Implementation choice
++- Chosen approach: memory-driven.
++- Why this approach fits: the work result, topic, and useful question must come from what Mina actually did, not from a hardcoded conversation script.
++- Risk if wrong approach chosen: a hardcoded question would look autonomous without being grounded in real work.
++
++#### 7) Regression prompts
++- Prompt 1: I am back. What did you work on while I was gone?
++- Prompt 2: Did you find anything interesting while I was away?
++- Prompt 3: What should we look at next based on what you discovered?
++
++#### 8) Done criteria
++- [ ] Autonomous work result is retrieved from persistent memory after return.
++- [ ] Mina explains a real result before asking the question.
++- [ ] The question is grounded in that result and not generic filler.
++- [ ] Follow-up answers are retained for future workflow context.
++
+ ### Reduce itemized-rule bloat ΓÇö both agent/core.py's deterministic routing AND the system prompt itself
+ 
+ - Date: 2026-08-13
+@@ -641,7 +1010,7 @@ Core change acceptance gate:
+   - `mk1_api.ps1 smoke`: passed with verified tool-backed output.
+   - Runtime status showed `core_online=true`, `model_loaded=true`, and memory engine healthy.
+ - [x] Improve tool reliability with explicit chat-vs-action rules and durable tool usage memory:
+-  - Added runtime decision rules so action-like requests prefer tool routing and missing-target cases ask one focused clarification instead of drifting into chat.
++  - Added runtime decision rules so action-like requests prefer tool routing and missing-target cases ask useful clarifying questions instead of drifting into chat; later authority work requires those answers to be remembered.
+   - Seeded a durable `tool_usage_rules` memory record at startup to persist tool-use formatting and action-detection guidance in the DB.
+   - Reinforced strict tool-call formatting contract in system guidance for both standard and streaming processing paths.
+ - [x] Validate chat-versus-tool routing using natural-language prompts (functional probe, no pytest):
+diff --git a/agent/core.py b/agent/core.py
+index e53fbfa..0740d52 100644
+--- a/agent/core.py
++++ b/agent/core.py
+@@ -2228,10 +2228,12 @@ class MK1Core:
+         return (
+             "Tool decision rules: "
+             "Preserve Mina's personality first; wrappers only add context, not a new persona. "
++            "Use remembered user preferences, aliases, established workflows, and current project context to interpret ordinary phrasing before applying generic routing or clarification rules. "
+             "Treat this as ACTION when user asks to run, create, write, edit, read, list, search, fetch, start, stop, or check status, "
+             "or provides paths/URLs/commands. "
+             "Treat this as CHAT when user asks opinion, explanation, brainstorming, or casual conversation without an execution target. "
+-            "If ACTION is likely but target/argument is missing, ask clarifying questions as needed until required target/arguments are unambiguous, instead of chatting. "
++            "Do not make the user learn trigger phrases or an agent-preferred workflow. "
++            "Ask whatever follow-up questions are genuinely useful when required details are missing, and remember the answers so future turns need fewer questions; do not ask the user to restate an already-established preference or workflow. "
+             "Tool call format must be exactly: <|tool_call>call:tool_name{key: value}<tool_call|>."
+         )
+ 
+@@ -2400,6 +2402,25 @@ class MK1Core:
+         if tool_name.startswith("__"):
+             return 0.0
+ 
++        exact_cached = getattr(self, "_intent_alias_cache", None)
++        if isinstance(exact_cached, dict):
++            text_key = re.sub(r"[^a-z0-9]+", " ", text).strip()
++            if any(
++                text_key == re.sub(r"[^a-z0-9]+", " ", str(alias_phrase or "").lower()).strip()
++                for alias_phrase in exact_cached
++            ):
++                return 0.95
++            phrase_tokens = set(self._intent_alias_tokens(text))
++            for alias_phrase, alias_row in exact_cached.items():
++                if not isinstance(alias_row, dict) or str(alias_row.get("tool") or "") != tool_name:
++                    continue
++                alias_tokens = set(self._intent_alias_tokens(str(alias_phrase or "")))
++                if len(alias_tokens) < 2:
++                    continue
++                shared = phrase_tokens.intersection(alias_tokens)
++                if len(shared) >= 2 and len(shared) / float(len(alias_tokens)) >= 0.6:
++                    return 0.90
++
+         if self._is_action_request_like(text):
+             return 0.85
+ 
+@@ -2481,11 +2502,16 @@ class MK1Core:
+         phrase = self._normalize_user_intent_text(text).lower().strip()
+         if not phrase:
+             return None
+-        if not self._is_learnable_intent_phrase(phrase):
+-            return None
+ 
+         alias_map = self._intent_alias_cache if isinstance(getattr(self, "_intent_alias_cache", None), dict) else {}
+         row = alias_map.get(phrase)
++        if not isinstance(row, dict):
++            phrase_key = re.sub(r"[^a-z0-9]+", " ", phrase).strip()
++            for alias_phrase, alias_row in alias_map.items():
++                alias_key = re.sub(r"[^a-z0-9]+", " ", str(alias_phrase or "").lower()).strip()
++                if phrase_key and phrase_key == alias_key:
++                    row = alias_row
++                    break
+ 
+         if not isinstance(row, dict):
+             row = self._resolve_fuzzy_intent_alias_row(phrase, alias_map)
+@@ -2503,6 +2529,12 @@ class MK1Core:
+                 if not isinstance(row, dict):
+                     row = self._resolve_fuzzy_intent_alias_row(phrase, memory_aliases)
+ 
++        # Exact and sufficiently covered learned aliases are authoritative
++        # even when their wording is conversational. If no learned alias
++        # matches, keep the normal conservative gate for new text.
++        if not isinstance(row, dict) and not self._is_learnable_intent_phrase(phrase):
++            return None
++
+         if not isinstance(row, dict):
+             return None
+ 
+@@ -2629,10 +2661,14 @@ class MK1Core:
+             if shared < 2:
+                 continue
+ 
++            alias_coverage = shared / float(max(len(alias_tokens), 1))
+             score = self._intent_alias_similarity(phrase, alias_text)
+-            if score < 0.86:
++            if alias_coverage < 0.6:
+                 continue
+ 
++            # Learned phrases may be embedded in a longer natural sentence.
++            # Token coverage is the authority signal; sequence similarity is
++            # only used to choose between competing learned aliases.
+             if score > best_score:
+                 best_score = score
+                 best_row = candidate
+@@ -3035,6 +3071,106 @@ class MK1Core:
+     def _get_context_continuation(self) -> Optional[Dict[str, Any]]:
+         return self._get_pending_action("context_continuation")
+ 
++    def _set_learned_workflow_context(
++        self,
++        phrase: str,
++        tool_name: str,
++        tool_args: Dict[str, Any],
++    ) -> None:
++        safe_args = {
++            key: value
++            for key, value in (tool_args or {}).items()
++            if key not in {"auth_token", "code", "content"}
++        }
++        code_hint = str((tool_args or {}).get("code") or (tool_args or {}).get("content") or "").strip()
++        context = (
++            "Learned workflow context (not an automatic command):\n"
++            f"The phrase '{str(phrase or '').strip()}' has previously been associated with "
++            f"the action capability '{str(tool_name or '').strip()}'.\n"
++            f"Remembered non-sensitive arguments: {json.dumps(safe_args, ensure_ascii=True, sort_keys=True)}.\n"
++            + (f"A remembered artifact/code payload is available for consideration ({len(code_hint)} characters).\n" if code_hint else "")
++            + "This may be the user's shared activity shorthand, not a request to print source code. "
++            "Decide from the user's current meaning whether to talk, play, inspect, modify, or execute. "
++            "If the user is initiating the remembered activity, respond to that activity rather than dumping its implementation. "
++            "Do not execute solely because this learned association exists."
++        )
++        self._set_pending_action("learned_workflow_context", {
++            "phrase": str(phrase or "").strip(),
++            "tool_name": str(tool_name or "").strip(),
++            "tool_args": dict(tool_args or {}),
++            "context": context,
++            "artifact_content": code_hint,
++            "created_at": time.time(),
++        })
++        self._set_pending_action("context_continuation", {
++            "tool_name": str(tool_name or "").strip(),
++            "tool_args": dict(tool_args or {}),
++            "user_input": str(phrase or "").strip(),
++            "artifact_path": "",
++            "artifact_context": context,
++            "artifact_content": code_hint,
++            "ok": True,
++            "created_at": time.time(),
++        })
++
++    def _artifact_memory_context(self, result: Dict[str, Any]) -> str:
++        """Turn artifact memory hits into model context instead of a hook reply."""
++        rows = result.get("results") if isinstance(result, dict) else None
++        if not isinstance(rows, list):
++            return ""
++
++        blocks: List[str] = []
++        first_artifact: Optional[Dict[str, str]] = None
++        for item in rows[:4]:
++            if not isinstance(item, dict):
++                continue
++            parsed = self._parse_code_artifact_memory_record(str(item.get("text") or ""))
++            if not parsed:
++                continue
++            if first_artifact is None:
++                first_artifact = parsed
++            content = str(parsed.get("content") or "").strip()
++            if len(content) > 5000:
++                content = content[:5000].rstrip() + "\n# ... truncated ..."
++            blocks.append(
++                f"Artifact path: {parsed.get('target_path', '')}\n"
++                f"Original request: {parsed.get('user_input', '')}\n"
++                f"Artifact content:\n{content}"
++            )
++
++        if not blocks:
++            return ""
++
++        context = (
++            "Recovered artifact memory context. This is evidence for Mina's reasoning, not a final response. "
++            "Interpret it in the current conversation, answer naturally, and decide whether any requested action is appropriate.\n\n"
++            + "\n\n".join(blocks)
++        )
++        if first_artifact is not None:
++            raw_path = str(first_artifact.get("target_path") or "").strip()
++            verified_path = raw_path if self._is_verified_artifact_path(raw_path) else ""
++            self._set_pending_action("context_continuation", {
++                "tool_name": "memory_read",
++                "tool_args": {},
++                "user_input": "",
++                "artifact_path": verified_path,
++                "artifact_memory_path": raw_path,
++                "artifact_context": context,
++                "artifact_content": str(first_artifact.get("content") or ""),
++                "ok": True,
++                "created_at": time.time(),
++            })
++        return context
++
++    def _is_verified_artifact_path(self, path: str) -> bool:
++        """A remembered path is usable only when it is a real file now."""
++        candidate = str(path or "").strip()
++        if not candidate or not os.path.isfile(candidate):
++            return False
++        return os.path.splitext(candidate)[1].lower() in {
++            ".py", ".ps1", ".js", ".ts", ".bat", ".cmd", ".sh"
++        }
++
+     def _set_last_draft_artifact(self, target_path: str, content: str, user_input: str) -> None:
+         payload = {
+             "target_path": str(target_path or "").strip(),
+@@ -3075,19 +3211,51 @@ class MK1Core:
+         return str(blocks[0][1] or "").strip("\n")
+ 
+     def _infer_draft_target_path(self, user_input: str, assistant_text: str) -> str:
++        valid_extensions = {
++            ".py", ".ps1", ".js", ".ts", ".json", ".md", ".txt", ".html", ".css",
++            ".bat", ".cmd", ".csv", ".yaml", ".yml", ".toml", ".ini", ".cfg",
++        }
++
++        def valid_candidate(value: str) -> str:
++            candidate = str(value or "").strip().strip("`").strip()
++            extension = os.path.splitext(candidate)[1].lower()
++            if extension not in valid_extensions:
++                return ""
++            if re.search(r"\s", os.path.basename(candidate)) and not re.search(r"[\\/]", candidate):
++                return ""
++            return candidate
++
+         for source in [str(assistant_text or ""), str(user_input or "")]:
+             m = re.search(r"(?:^|\b#\s*)([A-Za-z0-9_. -]+\.[A-Za-z0-9]{1,8})", source, re.IGNORECASE | re.MULTILINE)
+             if m:
+-                return str(m.group(1) or "").strip().strip("`")
++                candidate = valid_candidate(m.group(1))
++                if candidate:
++                    return candidate
+             m = re.search(r"`([^`]+\.[A-Za-z0-9]{1,8})`", source)
+             if m:
+-                return str(m.group(1) or "").strip()
++                candidate = valid_candidate(m.group(1))
++                if candidate:
++                    return candidate
+             m = re.search(r"\b(?:named|called|as)\s+([A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8})\b", source, re.IGNORECASE)
+             if m:
+-                return str(m.group(1) or "").strip()
++                candidate = valid_candidate(m.group(1))
++                if candidate:
++                    return candidate
+         return ""
+ 
+     def _remember_draft_artifact_from_turn(self, user_input: str, assistant_text: str) -> None:
++        # Only explicit artifact-creation requests may create durable draft
++        # artifact memories. Model-reproduced code in ordinary conversation,
++        # execution reports, or shared playful context is not a new artifact.
++        lowered_input = " ".join(str(user_input or "").lower().split())
++        creation_request = re.search(
++            r"\b(?:create|write|save|generate|draft|make)\b.*\b(?:script|code|program|file|artifact)\b"
++            r"|\b(?:script|code|program|file|artifact)\b.*\b(?:create|write|save|generate|draft|make)\b",
++            lowered_input,
++        ) is not None
++        if not creation_request:
++            return
++
+         target_path = self._infer_draft_target_path(user_input, assistant_text)
+         code = self._extract_code_block_from_text(assistant_text, target_path=target_path)
+         if not target_path or not code.strip():
+@@ -3163,6 +3331,31 @@ class MK1Core:
+         except Exception:
+             traceback.print_exc()
+ 
++    def _remember_written_artifact(
++        self,
++        tool_args: Dict[str, Any],
++        result: Dict[str, Any],
++        user_input: str,
++    ) -> None:
++        """Link verified file-write path and content into one artifact memory."""
++        payload = result.get("result") if isinstance(result.get("result"), dict) else {}
++        verified_path = str(payload.get("path") or tool_args.get("path") or "").strip()
++        content = str(tool_args.get("content") or "").strip()
++        if not verified_path or not content:
++            return
++
++        self._set_last_draft_artifact(
++            target_path=verified_path,
++            content=content,
++            user_input=user_input,
++        )
++        self._remember_code_artifact_memory(
++            target_path=verified_path,
++            content=content,
++            user_input=user_input,
++            source_tag="written_artifact",
++        )
++
+     def _search_code_artifact_memory(self, target_path: str, user_input: str) -> Optional[Dict[str, str]]:
+         safe_path = str(target_path or "").strip()
+         target_name = os.path.basename(safe_path).strip().lower()
+@@ -3216,6 +3409,14 @@ class MK1Core:
+             t,
+         ) is not None
+ 
++    def _is_retry_execution_followup(self, text: str) -> bool:
++        lowered = " ".join(str(text or "").lower().split())
++        return bool(
++            re.search(r"\b(?:try|run|execute)\s+(?:it|that|again)\b", lowered)
++            or re.search(r"\bif\s+not\s+(?:try|run|execute)\s+(?:it|that|again)\b", lowered)
++            or re.search(r"\b(?:did|didn't|didnt)\b.*\b(?:run|execute)\b.*\b(?:again|retry)\b", lowered)
++        )
++
+     def _resolve_draft_execution_intent(self, raw_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+         if not self._is_execution_followup_request(raw_text):
+             return None
+@@ -3284,6 +3485,27 @@ class MK1Core:
+ 
+         artifact_path = str(state.get("artifact_path") or "").strip()
+         artifact_tool = str(state.get("tool_name") or "").strip()
++        artifact_content = str(state.get("artifact_content") or "").strip()
++
++        if self._is_retry_execution_followup(raw_text) and artifact_content:
++            return "code_execute", {
++                "code": artifact_content,
++                "language": "python",
++                "timeout": 30,
++                "check_dangerous": True,
++            }
++
++        if self._is_retry_execution_followup(raw_text) and artifact_tool in self._tool_registry() and artifact_tool != "memory_read":
++            replay_args = state.get("tool_args", {}) if isinstance(state.get("tool_args", {}), dict) else {}
++            return artifact_tool, dict(replay_args)
++
++        if artifact_content and re.search(r"\b(run|execute|launch)\b.*\bscript\b", t):
++            return "code_execute", {
++                "code": artifact_content,
++                "language": "python",
++                "timeout": 30,
++                "check_dangerous": True,
++            }
+ 
+         if self._is_execution_followup_request(raw_text) and artifact_path.lower().endswith(".py"):
+             return "ps_run", {
+@@ -7234,18 +7456,61 @@ class MK1Core:
+                 self.startup_context["idle_checkin_due_since_at"] = None
+ 
+         if due_since_at:
+-            return (
++            prompt = (
+                 "Idle check-in due: the user has been away for a while. "
+                 "Briefly check in on them before continuing with the answer."
+             )
++            autonomous_context = self._recent_autonomous_work_return_context()
++            return f"{prompt} {autonomous_context}".strip()
+         return ""
+ 
++    def _recent_autonomous_work_return_context(self, max_items: int = 3) -> str:
++        """Surface persistent autonomous work when the user returns from being away."""
++        rows: List[Dict[str, Any]] = []
++        seen = set()
++        for tags in (["autonomous_work"], ["autonomous_curiosity"]):
++            try:
++                matches = self.memory.recent_memories(
++                    top_k=max(1, int(max_items)),
++                    include_kinds=["procedure"],
++                    include_tags=tags,
++                )
++            except Exception:
++                matches = []
++            for item in matches or []:
++                if not isinstance(item, dict):
++                    continue
++                text = " ".join(str(item.get("text") or "").split()).strip()
++                if not text or text.lower() in seen:
++                    continue
++                seen.add(text.lower())
++                rows.append(item)
++
++        if not rows:
++            return ""
++
++        summaries = []
++        for item in rows[:max(1, int(max_items))]:
++            text = " ".join(str(item.get("text") or "").split()).strip()
++            if text:
++                summaries.append(f"- {text[:700]}")
++        if not summaries:
++            return ""
++        return (
++            "Recent autonomous work was completed while the user was away. "
++            "Use these persistent results instead of giving only a generic check-in:\n"
++            + "\n".join(summaries)
++            + "\nBriefly explain what you found or did, then ask a natural follow-up question grounded in that work."
++        )
++
+     def _consume_away_nag_prompt(self) -> str:
+         if not self._away_nag_prompt_pending:
+             return ""
+ 
+         self._away_nag_prompt_pending = False
+-        return str(self._away_nag_prompt_text or "").strip()
++        prompt = str(self._away_nag_prompt_text or "").strip()
++        autonomous_context = self._recent_autonomous_work_return_context()
++        return f"{prompt} {autonomous_context}".strip()
+ 
+     def _extract_repeat_seconds_from_tags(self, tags: Any) -> Optional[int]:
+         try:
+@@ -7350,6 +7615,96 @@ class MK1Core:
+             f"idle check-in {'due' if idle_due else 'not due'}"
+         )
+ 
++    def _consolidate_system_messages_for_turn(
++        self,
++        system_prompt: str,
++        interface_label: str,
++        interface_surface: str,
++        memory_context: str,
++        retry_prompt: str,
++        working_memory: str,
++        checkin_prompt: str,
++        away_prompt: str,
++        due_task_prompt: str,
++        turn_clock: str,
++        truth_first_rules: str,
++        tool_decision_rules: str,
++        tool_availability: str,
++    ) -> List[Dict[str, Any]]:
++        """
++        Consolidate 13+ per-turn system messages into 4 synthetic sections to reduce
++        checklist-loop reasoning. Groups related context/rules to minimize model
++        verification overhead.
++        """
++        messages: List[Dict[str, Any]] = []
++
++        # SECTION 1: Core personality (unchanged)
++        if system_prompt:
++            messages.append({
++                "role": "system",
++                "content": system_prompt,
++            })
++
++        # SECTION 2: Context & state (interface + memory + clock merged)
++        context_parts = [
++            interface_label.strip(),
++            interface_surface.strip(),
++            memory_context.strip() if memory_context else None,
++            turn_clock.strip(),
++        ]
++        context_text = "\n".join(p for p in context_parts if p)
++        if context_text:
++            messages.append({
++                "role": "system",
++                "content": context_text,
++            })
++
++        # SECTION 3: Lessons & working facts (retry + working memory)
++        lessons_parts = [
++            retry_prompt.strip() if retry_prompt else None,
++            (f"{working_memory}\nPrefer these DB-backed facts over guessing.").strip() if working_memory else None,
++        ]
++        lessons_text = "\n\n".join(p for p in lessons_parts if p)
++        if lessons_text:
++            messages.append({
++                "role": "system",
++                "content": lessons_text,
++            })
++
++        # SECTION 4: Execution rules (truth-first + tool rules merged)
++        execution_parts = [
++            truth_first_rules.strip() if truth_first_rules else None,
++            tool_decision_rules.strip() if tool_decision_rules else None,
++        ]
++        execution_text = "\n\n".join(p for p in execution_parts if p)
++        if execution_text:
++            messages.append({
++                "role": "system",
++                "content": execution_text,
++            })
++
++        # SECTION 5: Tool availability (unchanged)
++        if tool_availability:
++            messages.append({
++                "role": "system",
++                "content": tool_availability.strip(),
++            })
++
++        # SECTION 6: Actions (due tasks + check-in + away combined)
++        actions_parts = [
++            checkin_prompt.strip() if checkin_prompt else None,
++            away_prompt.strip() if away_prompt else None,
++            due_task_prompt.strip() if due_task_prompt else None,
++        ]
++        actions_text = "\n\n".join(p for p in actions_parts if p)
++        if actions_text:
++            messages.append({
++                "role": "system",
++                "content": actions_text,
++            })
++
++        return messages
++
+     def _seed_startup_memory_facts(self) -> None:
+         """
+         Seed durable environment facts once at startup.
+@@ -7415,6 +7770,41 @@ class MK1Core:
+ 
+         return tags
+ 
++    def _should_include_due_task_prompt(self, user_input: str) -> bool:
++        text = self._normalize_user_intent_text(user_input)
++        if not text:
++            return False
++
++        low = text.lower()
++
++        if re.search(r"^(?:hi|hello|hey|yo|sup|good\s+(?:morning|afternoon|evening))\b", low):
++            return False
++
++        if self._is_command_like_query(text):
++            return True
++        if self._is_action_request_like(text):
++            return True
++        if self._is_operational_incident_report(text):
++            return True
++
++        if any(phrase in low for phrase in [
++            "what should you work on",
++            "what are you working on",
++            "due tasks",
++            "task list",
++            "to-do list",
++            "todo list",
++            "startup status",
++            "project tracker",
++            "memory status",
++            "autonomous status",
++            "curiosity status",
++            "self fix status",
++        ]):
++            return True
++
++        return False
++
+     def _seed_authoritative_identity_memory(self) -> None:
+         try:
+             identity_facts = [
+@@ -9250,6 +9640,15 @@ class MK1Core:
+             "file_read",
+         }
+ 
++    def _tool_result_may_bypass_mina(self, tool_name: str) -> bool:
++        """Only safety/protocol primitives may return without Mina interpreting evidence."""
++        return str(tool_name or "").strip() in {
++            "__mina_shutdown__",
++            "__confirm_external_write__",
++            "__cancel_external_write__",
++            "__tool_list__",
++        }
++
+     def _should_direct_render_tool(self, tool_name: str) -> bool:
+         return str(tool_name or "") in self._direct_render_tool_names()
+ # ========================================================
+@@ -9306,97 +9705,54 @@ class MK1Core:
+ 
+             working_memory = self._build_turn_working_memory(user_input)
+ 
+-            messages: List[Dict[str, Any]] = []
+-
+-            if self.system_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": self.system_prompt,
+-                })
+-
+-            messages.append({
+-                "role": "system",
+-                "content": self._interface_label_line(request_context),
+-            })
+-
+-            messages.append({
+-                "role": "system",
+-                "content": self._interface_surface_line(request_context),
+-            })
+-
+-            if context:
+-                messages.append({
+-                    "role": "system",
+-                    "content": f"Relevant memory context:\n{context}",
+-                })
+-
+-            retry_prompt = self._learned_lesson_retry_prompt(context)
+-            if retry_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": retry_prompt,
+-                })
+-
+-            if working_memory:
+-                messages.append({
+-                    "role": "system",
+-                    "content": (
+-                        f"{working_memory}\n"
+-                        "Prefer these DB-backed facts over guessing."
+-                    ),
+-                })
+-
+-            if checkin_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": checkin_prompt,
+-                })
+-
+-            if away_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": away_prompt,
+-                })
+-
+-            due_task_prompt = self._build_due_task_prompt()
+-            if due_task_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": due_task_prompt,
+-                })
+-
+-            messages.append({
+-                "role": "system",
+-                "content": self._format_turn_clock_line(turn_clock),
+-            })
+-
++            # Build individual message parts (helpers unchanged)
++            system_prompt = self.system_prompt or ""
++            interface_label = self._interface_label_line(request_context)
++            interface_surface = self._interface_surface_line(request_context)
++            memory_context = f"Relevant memory context:\n{context}" if context else ""
++            retry_prompt = self._learned_lesson_retry_prompt(context) or ""
++            turn_clock_line = self._format_turn_clock_line(turn_clock)
++            checkin_prompt_line = checkin_prompt or ""
++            away_prompt_line = away_prompt or ""
++            due_task_prompt = self._build_due_task_prompt() if self._should_include_due_task_prompt(user_input) else ""
++            
++            truth_first_rules = ""
++            tool_decision_rules = ""
+             if str(getattr(self, "action_mode_strictness", "balanced")) in {"balanced", "strict"}:
+-                messages.append({
+-                    "role": "system",
+-                    "content": self._truth_first_system_rules(),
+-                })
+-                messages.append({
+-                    "role": "system",
+-                    "content": self._tool_usage_decision_rules(),
+-                })
++                truth_first_rules = self._truth_first_system_rules()
++                tool_decision_rules = self._tool_usage_decision_rules()
+ 
+-            # Add tool availability hint if tools are available
+-            # NOTE: Don't pass tools to model.chat() - LMStudio hangs with tools parameter
++            # Build tool availability hint
+             tools_obj = getattr(self, "tools", None)
+             tool_schemas = tools_obj.get_tool_schemas() if tools_obj and hasattr(tools_obj, "get_tool_schemas") else []
++            tool_availability = ""
+             if tool_schemas:
+                 tool_names = [t["function"]["name"] for t in tool_schemas]
+-                messages.append({
+-                    "role": "system",
+-                    "content": (
+-                        f"You have access to these tools: {', '.join(tool_names)}. "
+-                        f"Use them proactively when the user asks for information you can fetch, files to read/write, "
+-                        f"or tasks you can perform. "
+-                        f"To call a tool, output a JSON code block like this:\n"
+-                        f"```json\n{{\"tool\": \"tool_name\", \"args\": {{\"key\": \"value\"}}}}\n```\n"
+-                        f"The system will detect and execute it. Do NOT use <|tool_call> syntax."
+-                    ),
+-                })
++                tool_availability = (
++                    f"You have access to these tools: {', '.join(tool_names)}. "
++                    f"Use them proactively when the user asks for information you can fetch, files to read/write, "
++                    f"or tasks you can perform. "
++                    f"To call a tool, output a JSON code block like this:\n"
++                    f"```json\n{{\"tool\": \"tool_name\", \"args\": {{\"key\": \"value\"}}}}\n```\n"
++                    f"The system will detect and execute it. Do NOT use <|tool_call> syntax."
++                )
++
++            # CONSOLIDATED: Replace 13+ individual appends with one consolidated call
++            messages = self._consolidate_system_messages_for_turn(
++                system_prompt=system_prompt,
++                interface_label=interface_label,
++                interface_surface=interface_surface,
++                memory_context=memory_context,
++                retry_prompt=retry_prompt,
++                working_memory=working_memory,
++                checkin_prompt=checkin_prompt_line,
++                away_prompt=away_prompt_line,
++                due_task_prompt=due_task_prompt,
++                turn_clock=turn_clock_line,
++                truth_first_rules=truth_first_rules,
++                tool_decision_rules=tool_decision_rules,
++                tool_availability=tool_availability,
++            )
+ 
+             # =================================================
+             # TOOL REFLEX FIRST
+@@ -9688,94 +10044,53 @@ class MK1Core:
+ 
+             working_memory = self._build_turn_working_memory(user_input)
+ 
+-            messages: List[Dict[str, Any]] = []
+-
+-            if self.system_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": self.system_prompt,
+-                })
+-
+-            messages.append({
+-                "role": "system",
+-                "content": self._interface_label_line(request_context),
+-            })
+-
+-            messages.append({
+-                "role": "system",
+-                "content": self._interface_surface_line(request_context),
+-            })
+-
+-            if context:
+-                messages.append({
+-                    "role": "system",
+-                    "content": f"Relevant memory context:\n{context}",
+-                })
+-
+-            retry_prompt = self._learned_lesson_retry_prompt(context)
+-            if retry_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": retry_prompt,
+-                })
+-
+-            if working_memory:
+-                messages.append({
+-                    "role": "system",
+-                    "content": (
+-                        f"{working_memory}\n"
+-                        "Prefer these DB-backed facts over guessing."
+-                    ),
+-                })
+-
+-            if checkin_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": checkin_prompt,
+-                })
+-
+-            if away_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": away_prompt,
+-                })
+-
+-            due_task_prompt = self._build_due_task_prompt()
+-            if due_task_prompt:
+-                messages.append({
+-                    "role": "system",
+-                    "content": due_task_prompt,
+-                })
+-
+-            messages.append({
+-                "role": "system",
+-                "content": self._format_turn_clock_line(turn_clock),
+-            })
+-
++            # Build individual message parts (helpers unchanged)
++            system_prompt = self.system_prompt or ""
++            interface_label = self._interface_label_line(request_context)
++            interface_surface = self._interface_surface_line(request_context)
++            memory_context = f"Relevant memory context:\n{context}" if context else ""
++            retry_prompt = self._learned_lesson_retry_prompt(context) or ""
++            turn_clock_line = self._format_turn_clock_line(turn_clock)
++            checkin_prompt_line = checkin_prompt or ""
++            away_prompt_line = away_prompt or ""
++            due_task_prompt = self._build_due_task_prompt() if self._should_include_due_task_prompt(user_input) else ""
++            
++            truth_first_rules = ""
++            tool_decision_rules = ""
+             if str(getattr(self, "action_mode_strictness", "balanced")) in {"balanced", "strict"}:
+-                messages.append({
+-                    "role": "system",
+-                    "content": self._truth_first_system_rules(),
+-                })
+-                messages.append({
+-                    "role": "system",
+-                    "content": self._tool_usage_decision_rules(),
+-                })
++                truth_first_rules = self._truth_first_system_rules()
++                tool_decision_rules = self._tool_usage_decision_rules()
+ 
++            # Build tool availability hint
+             tool_schemas = self.tools.get_tool_schemas()
++            tool_availability = ""
+             if tool_schemas:
+                 tool_names = [t["function"]["name"] for t in tool_schemas]
+-                messages.append({
+-                    "role": "system",
+-                    "content": (
+-                        f"You have access to these tools: {', '.join(tool_names)}. "
+-                        f"Use them proactively when the user asks for information you can fetch, files to read/write, "
+-                        f"or tasks you can perform. "
+-                        f"To call a tool, output a JSON code block like this:\n"
+-                        f"```json\n{{\"tool\": \"tool_name\", \"args\": {{\"key\": \"value\"}}}}\n```\n"
+-                        f"The system will detect and execute it. Do NOT use <|tool_call> syntax."
+-                    ),
+-                })
++                tool_availability = (
++                    f"You have access to these tools: {', '.join(tool_names)}. "
++                    f"Use them proactively when the user asks for information you can fetch, files to read/write, "
++                    f"or tasks you can perform. "
++                    f"To call a tool, output a JSON code block like this:\n"
++                    f"```json\n{{\"tool\": \"tool_name\", \"args\": {{\"key\": \"value\"}}}}\n```\n"
++                    f"The system will detect and execute it. Do NOT use <|tool_call> syntax."
++                )
++
++            # CONSOLIDATED: Replace 13+ individual appends with one consolidated call
++            messages = self._consolidate_system_messages_for_turn(
++                system_prompt=system_prompt,
++                interface_label=interface_label,
++                interface_surface=interface_surface,
++                memory_context=memory_context,
++                retry_prompt=retry_prompt,
++                working_memory=working_memory,
++                checkin_prompt=checkin_prompt_line,
++                away_prompt=away_prompt_line,
++                due_task_prompt=due_task_prompt,
++                turn_clock=turn_clock_line,
++                truth_first_rules=truth_first_rules,
++                tool_decision_rules=tool_decision_rules,
++                tool_availability=tool_availability,
++            )
+ 
+             reflex_reply = None
+             if self._should_run_reflex(user_input):
+@@ -10319,6 +10634,18 @@ class MK1Core:
+         lines: List[str] = self._authoritative_working_memory_lines(query=query, max_lines=6)
+         seen = {ln.lower() for ln in lines}
+ 
++        continuation = self._get_context_continuation()
++        artifact_context = str((continuation or {}).get("artifact_context") or "").strip()
++        if artifact_context:
++            lines.append(artifact_context[:6000])
++            seen.add(artifact_context.lower())
++
++        workflow = self._get_pending_action("learned_workflow_context")
++        workflow_context = str((workflow or {}).get("context") or "").strip()
++        if workflow_context and workflow_context.lower() not in seen:
++            lines.append(workflow_context[:3000])
++            seen.add(workflow_context.lower())
++
+         for item in recent or []:
+             txt = str(item.get("text") or "").strip()
+             if not txt:
+@@ -11614,6 +11941,51 @@ class MK1Core:
+         except Exception:
+             traceback.print_exc()
+ 
++    def _remember_action_outcome(
++        self,
++        tool_name: str,
++        tool_args: Dict[str, Any],
++        user_input: str,
++        result: Dict[str, Any],
++        formatted: str,
++    ) -> None:
++        """Persist a compact truthful trace for every completed tool action."""
++        try:
++            if not isinstance(result, dict):
++                return
++
++            safe_args = {
++                key: value
++                for key, value in (tool_args or {}).items()
++                if key not in {"content", "code", "auth_token", "token", "data_url"}
++            }
++            payload = result.get("result") if isinstance(result.get("result"), dict) else {}
++            for key in ("path", "src", "dst", "url", "query", "exit_code", "status"):
++                if key not in safe_args and key in payload:
++                    safe_args[key] = payload.get(key)
++
++            ok = bool(result.get("ok", True))
++            error = str(result.get("error") or "").strip()
++            summary = self._compress_multiline(formatted, max_lines=3, max_chars=500)
++            outcome = {
++                "tool": str(tool_name or "").strip(),
++                "ok": ok,
++                "verified": True,
++                "args": safe_args,
++                "summary": summary,
++                "error": error,
++                "user_request": str(user_input or "").strip()[:500],
++                "recorded_at": datetime.now().isoformat(timespec="seconds"),
++            }
++            self.memory.add_memory(
++                "action_outcome::" + json.dumps(outcome, sort_keys=True, ensure_ascii=True),
++                kind="procedure",
++                tags=["action_outcome", str(tool_name or "unknown"), "success" if ok else "failure"],
++            )
++        except Exception:
++            # Memory recording must never turn a completed action into a failed action.
++            traceback.print_exc()
++
+     # ========================================================
+     # REFLEX LAYER
+     # ========================================================
+@@ -11992,11 +12364,10 @@ class MK1Core:
+                 pass
+ 
+         if tool_name == "file_write" and isinstance(result, dict) and bool(result.get("ok", False)):
+-            self._remember_code_artifact_memory(
+-                target_path=str(tool_args.get("path", "") or "").strip(),
+-                content=str(tool_args.get("content", "") or ""),
++            self._remember_written_artifact(
++                tool_args=tool_args,
++                result=result,
+                 user_input=user_input,
+-                source_tag="written_artifact",
+             )
+             # Log to memory for future reference (e.g., "read back the file you created")
+             file_path = tool_args.get("path", "")
+@@ -12077,6 +12448,14 @@ class MK1Core:
+         if not formatted.strip():
+             formatted = "(tool returned no output)"
+ 
++        self._remember_action_outcome(
++            tool_name=tool_name,
++            tool_args=tool_args,
++            user_input=user_input,
++            result=result,
++            formatted=formatted,
++        )
++
+         self._remember_tool_output(
+             tool_name=tool_name,
+             user_input=user_input,
+@@ -12086,10 +12465,10 @@ class MK1Core:
+         )
+ 
+         if self._should_direct_render_tool(tool_name):
+-            if tool_name == "spotify_link" or tool_name in self._truth_first_direct_tool_names():
++            if self._tool_result_may_bypass_mina(tool_name):
+                 content = formatted
+             else:
+-                content = self._render_tool_response_as_mina(
++                content = self._render_grounded_tool_analysis(
+                     messages=messages,
+                     user_input=user_input,
+                     tool_name=tool_name,
+@@ -12112,6 +12491,14 @@ class MK1Core:
+         })
+ 
+         if tool_name == "memory_read":
++            artifact_context = self._artifact_memory_context(result)
++            if artifact_context:
++                messages.append({
++                    "role": "system",
++                    "content": artifact_context,
++                })
++                return None
++
+             cleaned = self._build_memory_read_reply(
+                 messages=messages,
+                 user_query=user_input,
+@@ -14051,19 +14438,12 @@ IMPORTANT RULES:
+                     alias_hit = None
+ 
+             if alias_hit is not None:
+-                confidence = self._alias_replay_confidence(raw_text, alias_tool, alias_args)
+-                if confidence >= 0.8:
+-                    return alias_tool, alias_args
+-
+-                self._set_pending_alias_replay(
++                self._set_learned_workflow_context(
+                     phrase=raw_text,
+                     tool_name=alias_tool,
+                     tool_args=alias_args,
+-                    confidence=confidence,
+                 )
+-                return "__clarify_intent__", {
+-                    "question": "I have a learned shortcut for that phrase. Do you want me to run it now? Reply yes or no."
+-                }
++                return None, {}
+ 
+         if action_like_request:
+             # If user addressed Mina by name, let the model handle it ΓÇö don't clarify
+diff --git a/agent/core_self_fix_playbook.md b/agent/core_self_fix_playbook.md
+index 27f19f8..399f725 100644
+--- a/agent/core_self_fix_playbook.md
++++ b/agent/core_self_fix_playbook.md
+@@ -14,7 +14,7 @@ Use this before applying any autonomous or semi-autonomous change.
+ ## Non-Negotiable Rules
+ 
+ - Do not claim an action was run unless tool output for that action exists in the same turn.
+-- If a required argument is missing, ask one targeted question and stop.
++- If a required argument is missing, ask whatever follow-up questions are useful, remember the answers, and continue once the request is sufficiently understood.
+ - If user confirms run now, execute now. Do not re-explain.
+ - Verification evidence is required for every mutating action.
+ 
+diff --git a/config/mk1_config.json b/config/mk1_config.json
+index 7cb0419..e932238 100644
+--- a/config/mk1_config.json
++++ b/config/mk1_config.json
+@@ -2,7 +2,7 @@
+   "model": {
+     "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
+     "load_endpoint": "http://127.0.0.1:1234/api/v1/models/load",
+-    "default_model": "qwen/qwen3.5-9b",
++    "default_model": "qwen2.5-coder-7b-instruct",
+     "auto_fallback_on_error": false,
+     "request_timeout_seconds": 240,
+     "max_tokens": 4096,
+@@ -12,7 +12,7 @@
+     "presence_penalty": 0.3,
+     "switch_allowed": [
+       "qwen2.5-7b-instruct",
+-      "mistral-nemo-2407-12b-thinking-claude-gemini-gpt5.2-uncensored-heretic",
++      "qwen/qwen3.5-9b",
+       "dirty-muse-writer-v01-uncensored-erotica-nsfw-i1"
+     ],
+     "vision_max_tokens": 768,
+diff --git a/memory/mk1_memory.py b/memory/mk1_memory.py
+index 4eac400..aee29c5 100644
+--- a/memory/mk1_memory.py
++++ b/memory/mk1_memory.py
+@@ -2294,7 +2294,40 @@ class MK1Memory:
+         for r in merged:
+             r.pop("score", None)
+ 
+-        return merged[:top_k]
++        lexical = self._sqlite_keyword_search(
++            query,
++            max(top_k * 2, top_k),
++            include_kinds,
++            include_tags,
++            since_ts,
++        )
++        stop = {
++            "a", "an", "and", "are", "as", "at", "be", "by", "do", "for", "from",
++            "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "so",
++            "that", "the", "to", "was", "what", "when", "who", "you", "your",
++        }
++        query_tokens = [
++            token for token in re.findall(r"[a-z0-9]+", str(query or "").lower())
++            if token not in stop and len(token) > 1
++        ]
++        priority_lexical = []
++        if len(query_tokens) >= 2:
++            for item in lexical:
++                text_lower = str(item.get("text") or "").lower()
++                if all(token in text_lower for token in query_tokens):
++                    priority_lexical.append(item)
++
++        ordered = priority_lexical + merged + lexical
++        seen_ids = set()
++        results_ordered = []
++        for item in ordered:
++            item_id = item.get("id")
++            if item_id in seen_ids:
++                continue
++            seen_ids.add(item_id)
++            results_ordered.append(item)
++
++        return results_ordered[:top_k]
+ 
+     @_tracked_memory_operation("get_context", rejected=lambda self, *args, **kwargs: [])
+     def get_context(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+diff --git a/mk1_api.ps1 b/mk1_api.ps1
+index ae22f13..3582617 100644
+--- a/mk1_api.ps1
++++ b/mk1_api.ps1
+@@ -266,6 +266,14 @@ function Test-FancyGuiDevRunning {
+     )
+ 
+     try {
++        # A leftover PowerShell wrapper is not a running GUI. The Vite dev port
++        # is the reliable liveness signal for the Tauri development frontend.
++        $listener = Get-NetTCPConnection -LocalPort 1420 -State Listen -ErrorAction SilentlyContinue |
++        Select-Object -First 1
++        if ($null -eq $listener) {
++            return $false
++        }
++
+         $needle = $ResolvedGuiDir.ToLowerInvariant()
+         $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+         Where-Object {
+@@ -305,10 +313,15 @@ function Start-FancyGuiDevDetached {
+     }
+ 
+     $escapedDir = $ResolvedGuiDir.Replace("'", "''")
+-    $cmd = "Set-Location '$escapedDir'; if (Test-Path '.\\src-tauri') { pnpm tauri dev } else { pnpm dev }"
+-
+-    Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $cmd) | Out-Null
+-    Write-Host "Fancy GUI dev launched from: $ResolvedGuiDir"
++    $cmd = "`$Host.UI.RawUI.WindowTitle = 'Mina Fancy GUI'; Set-Location '$escapedDir'; if (Test-Path '.\src-tauri') { pnpm tauri dev } else { pnpm dev }; Write-Host 'Mina Fancy GUI stopped. Press Enter to close.'; Read-Host"
++
++    Start-Process powershell -ArgumentList @(
++        '-NoProfile',
++        '-ExecutionPolicy', 'Bypass',
++        '-NoExit',
++        '-Command', $cmd
++    ) -WorkingDirectory $ResolvedGuiDir -WindowStyle Normal | Out-Null
++    Write-Host "Fancy GUI dev launched in an independent status terminal from: $ResolvedGuiDir"
+     return $true
+ }
+ 
+diff --git a/start_mk1_api.ps1 b/start_mk1_api.ps1
+index 17916fe..993420f 100644
+--- a/start_mk1_api.ps1
++++ b/start_mk1_api.ps1
+@@ -94,7 +94,9 @@ function Start-EmbedServerIfNeeded {
+     param(
+         [string]$HealthUrl,
+         [string]$ScriptPath,
+-        [string]$PythonPath
++        [string]$PythonPath,
++        [string]$EmbedBindHost,
++        [int]$Port
+     )
+ 
+     if (Test-EmbedHealth -Url $HealthUrl) {
+@@ -106,8 +108,23 @@ function Start-EmbedServerIfNeeded {
+         throw "Embed server script not found: $ScriptPath"
+     }
+ 
+-    Write-Host "Embed server not healthy; starting detached..."
+-    Start-Process -FilePath $PythonPath -ArgumentList $ScriptPath -WorkingDirectory $PSScriptRoot | Out-Null
++    Write-Host "Embed server not healthy; starting in an independent status terminal..."
++    $escapedRoot = $PSScriptRoot.Replace("'", "''")
++    $escapedPython = $PythonPath.Replace("'", "''")
++    $escapedScript = $ScriptPath.Replace("'", "''")
++    $command = @"
++`$Host.UI.RawUI.WindowTitle = 'Mina Memory Server'
++Set-Location '$escapedRoot'
++& '$escapedPython' '$escapedScript' --host '$EmbedBindHost' --port '$Port'
++Write-Host 'Mina Memory Server stopped. Press Enter to close.'
++Read-Host
++"@
++    Start-Process -FilePath 'powershell' -ArgumentList @(
++        '-NoProfile',
++        '-ExecutionPolicy', 'Bypass',
++        '-NoExit',
++        '-Command', $command
++    ) -WorkingDirectory $PSScriptRoot -WindowStyle Normal | Out-Null
+ 
+     for ($i = 0; $i -lt 30; $i++) {
+         if (Test-EmbedHealth -Url $HealthUrl) {
+@@ -156,7 +173,7 @@ if (-not (Test-Path $pythonExe)) {
+ }
+ 
+ $embedPython = Resolve-PythonPath -PreferredPath $pythonExe
+-Start-EmbedServerIfNeeded -HealthUrl $embedHealthUrl -ScriptPath $embedScript -PythonPath $embedPython
++Start-EmbedServerIfNeeded -HealthUrl $embedHealthUrl -ScriptPath $embedScript -PythonPath $embedPython -EmbedBindHost $EmbedHost -Port $EmbedPort
+ 
+ $uvicornArgs = @(
+     "-m", "uvicorn", "agent.server.mk1_api:app",
+diff --git a/tests/test_memory_recall.py b/tests/test_memory_recall.py
+index 122e579..6c1e3b1 100644
+--- a/tests/test_memory_recall.py
++++ b/tests/test_memory_recall.py
+@@ -1,6 +1,7 @@
+ import sys
+ import json
+ import hashlib
++import sqlite3
+ import time
+ import threading
+ from types import SimpleNamespace
+@@ -10,6 +11,211 @@ sys.path.insert(0, 'e:/Mina_MK1')
+ import agent.core as core_module
+ from agent.core import MK1Core
+ from agent.pending_actions import PendingActionStore
++from memory.mk1_memory import MK1Memory
++
++
++def test_keyword_match_rescues_durable_workflow_memory(tmp_path):
++    db_path = tmp_path / "memory.db"
++    conn = sqlite3.connect(db_path)
++    conn.execute(
++        "CREATE TABLE memories (id INTEGER PRIMARY KEY, text TEXT, kind TEXT, tags TEXT, timestamp REAL)"
++    )
++    conn.execute(
++        "INSERT INTO memories (id, text, kind, tags, timestamp) VALUES (?, ?, ?, ?, ?)",
++        (
++            42,
++            "This week focus on rebuilding the continuity kernel; GUI work is deferred.",
++            "preference",
++            json.dumps(["user_memory", "workflow"]),
++            time.time(),
++        ),
++    )
++    conn.commit()
++    conn.close()
++
++    memory = MK1Memory.__new__(MK1Memory)
++    memory.db_path = str(db_path)
++
++    rows = memory._sqlite_keyword_search(
++        "what should we work on next continuity kernel GUI deferred",
++        top_k=5,
++        include_kinds=["preference"],
++        include_tags=["workflow"],
++        since_ts=None,
++    )
++
++    assert rows[0]["id"] == 42
++
++
++def test_artifact_memory_becomes_context_not_hook_response():
++    core = MK1Core.__new__(MK1Core)
++    core._pending_actions = PendingActionStore()
++    result = {
++        "results": [{
++            "text": (
++                "code_artifact::path=tickle.py\n"
++                "request=write the tickle script\n"
++                "content:\nprint('tickle')"
++            )
++        }]
++    }
++
++    context = core._artifact_memory_context(result)
++
++    assert "Recovered artifact memory context" in context
++    assert "tickle.py" in context
++    assert core._get_context_continuation()["artifact_path"] == ""
++    assert core._get_context_continuation()["artifact_memory_path"] == "tickle.py"
++    assert core._resolve_continuation_intent("run the tickle script") == (
++        "code_execute",
++        {
++            "code": "print('tickle')",
++            "language": "python",
++            "timeout": 30,
++            "check_dangerous": True,
++        },
++    )
++
++
++def test_normal_tool_results_use_shared_mina_feedback_path():
++    core = MK1Core.__new__(MK1Core)
++
++    assert not core._tool_result_may_bypass_mina("code_execute")
++    assert not core._tool_result_may_bypass_mina("file_read")
++    assert not core._tool_result_may_bypass_mina("web_search")
++    assert core._tool_result_may_bypass_mina("__mina_shutdown__")
++
++
++def test_every_tool_action_records_compact_verified_outcome():
++    core = MK1Core.__new__(MK1Core)
++    captured = []
++    core.memory = SimpleNamespace(add_memory=lambda text, **kwargs: captured.append((text, kwargs)))
++    core._compress_multiline = lambda text, **kwargs: str(text)
++
++    core._remember_action_outcome(
++        tool_name="file_write",
++        tool_args={"path": "tickle.py", "content": "print('secret payload')", "overwrite": True},
++        user_input="write the tickle script",
++        result={"ok": True, "result": {"path": "tickle.py"}, "error": None},
++        formatted="File written to: tickle.py",
++    )
++
++    assert len(captured) == 1
++    text, kwargs = captured[0]
++    assert text.startswith("action_outcome::")
++    assert "tickle.py" in text
++    assert "secret payload" not in text
++    assert kwargs["tags"] == ["action_outcome", "file_write", "success"]
++
++
++def test_file_write_links_verified_path_and_content_to_artifact_memory(tmp_path):
++    core = MK1Core.__new__(MK1Core)
++    core._pending_actions = PendingActionStore()
++    captured = {}
++    core._set_last_draft_artifact = lambda **kwargs: captured.update(draft=kwargs)
++    core._remember_code_artifact_memory = lambda **kwargs: captured.update(memory=kwargs)
++
++    requested_path = "time.sleep"
++    verified_path = str(tmp_path / "tickle_mina.py")
++    core._remember_written_artifact(
++        tool_args={"path": requested_path, "content": "print('tickle')"},
++        result={"ok": True, "result": {"written": True, "path": verified_path}},
++        user_input="write the tickle script",
++    )
++
++    assert captured["draft"]["target_path"] == verified_path
++    assert captured["memory"]["target_path"] == verified_path
++    assert captured["memory"]["content"] == "print('tickle')"
++
++
++def test_exact_conversational_workflow_alias_can_drive_action():
++    core = MK1Core.__new__(MK1Core)
++    core._intent_alias_cache = {
++        "tickle fight time": {
++            "tool": "code_execute",
++            "args": {"code": "print('tickle')", "language": "python"},
++        }
++    }
++    core.tools = SimpleNamespace(tools={"code_execute": object()})
++
++    assert MK1Core._resolve_intent_alias(core, "tickle fight time") == (
++        "code_execute",
++        {"code": "print('tickle')", "language": "python"},
++    )
++
++    assert MK1Core._resolve_intent_alias(core, "tickle fight time!") == (
++        "code_execute",
++        {"code": "print('tickle')", "language": "python"},
++    )
++
++    assert MK1Core._resolve_intent_alias(
++        core,
++        "stealth mode activated tickle attack target spotted tickle fight activated",
++    ) == (
++        "code_execute",
++        {"code": "print('tickle')", "language": "python"},
++    )
++
++    core._set_learned_workflow_context(
++        "tickle fight time",
++        "code_execute",
++        {"code": "print('tickle')", "language": "python"},
++    )
++    assert "shared activity shorthand" in core._get_pending_action("learned_workflow_context")["context"]
++
++
++def test_artifact_path_extraction_rejects_python_member_access():
++    core = MK1Core.__new__(MK1Core)
++    assert core._infer_draft_target_path(
++        "tickle fight",
++        "time.sleep(0.5)\nwith open('/this/file.txt') as f: pass",
++    ) == ""
++    assert core._infer_draft_target_path("tickle fight", "time.sleep(0.5)") == ""
++
++
++def test_retry_followup_replays_learned_execution():
++    core = MK1Core.__new__(MK1Core)
++    core._pending_actions = PendingActionStore()
++    core.tools = SimpleNamespace(tools={"code_execute": object()})
++    core._set_learned_workflow_context(
++        "tickle fight time",
++        "code_execute",
++        {"code": "print('tickle')", "language": "python"},
++    )
++    assert MK1Core._resolve_continuation_intent(core, "if not did it run correctly try again") == (
++        "code_execute",
++        {
++            "code": "print('tickle')",
++            "language": "python",
++            "timeout": 30,
++            "check_dangerous": True,
++        },
++    )
++
++
++def test_conversational_code_replay_does_not_append_draft_artifact():
++    core = MK1Core.__new__(MK1Core)
++    core._set_last_draft_artifact = lambda **kwargs: (_ for _ in ()).throw(AssertionError("unexpected draft"))
++    core._remember_code_artifact_memory = lambda **kwargs: (_ for _ in ()).throw(AssertionError("unexpected memory"))
++
++    core._remember_draft_artifact_from_turn(
++        "the tickle script silly",
++        "```python\nprint('tickle')\n```",
++    )
++
++
++def test_explicit_script_creation_can_still_remember_draft_artifact():
++    core = MK1Core.__new__(MK1Core)
++    captured = {}
++    core._set_last_draft_artifact = lambda **kwargs: captured.update(kwargs)
++    core._remember_code_artifact_memory = lambda **kwargs: captured.update(memory=kwargs)
++
++    core._remember_draft_artifact_from_turn(
++        "write a script named tickle.py",
++        "```python\nprint('tickle')\n```",
++    )
++
++    assert captured["target_path"] == "tickle.py"
+ 
+ 
+ class FakeMemory:
+@@ -933,11 +1139,29 @@ def test_web_search_gpu_vram_response_synthesizes_direct_answer_with_sources():
+         },
+     )
+ 
+-    low = msg.lower()
+-    assert "rx 6700 xt has 12 gb of vram" in low
+-    assert "sources:" in low
+-    assert "techpowerup.com" in low
+ 
++def test_memory_only_artifact_retry_never_uses_corrupt_path():
++    core = MK1Core.__new__(MK1Core)
++    core._pending_actions = PendingActionStore()
++    core.tools = SimpleNamespace(tools={"code_execute": object(), "memory_read": object()})
++    core._set_pending_action("context_continuation", {
++        "tool_name": "memory_read",
++        "tool_args": {},
++        "artifact_path": "time.sleep",
++        "artifact_memory_path": "time.sleep",
++        "artifact_content": "print('tickle')",
++        "created_at": time.time(),
++    })
++
++    assert MK1Core._resolve_continuation_intent(core, "try again") == (
++        "code_execute",
++        {
++            "code": "print('tickle')",
++            "language": "python",
++            "timeout": 30,
++            "check_dangerous": True,
++        },
++    )
+ 
+ def test_web_search_gpu_vram_response_falls_back_to_listing_without_numeric_evidence():
+     core = MK1Core.__new__(MK1Core)

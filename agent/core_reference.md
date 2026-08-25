@@ -15,9 +15,12 @@ Use it before making changes so you touch the correct zone first.
 - autonomous idle work
 - project tracker and scaffolding helpers
 
+Maintainer rule:
+Memory is Mina. Do not replace normal learned behavior with hardcoded chat or routing shortcuts. Use hardcoded logic only for stable protocol and safety invariants.
+
 ## File Scale Snapshot
 
-- Function count: 363
+- Function count: 368
 - Main classes:
   - `LMStudioClient`
   - `MK1Core`

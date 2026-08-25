@@ -54,12 +54,21 @@ powershell -ExecutionPolicy Bypass -File .\tools\refresh_core_reference.ps1
 
 ## Implementation Choice Rule
 
-- Use memory-driven behavior for user habits, evolving aliases, and learned workflow context.
+- Memory is Mina. Memory-driven behavior is the default for user habits, evolving aliases, learned workflow context, and normal chat/routing behavior.
+- Do not replace memory with hardcoded behavior for routine conversational logic, tool routing, or learned user patterns.
 - Use hardcoded behavior only for deterministic routing rules, safety constraints, protocol contracts, and stable system invariants.
+- When a fix affects Mina's conversational memory or learned behavior, prefer memory-first repair and validation over bypass logic.
 
 ## Live Validation Rule
 
 - For runtime routing or execution fixes, prefer a live API proof through `/process` or the repo scripts when feasible, not only unit tests.
+
+## Workflow Efficiency Rule
+
+- When the user asks for a status update, TODO recap, or catch-up summary, do not keep re-reading the whole project in the same active chat. Summarize only the current branch state and blockers, then either compact the session or start a fresh chat before implementation.
+- If a session crosses a long discovery phase, prefer a file-scoped pass before broad repo reads. Start from the specific file, error, or task, and only widen scope when the first pass cannot answer the question.
+- For routine follow-up work such as "read the todo", "catch me up", or "what changed", use a short summary-first workflow instead of continuing a context-heavy debugging thread.
+- Always use a cheaper model for recap, status, TODO review, and lightweight context refreshes. Premium models are reserved for actual debugging, code changes, and implementation work where reasoning quality materially matters.
 
 ## TODO Contract
 

@@ -1,5 +1,5 @@
 import agent.core as core_module
-from agent.core import LMStudioClient
+from agent.core import LMStudioClient, MK1Core
 
 
 class FakeResponse:
@@ -63,3 +63,33 @@ def test_chat_max_tokens_override_replaces_configured_default(monkeypatch):
     client.chat([{"role": "user", "content": "hi"}], max_tokens_override=1200)
 
     assert captured["payload"]["max_tokens"] == 1200
+
+
+def test_extract_text_does_not_promote_reasoning_to_chat_reply():
+    core = MK1Core.__new__(MK1Core)
+
+    payload = {
+        "choices": [{
+            "message": {
+                "content": "",
+                "reasoning_content": "ghost the\n\n,, to with: is, _file:",
+            }
+        }]
+    }
+
+    assert core._extract_text(payload) == ""
+
+
+def test_extract_text_preserves_visible_content_and_emoji():
+    core = MK1Core.__new__(MK1Core)
+
+    payload = {
+        "choices": [{
+            "message": {
+                "content": "Hi 😊",
+                "reasoning_content": "hidden reasoning",
+            }
+        }]
+    }
+
+    assert core._extract_text(payload) == "Hi 😊"

@@ -14510,13 +14510,7 @@ IMPORTANT RULES:
             )
 
             # Never allow hidden reasoning fields to leak into user-visible text.
-            # But if content is empty and reasoning_content has text, qwen put everything
-            # in the think block — use reasoning_content as fallback before discarding it.
-            reasoning_fallback = ""
             if isinstance(msg, dict):
-                rc = msg.get("reasoning_content", "")
-                if isinstance(rc, str) and rc.strip():
-                    reasoning_fallback = rc.strip()
                 msg.pop("reasoning_content", None)
 
             content = msg.get("content", "") if isinstance(msg, dict) else ""
@@ -14558,7 +14552,7 @@ IMPORTANT RULES:
                 except Exception:
                     pass
 
-            return self._strip_think_tags(text) or self._strip_think_tags(reasoning_fallback)
+            return self._strip_think_tags(text)
 
         return ""
 

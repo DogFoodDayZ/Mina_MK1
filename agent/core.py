@@ -3714,6 +3714,11 @@ class MK1Core:
         try:
             user_mem = str(user_input or "").strip()
             assistant_mem = str(assistant_text or "").strip()
+            model_name = re.sub(
+                r"[^a-z0-9_.-]+",
+                "_",
+                str(getattr(getattr(self, "model", None), "default_model", "mina_core") or "mina_core").lower(),
+            ).strip("._-") or "mina_core"
 
             self._remember_draft_artifact_from_turn(user_mem, assistant_mem)
 
@@ -3725,7 +3730,7 @@ class MK1Core:
             if len(assistant_mem) > 1800:
                 assistant_mem = self._compress_multiline(assistant_mem, max_lines=24, max_chars=1800)
 
-            user_tags = ["short_term", "user_turn"]
+            user_tags = ["short_term", "user_turn", f"model:{model_name}"]
             correction_patterns = [
                 r"\bthat was (?:a|an) .{2,60} request\b",
                 r"\bi meant (?:to|that|a|an)\b",
@@ -3735,7 +3740,7 @@ class MK1Core:
             if any(re.search(pattern, user_mem, re.IGNORECASE) is not None for pattern in correction_patterns):
                 user_tags.extend(["user_memory", "routing_correction"])
 
-            assistant_tags = ["short_term", "assistant_turn"]
+            assistant_tags = ["short_term", "assistant_turn", f"model:{model_name}"]
 
             if is_ostranauts_query(user_mem):
                 user_tags.append("ostranauts")
@@ -4182,6 +4187,46 @@ class MK1Core:
             traceback.print_exc()
             return f"VERIFIED OUTPUT:\n```text\n{formatted}\n```"
 
+    @staticmethod
+    def _wants_file_summary(user_input: str) -> bool:
+        return re.search(r"\b(?:summari[sz]e|summary|overview|brief)\b", str(user_input or ""), re.IGNORECASE) is not None
+
+    @staticmethod
+    def _summarize_file_read_content(user_input: str, content: str) -> str:
+        lines = str(content or "").splitlines()
+        is_todo = str(user_input or "").lower().find("todo.md") >= 0
+        if is_todo:
+            active_backlog = False
+            section = ""
+            tasks: List[str] = []
+            for line in lines:
+                heading = line.strip()
+                if heading.lower() == "## next":
+                    active_backlog = True
+                    continue
+                if active_backlog and heading.lower().startswith("### issue:"):
+                    break
+                if not active_backlog:
+                    continue
+                if heading.startswith("### "):
+                    section = heading[4:].strip()
+                    continue
+                match = re.match(r"^\s*- \[ \]\s+(.+?)\s*$", line)
+                if match and section.lower() != "autonomous work intake":
+                    tasks.append(match.group(1).strip())
+            if tasks:
+                preview = tasks[:12]
+                suffix = "" if len(tasks) <= len(preview) else f"\n- ... and {len(tasks) - len(preview)} more"
+                return f"Active TODO backlog ({len(tasks)} unchecked):\n" + "\n".join(
+                    f"- {task}" for task in preview
+                ) + suffix
+            return "The active TODO backlog has no unchecked tasks."
+
+        nonempty = [line.strip() for line in lines if line.strip()]
+        preview = nonempty[:8]
+        suffix = "" if len(nonempty) <= len(preview) else f"\n... ({len(nonempty) - len(preview)} additional non-empty lines)"
+        return "File summary:\n" + "\n".join(preview) + suffix if preview else "The file is empty."
+
     def _render_tool_response_as_mina(
         self,
         messages: List[Dict[str, Any]],
@@ -4197,6 +4242,11 @@ class MK1Core:
 
         if tool_name in self._raw_direct_render_tool_names():
             return formatted
+
+        if tool_name == "file_read" and self._wants_file_summary(user_input):
+            # Why: requested file summaries could fall back to a full raw-file dump.
+            # Guard: summarize locally and bound output before any model analysis can expand it.
+            return self._summarize_file_read_content(user_input, formatted)
 
         if tool_name == "file_read" and not self._wants_grounded_tool_analysis(user_input):
             return formatted
@@ -5782,6 +5832,63 @@ class MK1Core:
     def _autonomy_audit_path(self) -> str:
         return os.path.join(self._autonomy_root(), "audit.jsonl")
 
+    def _autonomy_approved_tasks_path(self) -> str:
+        return os.path.join(self._autonomy_root(), "approved_tasks.json")
+
+    def _load_autonomy_approved_tasks(self) -> List[Dict[str, Any]]:
+        try:
+            with open(self._autonomy_approved_tasks_path(), "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            tasks = payload.get("tasks") if isinstance(payload, dict) else []
+            if not isinstance(tasks, list):
+                return []
+            return [dict(task) for task in tasks if isinstance(task, dict)]
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return []
+
+    def _save_autonomy_approved_tasks(self, tasks: List[Dict[str, Any]]) -> None:
+        os.makedirs(self._autonomy_root(), exist_ok=True)
+        path = self._autonomy_approved_tasks_path()
+        temporary = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump({"schema": 1, "tasks": tasks}, handle, indent=2, sort_keys=True, ensure_ascii=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+
+    def _add_autonomy_approved_task(
+        self,
+        title: str,
+        proof_target: str,
+        allowed_action: str,
+        done_when: str,
+        source_task_key: str = "",
+    ) -> Dict[str, Any]:
+        title_text = str(title or "").strip()
+        proof_text = str(proof_target or "").strip()
+        done_text = str(done_when or "").strip()
+        action = str(allowed_action or "").strip().lower()
+        if not title_text or not proof_text or not done_text:
+            return {"ok": False, "error": "title_proof_target_and_done_when_required"}
+        if action not in {"read_only", "test_run", "proposed_patch"}:
+            return {"ok": False, "error": "allowed_action_invalid"}
+
+        task_id = hashlib.sha1(f"{time.time_ns()}:{title_text}:{proof_text}".encode("utf-8")).hexdigest()[:16]
+        task = {
+            "id": task_id,
+            "key": f"approved:{task_id}",
+            "title": title_text[:240],
+            "proof_target": proof_text[:500],
+            "allowed_action": action,
+            "done_when": done_text[:500],
+            "source_task_key": str(source_task_key or "").strip(),
+            "status": "pending",
+            "approved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        tasks = self._load_autonomy_approved_tasks()
+        tasks.append(task)
+        self._save_autonomy_approved_tasks(tasks)
+        return {"ok": True, "task": task}
+
     def _watchdog_root(self) -> str:
         configured = self.config.get(
             "curiosity",
@@ -5792,6 +5899,38 @@ class MK1Core:
 
     def _watchdog_candidate_path(self) -> str:
         return os.path.join(self._watchdog_root(), "candidate.json")
+
+    def _autonomous_watchdog_ready(self) -> Tuple[bool, str]:
+        root = self._watchdog_root()
+        state_path = os.path.join(root, "state.json")
+        pid_path = os.path.join(root, "watchdog.pid")
+        try:
+            with open(state_path, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+            if not isinstance(state, dict) or state.get("healthy") is not True:
+                return False, "watchdog_not_healthy"
+            updated_at = datetime.fromisoformat(str(state.get("updated_at") or "").replace("Z", "+00:00"))
+            max_age = max(15, int(self.config.get("curiosity", "watchdog_state_max_age_seconds", 90)))
+            if abs(time.time() - updated_at.timestamp()) > max_age:
+                return False, "watchdog_state_stale"
+            with open(pid_path, "r", encoding="utf-8") as handle:
+                pid = int(handle.read().strip())
+            if os.name == "nt":
+                probe = subprocess.run(
+                    ["tasklist.exe", "/FI", f"PID eq {pid}", "/NH"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if probe.returncode != 0 or str(pid) not in probe.stdout:
+                    return False, "watchdog_process_not_running"
+            else:
+                os.kill(pid, 0)
+        except FileNotFoundError:
+            return False, "watchdog_state_or_pid_missing"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.TimeoutExpired):
+            return False, "watchdog_process_not_running"
+        return True, ""
 
     def _write_watchdog_candidate(self, candidate: Dict[str, Any]) -> None:
         root = self._watchdog_root()
@@ -5886,9 +6025,39 @@ class MK1Core:
 
         return False
 
-    def _autonomous_work_candidates(self) -> List[Dict[str, Any]]:
-        completed = self._completed_autonomy_keys()
-        candidates: List[Dict[str, Any]] = []
+    @staticmethod
+    def _autonomous_task_has_proof_target(title: str, details: List[str]) -> bool:
+        task_text = " ".join([str(title or ""), *[str(item or "") for item in details]]).lower()
+        if re.search(r"\b(?:archive|delete|destroy|prune|remove)\b", task_text):
+            return False
+        if re.search(r"\b(?:reboot|sign-in|while parked|manual)\b", task_text):
+            return False
+        if re.search(r"\b[\w./\\-]+\.(?:py|ps1|js|jsx|ts|tsx|kt|kts|json|md|zip)\b", task_text):
+            return True
+        if re.search(r"\b(?:get|post|put|patch|delete)\s+`?/[a-z0-9_/?=&.-]+", task_text):
+            return True
+        return bool(re.search(r"\b(?:pytest|python(?:\.exe)?|powershell(?:\.exe)?|npm|pnpm|gradlew)\b", task_text))
+
+    def _autonomous_task_defer_reason(
+        self,
+        title: str,
+        details: List[str],
+        section_context: str,
+        suspended_keywords: set,
+    ) -> str:
+        task_text = " ".join([section_context, title, *details]).lower()
+        if any(keyword in task_text for keyword in suspended_keywords):
+            return "suspended_topic"
+        if re.search(r"\b(?:archive|delete|destroy|prune|remove)\b", task_text):
+            return "destructive_operation"
+        if re.search(r"\b(?:reboot|sign-in|while parked|manual)\b", task_text):
+            return "manual_validation_required"
+        if not self._autonomous_task_has_proof_target(title, details):
+            return "no_proof_target"
+        return ""
+
+    def _autonomous_todo_items(self) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
         todo_paths = self.config.get(
             "curiosity",
             "todo_paths",
@@ -5904,7 +6073,23 @@ class MK1Core:
                     lines = handle.readlines()
             except Exception:
                 continue
+            has_active_backlog = any(item.strip().lower() == "## next" for item in lines)
+            active_backlog = not has_active_backlog
+            section_context = ""
             for index, line in enumerate(lines):
+                heading = line.strip().lower()
+                if heading == "## next":
+                    active_backlog = True
+                    continue
+                if active_backlog and heading.startswith("### issue:"):
+                    active_backlog = False
+                if not active_backlog:
+                    continue
+                if heading.startswith("### "):
+                    section_context = heading
+                    continue
+                if section_context == "### autonomous work intake":
+                    continue
                 match = re.match(r"^\s*- \[ \]\s+(.+?)\s*$", line)
                 if not match:
                     continue
@@ -5916,19 +6101,38 @@ class MK1Core:
                     detail_match = re.match(r"^\s{2,}-\s+(.+?)\s*$", following)
                     if detail_match:
                         details.append(detail_match.group(1).strip())
-                key = "todo:" + hashlib.sha1(f"{path}:{title}".encode("utf-8")).hexdigest()[:16]
-                if key not in completed:
-                    candidates.append({
-                        "key": key,
-                        "title": title,
-                        "details": details,
-                        "source": "todo",
-                        "reference": path,
-                        "project_root": next(
-                            (root for root in self._autonomous_project_roots() if self._autonomous_path_within(path, root)),
-                            "",
-                        ),
-                    })
+                items.append({
+                    "key": "todo:" + hashlib.sha1(f"{path}:{title}".encode("utf-8")).hexdigest()[:16],
+                    "title": title,
+                    "details": details,
+                    "section_context": section_context,
+                    "source": "todo",
+                    "reference": path,
+                    "project_root": next(
+                        (root for root in self._autonomous_project_roots() if self._autonomous_path_within(path, root)),
+                        "",
+                    ),
+                })
+        return items
+
+    def _autonomous_work_candidates(self) -> List[Dict[str, Any]]:
+        completed = self._completed_autonomy_keys()
+        candidates: List[Dict[str, Any]] = []
+        suspended_keywords = {
+            str(keyword or "").strip().lower()
+            for keyword in self.config.get("curiosity", "suspended_task_keywords", [])
+            if str(keyword or "").strip()
+        }
+        for item in self._autonomous_todo_items():
+            if item["key"] in completed:
+                continue
+            # Why: broad TODO intentions consumed idle cycles without an executable proof surface.
+            # Guard: autonomous work starts only when it can inspect or verify a concrete target.
+            if self._autonomous_task_defer_reason(
+                item["title"], item["details"], item["section_context"], suspended_keywords,
+            ):
+                continue
+            candidates.append({key: value for key, value in item.items() if key != "section_context"})
 
         tracker = self._load_project_tracker()
         for project in self._projects_to_complete(tracker):
@@ -5937,6 +6141,10 @@ class MK1Core:
             for step in project.get("next_steps", []) if isinstance(project.get("next_steps"), list) else []:
                 title = str(step or "").strip()
                 if not title:
+                    continue
+                if any(keyword in title.lower() for keyword in suspended_keywords):
+                    continue
+                if not self._autonomous_task_has_proof_target(title, [f"Project: {project_name}"]):
                     continue
                 key = "tracker:" + hashlib.sha1(f"{project_name}:{title}".encode("utf-8")).hexdigest()[:16]
                 if key not in completed:
@@ -5948,7 +6156,99 @@ class MK1Core:
                         "reference": self._project_tracker_path(),
                         "project_root": project_root,
                     })
+        default_root = next(iter(self._autonomous_project_roots()), "")
+        for task in self._load_autonomy_approved_tasks():
+            key = str(task.get("key") or "").strip()
+            if not key or key in completed or str(task.get("status") or "pending").lower() != "pending":
+                continue
+            candidates.append({
+                "key": key,
+                "title": str(task.get("title") or "Approved task").strip(),
+                "details": [
+                    f"Proof target: {str(task.get('proof_target') or '').strip()}",
+                    f"Allowed action: {str(task.get('allowed_action') or '').strip()}",
+                    f"Done when: {str(task.get('done_when') or '').strip()}",
+                ],
+                "source": "approved_task",
+                "reference": self._autonomy_approved_tasks_path(),
+                "project_root": default_root,
+                "allowed_action": str(task.get("allowed_action") or "read_only").strip(),
+            })
         return candidates
+
+    def _autonomous_decision_summary(self) -> Dict[str, Any]:
+        completed = self._completed_autonomy_keys()
+        suspended_keywords = {
+            str(keyword or "").strip().lower()
+            for keyword in self.config.get("curiosity", "suspended_task_keywords", [])
+            if str(keyword or "").strip()
+        }
+        deferred_by_reason: Dict[str, int] = {}
+        deferred_preview: List[Dict[str, str]] = []
+        eligible_preview: List[Dict[str, str]] = []
+        for item in self._autonomous_todo_items():
+            if item["key"] in completed:
+                continue
+            reason = self._autonomous_task_defer_reason(
+                item["title"], item["details"], item["section_context"], suspended_keywords,
+            )
+            if reason:
+                deferred_by_reason[reason] = deferred_by_reason.get(reason, 0) + 1
+                if len(deferred_preview) < 20:
+                    deferred_preview.append({
+                        "key": item["key"],
+                        "title": item["title"],
+                        "reason": reason,
+                        "reference": item["reference"],
+                    })
+                continue
+            if len(eligible_preview) < 5:
+                eligible_preview.append({
+                    "key": item["key"],
+                    "title": item["title"],
+                    "source": item["source"],
+                    "reference": item["reference"],
+                })
+
+        latest_outcome = "none"
+        model_unavailable_count = 0
+        try:
+            with open(self._autonomy_audit_path(), "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    if str(row.get("error") or "") == "model_unavailable":
+                        model_unavailable_count += 1
+                    outcome = str(row.get("outcome") or "").strip()
+                    if outcome:
+                        latest_outcome = outcome
+                    elif row.get("error"):
+                        latest_outcome = "blocked"
+        except FileNotFoundError:
+            pass
+
+        watchdog_ready, watchdog_error = self._autonomous_watchdog_ready()
+        source_edits_configured = bool(self.config.get("curiosity", "allow_source_edits", False))
+        return {
+            "eligible_count": len(self._autonomous_work_candidates()),
+            "eligible_preview": eligible_preview,
+            "deferred_count": sum(deferred_by_reason.values()),
+            "deferred_by_reason": deferred_by_reason,
+            "deferred_preview": deferred_preview,
+            "approved_task_count": len(self._load_autonomy_approved_tasks()),
+            "last_outcome": latest_outcome,
+            "model_unavailable_count": model_unavailable_count,
+            "watchdog": {
+                "ready": watchdog_ready,
+                "error": watchdog_error or None,
+                "source_edits_configured": source_edits_configured,
+                "source_edits_permitted": source_edits_configured and watchdog_ready,
+            },
+        }
 
     def _autonomous_context_files(self, task: Dict[str, Any], project_root: str) -> List[Dict[str, str]]:
         task_text = " ".join([
@@ -6071,6 +6371,11 @@ class MK1Core:
         allowed, relative_paths, error = self._validate_autonomous_patch_paths(patch, project_root)
         if not allowed:
             return {"ok": False, "applied": False, "error": error, "files": relative_paths}
+        # Why: config alone allowed an autonomous patch while its independent rollback monitor was stopped.
+        # Guard: fail closed unless the watchdog proves it is both live and recently healthy.
+        watchdog_ready, watchdog_error = self._autonomous_watchdog_ready()
+        if not watchdog_ready:
+            return {"ok": False, "applied": False, "error": watchdog_error, "files": relative_paths}
         created_files = [
             relative for relative in relative_paths
             if not os.path.exists(os.path.join(project_root, relative))
@@ -6247,6 +6552,7 @@ class MK1Core:
             "result": {
                 "curiosity": curiosity_status,
                 "autonomous_tool_status": self._autonomous_tool_status(),
+                "decision_summary": self._autonomous_decision_summary(),
                 "pending_candidate_count": len(candidates),
                 "pending_candidates": preview,
             },
@@ -6370,16 +6676,6 @@ class MK1Core:
         elif patch:
             patch_result = {"ok": True, "applied": False, "reason": "source_edits_disabled"}
 
-        result = {
-            "ok": bool(summary) and bool(patch_result.get("ok")),
-            "summary": summary,
-            "confidence": parsed.get("confidence"),
-            "evidence": parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else [],
-            "next_step": str(parsed.get("next_step") or "").strip(),
-            "patch": patch_result,
-            "context_files": [item["path"] for item in context_files],
-            "duration_seconds": round(time.time() - started_at, 3),
-        }
         patch_applied = bool(patch_result.get("applied"))
         validations_value = patch_result.get("validations")
         raw_validations: List[Any] = validations_value if isinstance(validations_value, list) else []
@@ -6389,13 +6685,27 @@ class MK1Core:
             item.get("name") == "pytest_full" and bool(item.get("ok"))
             for item in validation_items
         )
+        # Why: a non-empty model summary was treated as successful completed work.
+        # Guard: only an applied patch with passing recorded validations can close a task.
+        completion_verified = patch_applied and bool(patch_result.get("ok", False)) and validations_ok
+        result = {
+            "ok": completion_verified,
+            "outcome": "verified_complete" if completion_verified else "research_complete",
+            "summary": summary,
+            "confidence": parsed.get("confidence"),
+            "evidence": parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else [],
+            "next_step": str(parsed.get("next_step") or "").strip(),
+            "patch": patch_result,
+            "context_files": [item["path"] for item in context_files],
+            "duration_seconds": round(time.time() - started_at, 3),
+        }
         result["verification"] = {
             "policy": "verified_completion_requires_structured_proof",
             "patch_applied": patch_applied,
             "validations_ok": validations_ok,
             "pytest_full_ok": pytest_full_ok,
             "live_api_proof": False,
-            "completion_verified": patch_applied and bool(patch_result.get("ok", False)),
+            "completion_verified": completion_verified,
         }
         self._write_autonomy_audit({
             "ts": time.time(),
@@ -9331,6 +9641,22 @@ class MK1Core:
     ) -> Tuple[str, Dict[str, Any], str]:
         tool_args = self._parse_tool_args(args_str)
 
+        if tool_name == "file_read" and not str(tool_args.get("path") or "").strip():
+            tool_result_dict = {
+                "ok": False,
+                "result": None,
+                "error": "file_read_requires_explicit_path",
+            }
+            self._capture_tool_failure_for_learning(
+                tool_name=tool_name,
+                tool_result=tool_result_dict,
+                user_intent=user_intent,
+            )
+            return tool_name, tool_result_dict, (
+                "[TOOL FAILED] file_read: an explicit file path is required. "
+                "Ask the user for the exact path instead of guessing."
+            )
+
         hardware_context_query = (
             self._is_local_hardware_question(user_intent)
             or self._is_hardware_followup_query(user_intent)
@@ -12156,6 +12482,14 @@ class MK1Core:
             write_tags = tool_args.get("tags", ["user_memory"])
             if not isinstance(write_tags, list):
                 write_tags = ["user_memory"]
+            model_name = re.sub(
+                r"[^a-z0-9_.-]+",
+                "_",
+                str(getattr(getattr(self, "model", None), "default_model", "mina_core") or "mina_core").lower(),
+            ).strip("._-") or "mina_core"
+            write_tags = list(write_tags)
+            if f"model:{model_name}" not in write_tags:
+                write_tags.append(f"model:{model_name}")
             memory_id = self.memory.add_task_memory(
                 str(tool_args.get("text", "") or ""),
                 due_at=tool_args.get("due_at"),
@@ -12221,6 +12555,20 @@ class MK1Core:
         elif tool_name == "__scaffold__":
             result = self._execute_scaffold_request(user_input)
         else:
+            if tool_name == "memory_write":
+                tool_args = dict(tool_args or {})
+                write_tags = tool_args.get("tags", [])
+                if not isinstance(write_tags, list):
+                    write_tags = []
+                model_name = re.sub(
+                    r"[^a-z0-9_.-]+",
+                    "_",
+                    str(getattr(getattr(self, "model", None), "default_model", "mina_core") or "mina_core").lower(),
+                ).strip("._-") or "mina_core"
+                write_tags = list(write_tags)
+                if f"model:{model_name}" not in write_tags:
+                    write_tags.append(f"model:{model_name}")
+                tool_args["tags"] = write_tags
             result = self.tools.run(tool_name, tool_args)
 
         tool_name, tool_args, result, _recovered = self._recover_failed_tool_once(
@@ -12765,6 +13113,16 @@ IMPORTANT RULES:
         t = raw_text.lower().strip()
         action_like_request = self._is_action_request_like(raw_text)
         intent_signals = self._intent_signal_profile(raw_text)
+
+        path_correction = re.search(
+            r"\b(?:that\s+)?(?:file|folder|directory|path)\s+(?:is|was|lives?|located)\s+(?:in|at)\s+",
+            raw_text,
+            re.IGNORECASE,
+        )
+        if path_correction:
+            corrected_path = self._extract_explicit_windows_path(raw_text)
+            if corrected_path and os.path.isdir(corrected_path):
+                return "dir_list", {"path": corrected_path}
 
         if self._get_pending_write_authorization() is not None:
             if self._is_write_authorization_confirmation(raw_text):

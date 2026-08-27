@@ -429,6 +429,75 @@ def test_hardware_ps_probe_is_upgraded_to_combined_cpu_gpu_query():
     assert "Win32_VideoController" in calls[0][1]["script"]
 
 
+def test_file_path_correction_supersedes_stale_directory_context(tmp_path):
+    core = _core_for_intent_tests()
+    corrected = str(tmp_path)
+
+    tool_name, args = MK1Core.detect_tool_intent(
+        core,
+        f"that file is in {corrected}",
+    )
+
+    assert tool_name == "dir_list"
+    assert args["path"] == corrected
+
+
+def test_shared_tool_executor_rejects_file_read_without_path():
+    core = _core_for_intent_tests()
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    core.tools = SimpleNamespace(tools={}, run=lambda *_args: (_ for _ in ()).throw(AssertionError("must not execute")))
+
+    tool_name, result, message = MK1Core._execute_process_tool_call(
+        core,
+        tool_name="file_read",
+        args_str="",
+        user_intent="you lol",
+    )
+
+    assert tool_name == "file_read"
+    assert result["error"] == "file_read_requires_explicit_path"
+    assert "Ask the user for the exact path" in message
+
+
+def test_transcript_prompt_read_and_summarize_todo_is_bounded_to_active_backlog():
+    content = "\n".join([
+        "# TODO",
+        "- [ ] Historical item",
+        "## Next",
+        "### Autonomous Work Intake",
+        "- [ ] <bounded task title>",
+        "### Core work",
+        "- [ ] Run pytest tests/test_worker.py",
+        "### Issue: Old record",
+        "- [ ] Historical done criterion",
+    ])
+
+    summary = MK1Core._summarize_file_read_content(
+        "Read E:\\Mina_MK1\\TODO.md and summarize the active autonomous backlog.",
+        content,
+    )
+
+    assert "Run pytest tests/test_worker.py" in summary
+    assert "Historical item" not in summary
+    assert "<bounded task title>" not in summary
+    assert "Historical done criterion" not in summary
+
+
+def test_file_read_without_summary_request_preserves_full_content():
+    core = _core_for_intent_tests()
+
+    reply = MK1Core._render_tool_response_as_mina(
+        core,
+        messages=[],
+        user_input="Read E:\\Mina_MK1\\TODO.md",
+        tool_name="file_read",
+        formatted="full file content",
+        tool_ok=True,
+    )
+
+    assert reply == "full file content"
+
+
 def test_shared_model_tool_loop_executes_tool_and_stops_on_final_reply():
     core = _core_for_intent_tests()
     core._capture_tool_failure_for_learning = lambda **_kwargs: None

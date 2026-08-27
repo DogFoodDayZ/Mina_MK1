@@ -1,0 +1,20 @@
+/* index.css — global reset and viewport normalization */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: #000;
+  font-family: monospace;
+}
+
+/* Prevent text zooming on mobile (harmless on desktop) */
+html {
+  -webkit-text-size-adjust: 100%;
+}

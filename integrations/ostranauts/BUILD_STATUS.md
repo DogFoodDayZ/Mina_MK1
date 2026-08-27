@@ -55,18 +55,18 @@ Verified during backup #3:
 
 ### Desktop GUI ownership
 
-The active desktop GUI is the Tauri app in `C:\dev\mina-gui`.
+The active desktop GUI is the Tauri app in `E:\Mina_MK1\apps\mina-gui`.
 
-- Base GUI: `C:\dev\mina-gui\src\App.jsx`
-- Companion component: `C:\dev\mina-gui\src\components\OstranautsCompanion.jsx`
-- Companion styles: `C:\dev\mina-gui\src\components\OstranautsCompanion.css`
-- Tauri window creation: `C:\dev\mina-gui\src-tauri\src\lib.rs`
+- Base GUI: `E:\Mina_MK1\apps\mina-gui\src\App.jsx`
+- Companion component: `E:\Mina_MK1\apps\mina-gui\src\components\OstranautsCompanion.jsx`
+- Companion styles: `E:\Mina_MK1\apps\mina-gui\src\components\OstranautsCompanion.css`
+- Tauri window creation: `E:\Mina_MK1\apps\mina-gui\src-tauri\src\lib.rs`
 - Companion route: `index.html?view=ostranauts`
 - Window title: `Mina // Ostranauts Companion`
 
 The `OPEN OSTRANAUTS COMPANION` button in Mina's base GUI opens/toggles the second Tauri window. Both Mina windows can coexist with Ostranauts and switch normally.
 
-Do not treat `agent/gui/mina_gui.py` or the root `mina_gui.py` shim as the active interface.
+Do not treat `agent/gui/mina_gui.py` or the root `mina_gui.py` shim as the active interface. The prior `C:\dev\mina-gui` working copy remains a rollback source until the repo-local GUI has been used successfully.
 
 ## Completed
 

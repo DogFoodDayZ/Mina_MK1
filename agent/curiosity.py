@@ -31,6 +31,23 @@ DEFAULT_EXCLUDED_PARTS = {
     "windows.old",
 }
 
+DISCOVERY_NOISE_PARTS = {
+    ".git",
+    ".openclaw_backup",
+    "archive",
+    "backups",
+    "build",
+    "dist",
+    "node_modules",
+    "tmp",
+}
+
+DISCOVERY_NOISE_FILENAMES = {
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+}
+
 SECRET_NAME_PATTERN = re.compile(
     r"(?:^|[._-])(?:credential|credentials|password|passwords|passwd|secret|secrets|token|tokens|wallet|cookies?)(?:$|[._-])",
     re.IGNORECASE,
@@ -147,6 +164,28 @@ def is_autonomous_path_allowed(
 
 def contains_sensitive_content(text: str) -> bool:
     return SENSITIVE_CONTENT_PATTERN.search(str(text or "")) is not None
+
+
+def is_autonomous_discovery_path_relevant(path: str, topics: Iterable[str]) -> bool:
+    candidate = os.path.normcase(os.path.abspath(str(path or "")))
+    parts = {part.lower() for part in Path(candidate).parts}
+    if parts.intersection(DISCOVERY_NOISE_PARTS):
+        return False
+    if os.path.basename(candidate).lower() in DISCOVERY_NOISE_FILENAMES:
+        return False
+    normalized_topics = [str(topic or "").strip().lower() for topic in topics]
+    return any(topic and topic in candidate.lower() for topic in normalized_topics)
+
+
+def is_autonomous_news_result_relevant(row: Dict[str, Any], topics: Iterable[str]) -> bool:
+    title = str(row.get("title") or "")
+    url = str(row.get("url") or "")
+    snippet = str(row.get("snippet") or "")
+    haystack = f"{title} {snippet} {url}".lower()
+    normalized_topics = [str(topic or "").strip().lower() for topic in topics]
+    topic_match = any(topic and topic in haystack for topic in normalized_topics)
+    trusted_source = any(host in haystack for host in OSTRANAUTS_WIKI_HOST_HINTS + CODING_REFERENCE_HOST_HINTS)
+    return topic_match and trusted_source
 
 
 def conversation_topics(memory: Any, limit: int = 12) -> List[str]:
@@ -330,10 +369,14 @@ class AutonomousCuriosity:
 
         title = str(task.get("title") or task_key)
         summary = str(result.get("summary") or result.get("error") or "No result").strip()
+        outcome = str(result.get("outcome") or "").strip()
+        # Why: evidence-only research is not a failed action, but it also cannot close a task.
+        # Guard: keep the event and memory history honest without bypassing bounded retries.
+        result_tag = "success" if result.get("ok") else "research" if outcome == "research_complete" else "failed"
         memory_id = self.memory.add_memory(
             f"Autonomous work: {title} | {summary}",
             kind="procedure",
-            tags=["autonomous_work", "audit", "success" if result.get("ok") else "failed"],
+            tags=["autonomous_work", "audit", result_tag],
         )
         with self._lock:
             self._event_seq += 1
@@ -345,6 +388,7 @@ class AutonomousCuriosity:
                 "reference": str(task.get("reference") or ""),
                 "memory_id": memory_id,
                 "ok": bool(result.get("ok")),
+                "outcome": outcome,
             })
 
     def _scan_local(self, topics: List[str]) -> None:
@@ -383,6 +427,8 @@ class AutonomousCuriosity:
                 except (OSError, PermissionError):
                     continue
 
+                if not is_autonomous_discovery_path_relevant(path, topics):
+                    continue
                 lowered = path.lower()
                 score = sum(1 for topic in topics if topic in lowered)
                 if score > best_score and lowered not in self._seen_items:
@@ -414,14 +460,6 @@ class AutonomousCuriosity:
         queries: List[str] = []
         if query_topics:
             queries.append(f"{query_topics} latest news")
-        # Keep a dedicated Ostranauts wiki pass so game-lore sources are discoverable.
-        queries.append("site:ostranauts.wiki.gg OR site:ostranauts.fandom.com ostranauts wiki")
-        # Include coding references so autonomous choices are grounded in technical sources.
-        queries.append(
-            "site:docs.python.org OR site:developer.mozilla.org OR site:learn.microsoft.com "
-            "OR site:stackoverflow.com OR site:github.com programming reference"
-        )
-
         for search_query in queries:
             result = self.tools.run("web_search", {
                 "query": search_query,
@@ -440,16 +478,9 @@ class AutonomousCuriosity:
                 url = str(row.get("url") or "").strip()
                 snippet = " ".join(str(row.get("snippet") or "").split())[:500]
                 key = url.lower() or title.lower()
-                haystack = f"{title} {snippet} {url}".lower()
-                is_ostranauts_wiki = any(host in haystack for host in OSTRANAUTS_WIKI_HOST_HINTS) or (
-                    "ostranauts" in haystack and "wiki" in haystack
-                )
-                is_coding_reference = any(host in haystack for host in CODING_REFERENCE_HOST_HINTS) or any(
-                    token in haystack for token in CODING_SIGNAL_KEYWORDS
-                )
                 if not key or key in self._seen_items:
                     continue
-                if not is_ostranauts_wiki and not is_coding_reference and not any(topic in haystack for topic in topics):
+                if not is_autonomous_news_result_relevant(row, topics):
                     continue
                 self._seen_items.add(key)
                 summary = f"Autonomous news discovery: {title} | {snippet} | {url}"

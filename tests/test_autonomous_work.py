@@ -1,6 +1,8 @@
 import json
+import os
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.core import MK1Core
@@ -19,7 +21,7 @@ def test_todo_items_become_autonomous_work_candidates(tmp_path):
     project_root.mkdir()
     todo_path = project_root / "TODO.md"
     todo_path.write_text(
-        "# TODO\n\n- [ ] Investigate flaky tests:\n  - Find the failing module.\n- [x] Already done.\n",
+        "# TODO\n\n- [ ] Investigate flaky tests:\n  - Run pytest tests/test_flaky.py to find the failing module.\n- [x] Already done.\n",
         encoding="utf-8",
     )
 
@@ -35,15 +37,193 @@ def test_todo_items_become_autonomous_work_candidates(tmp_path):
 
     assert len(candidates) == 1
     assert candidates[0]["title"] == "Investigate flaky tests"
-    assert candidates[0]["details"] == ["Find the failing module."]
+    assert candidates[0]["details"] == ["Run pytest tests/test_flaky.py to find the failing module."]
     assert candidates[0]["project_root"] == str(project_root)
+
+
+def test_only_active_next_backlog_items_become_autonomous_work_candidates(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    todo_path = project_root / "TODO.md"
+    todo_path.write_text(
+        "# TODO\n\n"
+        "- [ ] Historical checklist must not run\n\n"
+        "## Next\n\n"
+        "- [ ] Run tests/test_worker.py and verify the worker result\n\n"
+        "### Issue: Historical repair record\n\n"
+        "- [ ] Old done criterion must not run\n",
+        encoding="utf-8",
+    )
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({
+        ("curiosity", "project_roots"): [str(project_root)],
+        ("curiosity", "todo_paths"): [str(todo_path)],
+    })
+    core._load_project_tracker = lambda: {"projects": {}}
+
+    candidates = core._autonomous_work_candidates()
+
+    assert [candidate["title"] for candidate in candidates] == [
+        "Run tests/test_worker.py and verify the worker result"
+    ]
+
+
+def test_autonomous_work_intake_template_is_not_a_task(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    todo_path = project_root / "TODO.md"
+    todo_path.write_text(
+        "## Next\n\n"
+        "### Autonomous Work Intake\n\n"
+        "- [ ] <bounded task title>\n"
+        "  - Proof target: `tests/test_example.py`\n\n"
+        "### Core work\n\n"
+        "- [ ] Run pytest tests/test_worker.py\n",
+        encoding="utf-8",
+    )
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({
+        ("curiosity", "project_roots"): [str(project_root)],
+        ("curiosity", "todo_paths"): [str(todo_path)],
+    })
+    core._load_project_tracker = lambda: {"projects": {}}
+
+    assert [candidate["title"] for candidate in core._autonomous_work_candidates()] == [
+        "Run pytest tests/test_worker.py"
+    ]
+
+
+def test_suspended_task_keyword_is_not_queued(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    todo_path = project_root / "TODO.md"
+    todo_path.write_text(
+        "## Next\n\n"
+        "### Ostranauts integration\n\n"
+        "- [ ] Resume telemetry integration\n"
+        "\n### Core work\n\n"
+        "- [ ] Run tests/test_worker.py\n",
+        encoding="utf-8",
+    )
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({
+        ("curiosity", "project_roots"): [str(project_root)],
+        ("curiosity", "todo_paths"): [str(todo_path)],
+        ("curiosity", "suspended_task_keywords"): ["ostranauts"],
+    })
+    core._load_project_tracker = lambda: {"projects": {}}
+
+    assert [candidate["title"] for candidate in core._autonomous_work_candidates()] == [
+        "Run tests/test_worker.py"
+    ]
+
+
+def test_only_concrete_non_destructive_tasks_are_queued(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    todo_path = project_root / "TODO.md"
+    todo_path.write_text(
+        "## Next\n\n"
+        "### Core work\n\n"
+        "- [ ] Improve Mina reliability\n"
+        "- [ ] Run pytest tests/test_worker.py\n"
+        "- [ ] Validate the real reboot/sign-in cycle\n"
+        "- [ ] Review and delete E:\\workspace\\tmp\\old.txt\n"
+        "- [ ] Verify GET /status returns core_online\n",
+        encoding="utf-8",
+    )
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({
+        ("curiosity", "project_roots"): [str(project_root)],
+        ("curiosity", "todo_paths"): [str(todo_path)],
+    })
+    core._load_project_tracker = lambda: {"projects": {}}
+
+    assert [candidate["title"] for candidate in core._autonomous_work_candidates()] == [
+        "Run pytest tests/test_worker.py",
+        "Verify GET /status returns core_online",
+    ]
+
+
+def test_autonomous_decision_summary_reports_deferred_reasons_and_watchdog_state(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    todo_path = project_root / "TODO.md"
+    todo_path.write_text(
+        "## Next\n\n"
+        "### Ostranauts integration\n\n"
+        "- [ ] Resume telemetry\n\n"
+        "### Core work\n\n"
+        "- [ ] Improve reliability\n"
+        "- [ ] Validate a real reboot/sign-in cycle\n"
+        "- [ ] Delete E:\\workspace\\tmp\\old.txt\n"
+        "- [ ] Run pytest tests/test_worker.py\n",
+        encoding="utf-8",
+    )
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({
+        ("curiosity", "project_roots"): [str(project_root)],
+        ("curiosity", "todo_paths"): [str(todo_path)],
+        ("curiosity", "suspended_task_keywords"): ["ostranauts"],
+        ("curiosity", "allow_source_edits"): True,
+    })
+    core._load_project_tracker = lambda: {"projects": {}}
+    core._autonomous_watchdog_ready = lambda: (False, "watchdog_state_stale")
+    audit_path = Path(core._autonomy_audit_path())
+    audit_path.parent.mkdir(parents=True)
+    audit_path.write_text(json.dumps({"error": "model_unavailable"}) + "\n", encoding="utf-8")
+
+    summary = core._autonomous_decision_summary()
+
+    assert summary["eligible_count"] == 1
+    assert summary["eligible_preview"][0]["title"] == "Run pytest tests/test_worker.py"
+    assert summary["deferred_by_reason"] == {
+        "suspended_topic": 1,
+        "no_proof_target": 1,
+        "manual_validation_required": 1,
+        "destructive_operation": 1,
+    }
+    assert summary["model_unavailable_count"] == 1
+    assert summary["last_outcome"] == "blocked"
+    assert summary["watchdog"]["source_edits_permitted"] is False
+
+
+def test_user_approved_task_becomes_a_bounded_autonomy_candidate(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({("curiosity", "project_roots"): [str(project_root)]})
+    core._load_project_tracker = lambda: {"projects": {}}
+
+    result = core._add_autonomy_approved_task(
+        title="Verify status route",
+        proof_target="GET /status",
+        allowed_action="read_only",
+        done_when="The response reports core_online.",
+    )
+
+    assert result["ok"] is True
+    candidates = core._autonomous_work_candidates()
+    assert candidates[0]["source"] == "approved_task"
+    assert candidates[0]["allowed_action"] == "read_only"
+    assert core._autonomous_decision_summary()["approved_task_count"] == 1
 
 
 def test_completed_audit_task_is_not_queued_again(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     todo_path = project_root / "TODO.md"
-    todo_path.write_text("- [ ] Review logs\n", encoding="utf-8")
+    todo_path.write_text("- [ ] Run pytest tests/test_log_review.py\n", encoding="utf-8")
 
     core = MK1Core.__new__(MK1Core)
     core.workspace_root = str(tmp_path / "workspace")
@@ -73,7 +253,7 @@ def test_unverified_audit_task_remains_queued(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     todo_path = project_root / "TODO.md"
-    todo_path.write_text("- [ ] Review logs\n", encoding="utf-8")
+    todo_path.write_text("- [ ] Run pytest tests/test_log_review.py\n", encoding="utf-8")
 
     core = MK1Core.__new__(MK1Core)
     core.workspace_root = str(tmp_path / "workspace")
@@ -136,6 +316,7 @@ def test_clean_autonomous_patch_applies_and_validates(tmp_path):
         ("curiosity", "keep_patch_files"): False,
         ("curiosity", "watchdog_dir"): str(watchdog_dir),
     })
+    core._autonomous_watchdog_ready = lambda: (True, "")
 
     result = core._apply_autonomous_patch(make_patch("value = 1", "value = 2"), str(project_root))
 
@@ -169,6 +350,7 @@ def test_autonomous_patch_runs_core_boot_smoke_and_full_suite_when_project_has_a
         ("curiosity", "keep_patch_files"): False,
         ("curiosity", "watchdog_dir"): str(watchdog_dir),
     })
+    core._autonomous_watchdog_ready = lambda: (True, "")
 
     patch = make_patch("class MK1Core: pass", "class MK1Core: pass  # patched").replace("sample.py", "agent/core.py")
 
@@ -199,6 +381,7 @@ def test_autonomous_patch_reverted_when_core_boot_smoke_fails(tmp_path):
         ("curiosity", "keep_patch_files"): False,
         ("curiosity", "watchdog_dir"): str(watchdog_dir),
     })
+    core._autonomous_watchdog_ready = lambda: (True, "")
 
     patch = (
         "diff --git a/agent/core.py b/agent/core.py\n"
@@ -219,6 +402,48 @@ def test_autonomous_patch_reverted_when_core_boot_smoke_fails(tmp_path):
     assert boot_check["ok"] is False
     assert (agent_dir / "core.py").read_text(encoding="utf-8") == "class MK1Core:\n    def __init__(self):\n        pass\n"
 
+
+def test_autonomous_patch_refuses_when_watchdog_is_not_healthy(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    source = project_root / "sample.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    initialize_git_project(project_root)
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({("curiosity", "watchdog_dir"): str(tmp_path / "watchdog")})
+
+    result = core._apply_autonomous_patch(make_patch("value = 1", "value = 2"), str(project_root))
+
+    assert result["ok"] is False
+    assert result["applied"] is False
+    assert result["error"] == "watchdog_state_or_pid_missing"
+    assert source.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_watchdog_readiness_requires_live_pid_and_fresh_health(tmp_path):
+    watchdog_dir = tmp_path / "watchdog"
+    watchdog_dir.mkdir()
+    (watchdog_dir / "state.json").write_text(
+        json.dumps({"healthy": True, "updated_at": datetime.now(timezone.utc).isoformat()}),
+        encoding="utf-8",
+    )
+    (watchdog_dir / "watchdog.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    core = MK1Core.__new__(MK1Core)
+    core.workspace_root = str(tmp_path / "workspace")
+    core.config = FakeConfig({
+        ("curiosity", "watchdog_dir"): str(watchdog_dir),
+        ("curiosity", "watchdog_state_max_age_seconds"): 600,
+    })
+
+    assert core._autonomous_watchdog_ready() == (True, "")
+    (watchdog_dir / "state.json").write_text(
+        json.dumps({"healthy": True, "updated_at": "2000-01-01T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    assert core._autonomous_watchdog_ready() == (False, "watchdog_state_stale")
 
 def test_autonomous_patch_refuses_preexisting_user_changes(tmp_path):
     project_root = tmp_path / "project"
@@ -311,7 +536,7 @@ def test_autonomous_tool_policy_only_allows_bounded_web_search():
     assert core._autonomous_tool_status()["ready"] is True
 
 
-def test_autonomous_executor_writes_structured_audit(tmp_path):
+def test_autonomous_model_only_research_is_not_marked_complete(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     (project_root / "sample.py").write_text("def improve_worker():\n    return True\n", encoding="utf-8")
@@ -333,13 +558,15 @@ def test_autonomous_executor_writes_structured_audit(tmp_path):
         "project_root": str(project_root),
     })
 
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["outcome"] == "research_complete"
     assert result["summary"] == "Found a bounded improvement."
     assert core.model.chat_kwargs["allow_fallback"] is False
     assert core.model.chat_kwargs["allow_model_load"] is False
     audit_rows = [json.loads(line) for line in Path(core._autonomy_audit_path()).read_text(encoding="utf-8").splitlines()]
     assert audit_rows[0]["task_key"] == "todo:improve-worker"
     assert audit_rows[0]["evidence"] == ["sample.py contains the relevant implementation"]
+    assert audit_rows[0]["outcome"] == "research_complete"
     assert audit_rows[0]["verification"]["completion_verified"] is False
     assert audit_rows[0]["verification"]["patch_applied"] is False
 

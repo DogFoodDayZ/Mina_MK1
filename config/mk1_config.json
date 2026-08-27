@@ -2,7 +2,7 @@
   "model": {
     "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
     "load_endpoint": "http://127.0.0.1:1234/api/v1/models/load",
-    "default_model": "qwen2.5-7b-instruct",
+    "default_model": "dolphin3-nsfw-gf-chat",
     "auto_fallback_on_error": false,
     "request_timeout_seconds": 240,
     "max_tokens": 4096,
@@ -13,7 +13,8 @@
     "switch_allowed": [
       "qwen2.5-7b-instruct",
       "mistral-nemo-2407-12b-thinking-claude-gemini-gpt5.2-uncensored-heretic",
-      "qwen/qwen3.5-9b"
+      "qwen/qwen3.5-9b",
+      "dolphin3-nsfw-gf-chat"
     ],
     "vision_max_tokens": 768,
     "vision_reasoning_effort": "none"
@@ -65,17 +66,21 @@
     "news_interval_seconds": 21600,
     "work_interval_seconds": 1800,
     "max_work_retries": 2,
-    "allow_source_edits": true,
+    "allow_source_edits": false,
     "suspend_during_ostranauts": true,
     "pause_after_ostranauts_seconds": 1200,
     "keep_patch_files": true,
     "code_backup_dir": "E:\\workspace\\mina_code_backups",
     "watchdog_dir": "E:\\workspace\\mina_watchdog",
+    "watchdog_state_max_age_seconds": 90,
     "project_roots": [
       "E:\\Mina_MK1"
     ],
     "todo_paths": [
       "E:\\Mina_MK1\\TODO.md"
+    ],
+    "suspended_task_keywords": [
+      "ostranauts"
     ],
     "max_directories_per_cycle": 40,
     "max_file_bytes": 2000000
@@ -95,7 +100,7 @@
     "default_public": false
   },
   "gui": {
-    "fancy_dir": "C:\\dev\\mina-gui",
+    "fancy_dir": "E:\\Mina_MK1\\apps\\mina-gui",
     "server": {
       "start_script": "E:\\Mina_MK1\\start_mk1_api.ps1",
       "stop_script": "E:\\Mina_MK1\\stop_mk1_api.ps1"

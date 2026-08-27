@@ -1152,6 +1152,81 @@ class MK1Memory:
         return deleted
 
     @_tracked_memory_operation(
+        "memory_evidence_report",
+        allow_while_quiescing=True,
+        rejected=lambda self, *args, **kwargs: {"ok": False, "error": "memory_quiescing"},
+    )
+    def memory_evidence_report(self, limit: int = 5000) -> Dict[str, Any]:
+        """Return a read-only provenance report without changing memory state."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, text, kind, tags, timestamp FROM memories "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (max(1, int(limit)),),
+            )
+            rows = cur.fetchall()
+            conn.close()
+        except Exception as e:
+            self._set_error(f"memory_evidence_report_error: {e}")
+            return {"ok": False, "error": str(e), "records": []}
+
+        now = time.time()
+        records: List[Dict[str, Any]] = []
+        counts = {"verified": 0, "historical": 0, "unverified": 0, "conflicting": 0}
+        for row in rows:
+            mem_id = int(row[0])
+            text = str(row[1] or "")
+            kind = str(row[2] or "")
+            tags = json.loads(row[3]) if row[3] else []
+            tags = [str(tag) for tag in tags]
+            timestamp = float(row[4])
+            lowered_tags = {tag.lower() for tag in tags}
+            age_seconds = max(0.0, now - timestamp)
+
+            if lowered_tags.intersection({"conflict", "conflicting", "contradiction"}):
+                classification = "conflicting"
+            elif lowered_tags.intersection({"verified", "explicitly_verified", "authoritative", "authoritative_identity", "authoritative_profile"}):
+                classification = "verified"
+            elif lowered_tags.intersection({"historical", "conversation_digest", "archive"}):
+                classification = "historical"
+            else:
+                classification = "unverified"
+            counts[classification] += 1
+
+            if age_seconds <= 7 * 86400:
+                freshness = "current"
+            elif age_seconds <= 30 * 86400:
+                freshness = "aging"
+            else:
+                freshness = "stale"
+
+            source_tags = [
+                tag for tag in tags
+                if tag.lower().startswith(("source:", "path:", "file:"))
+            ]
+            records.append({
+                "id": mem_id,
+                "text": text,
+                "kind": kind,
+                "tags": tags,
+                "timestamp": timestamp,
+                "age_seconds": age_seconds,
+                "freshness": freshness,
+                "classification": classification,
+                "source_evidence": source_tags,
+            })
+
+        return {
+            "ok": True,
+            "read_only": True,
+            "total_rows": len(records),
+            "counts": counts,
+            "records": records,
+        }
+
+    @_tracked_memory_operation(
         "memory_hygiene",
         rejected=lambda self, *args, **kwargs: {"ok": False, "error": "memory_quiescing"},
     )

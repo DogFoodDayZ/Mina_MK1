@@ -78,6 +78,23 @@ class ModelSelectRequest(BaseModel):
     force_reload: bool = False
 
 
+class AutonomousTaskRequest(BaseModel):
+    title: str
+    proof_target: str
+    allowed_action: str
+    done_when: str
+    source_task_key: str = ""
+
+
+class ScheduledTaskRequest(BaseModel):
+    text: str
+    due_at: float
+    repeat_seconds: int = 0
+    repeat_minutes: Optional[int] = None
+    window_end: Optional[float] = None
+    alarm: bool = False
+
+
 class OstranautsActionRequest(BaseModel):
     action_id: Optional[str] = None
     schema_version: int = 1
@@ -123,7 +140,9 @@ def _resolve_tts_rate() -> float:
 # ------------------------------------------------------------
 # Initialize CORE + API
 # ------------------------------------------------------------
-core = MK1Core()
+# Why: importing this module in route tests previously initialized the live memory engine.
+# Guard: pytest injects a fake core before requests, so test imports never create live backups.
+core = None if os.getenv("MK1_API_TEST_MODE") == "1" else MK1Core()
 app = FastAPI(title="MK1 Core API", version="1.0")
 
 _restart_lock = threading.Lock()
@@ -134,11 +153,16 @@ _ostranauts_action_lock = threading.Lock()
 _ostranauts_action_queue: deque[dict[str, Any]] = deque(maxlen=50)
 _ostranauts_action_counter = 0
 
+# Alternative model memory proxy registry (for models like dolphin3 that should not pollute Mina's memory)
+_alt_model_proxies: dict[str, Any] = {}
+_alt_model_proxy_lock = threading.Lock()
+
 
 @app.on_event("shutdown")
 def _shutdown_core() -> None:
     try:
-        core.close()
+        if core is not None:
+            core.close()
     except Exception:
         pass
 
@@ -661,7 +685,7 @@ VOICE_MONITOR_PID_FILE = PROJECT_ROOT / ".mk1_voice_monitor.pid"
 VOICE_MONITOR_LOG_FILE = PROJECT_ROOT / "logs" / "voice_monitor.log"
 FANCY_GUI_PID_FILE = PROJECT_ROOT / ".mk1_fancy_gui.pid"
 CONFIG_GUI_DIR = str(getattr(core, "config", None).get("gui", "fancy_dir", "") if getattr(core, "config", None) else "").strip()
-FANCY_GUI_DIR = Path(os.getenv("MK1_FANCY_GUI_DIR", CONFIG_GUI_DIR or "C:/dev/mina-gui"))
+FANCY_GUI_DIR = Path(os.getenv("MK1_FANCY_GUI_DIR", CONFIG_GUI_DIR or str(PROJECT_ROOT / "apps" / "mina-gui")))
 FANCY_AVATAR_FILES = {
     "idle": "avatar_idle.png",
     "talk": "avatar_talk.png",
@@ -1181,6 +1205,17 @@ def _switch_model_runtime(
     load_attempted = False
     load_ok = False
     load_error = None
+    unloaded_instances = []
+    load_timeout = max(
+        60,
+        float(
+            getattr(core, "config", None).get(
+                "model", "request_timeout_seconds", 240
+            )
+            if getattr(core, "config", None)
+            else 240
+        ),
+    )
 
     skip_reason = None
     same_model = previous.strip().lower() == target.strip().lower()
@@ -1190,22 +1225,46 @@ def _switch_model_runtime(
 
     if autoload and load_endpoint:
         load_attempted = True
-        payload_candidates = [
-            {"model": target},
-            {"identifier": target},
-            {"id": target},
-        ]
+        try:
+            api_root = load_endpoint.rsplit("/models/load", 1)[0]
+            models_endpoint = f"{api_root}/models"
+            unload_endpoint = f"{api_root}/models/unload"
+            models_resp = requests.get(models_endpoint, timeout=10)
+            models_resp.raise_for_status()
+            for model_info in models_resp.json().get("models", []):
+                for instance in model_info.get("loaded_instances", []):
+                    instance_id = str(instance.get("id") or "").strip()
+                    if not instance_id:
+                        continue
+                    unload_resp = requests.post(
+                        unload_endpoint,
+                        json={"instance_id": instance_id},
+                        timeout=30,
+                    )
+                    unload_resp.raise_for_status()
+                    unloaded_instances.append(instance_id)
 
-        for payload in payload_candidates:
-            try:
-                resp = requests.post(load_endpoint, json=payload, timeout=30)
-                if resp.status_code < 400:
-                    load_ok = True
-                    load_error = None
-                    break
+            resp = requests.post(load_endpoint, json={"model": target}, timeout=load_timeout)
+            if resp.status_code < 400:
+                load_ok = True
+            else:
                 load_error = (resp.text or "")[:500]
-            except Exception as e:
-                load_error = str(e)
+        except Exception as e:
+            load_error = str(e)
+
+        if not load_ok:
+            return {
+                "ok": False,
+                "error": "model_load_failed",
+                "previous_model": previous,
+                "requested_model": target,
+                "load_attempted": load_attempted,
+                "load_ok": False,
+                "load_endpoint": load_endpoint,
+                "load_error": load_error,
+                "unloaded_instances": unloaded_instances,
+                "allowed_models": allowed,
+            }
 
     setattr(core.model, "default_model", target)
     setattr(core.model, "_vision_support_cache_value", None)
@@ -1227,6 +1286,7 @@ def _switch_model_runtime(
         "skip_reason": skip_reason,
         "load_endpoint": load_endpoint or None,
         "load_error": load_error,
+        "unloaded_instances": unloaded_instances,
         "allowed_models": allowed,
         "persist": bool(persist),
         "persist_result": persisted,
@@ -1325,11 +1385,36 @@ def _play_alarm_beep_async(repeats: int = 2, frequency_hz: int = 880, duration_m
     safe_hz = max(250, min(2400, int(frequency_hz)))
     safe_duration = max(60, min(1500, int(duration_ms)))
 
+    def _win_system_alert() -> None:
+        if winsound is None:
+            return
+        try:
+            if hasattr(winsound, "MessageBeep"):
+                winsound.MessageBeep(getattr(winsound, "MB_ICONEXCLAMATION", 0x30))
+                return
+        except Exception:
+            pass
+        try:
+            play_flags = 0
+            if hasattr(winsound, "SND_ALIAS"):
+                play_flags |= getattr(winsound, "SND_ALIAS", 0)
+            if hasattr(winsound, "SND_ASYNC"):
+                play_flags |= getattr(winsound, "SND_ASYNC", 0)
+            if hasattr(winsound, "PlaySound"):
+                winsound.PlaySound("SystemExclamation", play_flags)
+                return
+        except Exception:
+            pass
+        raise RuntimeError("no_windows_alert_available")
+
     def _worker() -> None:
         try:
             if winsound is not None:
                 for _ in range(safe_repeats):
-                    winsound.Beep(safe_hz, safe_duration)
+                    try:
+                        winsound.Beep(safe_hz, safe_duration)
+                    except Exception:
+                        _win_system_alert()
                     time.sleep(0.08)
                 return
         except Exception:
@@ -2191,6 +2276,83 @@ def tasks_list(limit: int = 12):
         }
 
 
+@app.post("/tasks/create")
+def tasks_create(req: ScheduledTaskRequest):
+    text = str(req.text or "").strip()
+    if not text:
+        return {"ok": False, "error": "task_text_required"}
+    try:
+        due_at = float(req.due_at)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "task_due_at_invalid"}
+    if due_at <= time.time():
+        return {"ok": False, "error": "task_due_at_must_be_future"}
+
+    window_end = None
+    if req.window_end is not None:
+        try:
+            window_end = float(req.window_end)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "task_window_end_invalid"}
+        if window_end < due_at:
+            return {"ok": False, "error": "task_window_end_before_due"}
+
+    repeat_minutes = req.repeat_minutes
+    if repeat_minutes is not None:
+        try:
+            repeat_minutes = max(1, int(repeat_minutes))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "task_repeat_minutes_invalid"}
+    repeat_seconds = max(0, min(7 * 24 * 60 * 60, int(req.repeat_seconds or 0)))
+    if repeat_minutes is not None:
+        repeat_seconds = max(1, min(7 * 24 * 60 * 60, repeat_minutes * 60))
+
+    mem = getattr(core, "memory", None)
+    if mem is None or not hasattr(mem, "add_task_memory"):
+        return {"ok": False, "error": "task_memory_not_available"}
+
+    series = [due_at]
+    if repeat_seconds and window_end is not None and window_end > due_at:
+        series = []
+        current = due_at
+        while current <= window_end + 1:
+            series.append(current)
+            next_current = current + repeat_seconds
+            if next_current > window_end and abs(next_current - window_end) < max(1, repeat_seconds // 4):
+                break
+            current = next_current
+        if not series:
+            series = [due_at]
+
+    created = []
+    for _, current_due in enumerate(series):
+        tags = ["user_memory", "reminder_task"]
+        if repeat_seconds:
+            tags.extend(["recurring_task", f"repeat_{repeat_seconds}s"])
+        if bool(req.alarm):
+            tags.extend(["alarm_task", "beep"])
+        task_id = mem.add_task_memory(text, due_at=current_due, tags=tags, status="pending")
+        if task_id is None:
+            return {"ok": False, "error": "task_create_failed"}
+        created.append({
+            "id": task_id,
+            "text": text,
+            "due_at": current_due,
+            "tags": tags,
+            "status": "pending",
+            "repeat_seconds": repeat_seconds or None,
+            "alarm": bool(req.alarm),
+        })
+
+    first = created[0]
+    return {
+        "ok": True,
+        "count": len(created),
+        "task": first,
+        "tasks": created,
+    }
+
+
 @app.post("/tasks/ring_due_alarm")
 def tasks_ring_due_alarm(repeats: int = 2):
     now_ts = time.time()
@@ -2312,6 +2474,7 @@ def curiosity_status():
     status["code_backup_dir"] = str(core.config.get("curiosity", "code_backup_dir", ""))
     status["watchdog_dir"] = str(core.config.get("curiosity", "watchdog_dir", ""))
     status["autonomous_tools"] = core._autonomous_tool_status()
+    status["decision_summary"] = core._autonomous_decision_summary()
     return status
 
 
@@ -2321,6 +2484,22 @@ def curiosity_events(since_id: int = 0, limit: int = 20):
     if curiosity is None:
         return []
     return curiosity.events_since(since_id=since_id, limit=limit)
+
+
+@app.get("/autonomy/tasks")
+def autonomy_tasks():
+    return {"ok": True, "tasks": core._load_autonomy_approved_tasks()}
+
+
+@app.post("/autonomy/tasks")
+def autonomy_tasks_add(req: AutonomousTaskRequest):
+    return core._add_autonomy_approved_task(
+        title=req.title,
+        proof_target=req.proof_target,
+        allowed_action=req.allowed_action,
+        done_when=req.done_when,
+        source_task_key=req.source_task_key,
+    )
 
 
 @app.post("/restore/open")
@@ -2552,6 +2731,18 @@ def memory_flush_buffer(max_items: int = 200):
         return {"ok": False, "error": str(e), "result": None}
 
 
+@app.get("/memory/evidence")
+def memory_evidence_report(limit: int = 5000):
+    mem = getattr(core, "memory", None)
+    if mem is None or not hasattr(mem, "memory_evidence_report"):
+        return {"ok": False, "error": "memory_evidence_report_not_supported", "result": None}
+    try:
+        safe_limit = max(1, min(10000, int(limit)))
+        return mem.memory_evidence_report(limit=safe_limit)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "result": None}
+
+
 @app.get("/memory/hygiene")
 def memory_hygiene_audit(max_delete: int = 500):
     mem = getattr(core, "memory", None)
@@ -2595,7 +2786,219 @@ def memory_retention(dry_run: bool = True, max_delete: int = 1000):
     return mem.run_retention_lifecycle(dry_run=bool(dry_run), max_delete=safe_max)
 
 
+# ========== ALT MODEL MEMORY PROXY ENDPOINTS ==========
+# Endpoints for alternative models (e.g., dolphin3) with isolated memory
+
+
+@app.post("/alt_model/memory_session/create")
+def alt_model_create_memory_session(model_name: str = "dolphin3"):
+    """
+    Create an isolated memory proxy for an alternative model.
+    The model can read Mina's personality and system state,
+    but all writes go to a sandboxed session log.
+    """
+    global _alt_model_proxies
+    
+    if core is None or not hasattr(core, "memory"):
+        return {"ok": False, "error": "core_memory_not_available"}
+    
+    try:
+        from memory.safe_memory_proxy import SafeMemoryProxy
+        
+        safe_model_name = str(model_name or "alt_model").strip().lower()[:64]
+        
+        with _alt_model_proxy_lock:
+            if safe_model_name in _alt_model_proxies:
+                return {
+                    "ok": True,
+                    "model": safe_model_name,
+                    "info": _alt_model_proxies[safe_model_name].get_session_info(),
+                    "message": "session_already_exists",
+                }
+            
+            proxy = SafeMemoryProxy(
+                mina_memory=core.memory,
+                alt_model_name=safe_model_name,
+            )
+            _alt_model_proxies[safe_model_name] = proxy
+            
+            return {
+                "ok": True,
+                "model": safe_model_name,
+                "info": proxy.get_session_info(),
+                "message": "session_created",
+            }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/alt_model/memory_session/info")
+def alt_model_session_info(model_name: str = "dolphin3"):
+    """Get info about an alternative model's memory session."""
+    global _alt_model_proxies
+    
+    safe_model_name = str(model_name or "alt_model").strip().lower()[:64]
+    
+    with _alt_model_proxy_lock:
+        if safe_model_name not in _alt_model_proxies:
+            return {
+                "ok": False,
+                "error": f"session_not_found_for_model_{safe_model_name}",
+            }
+        
+        proxy = _alt_model_proxies[safe_model_name]
+        return {
+            "ok": True,
+            "model": safe_model_name,
+            "info": proxy.get_session_info(),
+        }
+
+
+@app.get("/alt_model/memory_session/reads")
+def alt_model_read_mina_memory(model_name: str = "dolphin3", query: str = ""):
+    """
+    Allow the alternative model to read from Mina's memory.
+    Returns personality + relevant system context.
+    """
+    global _alt_model_proxies
+    
+    safe_model_name = str(model_name or "alt_model").strip().lower()[:64]
+    
+    with _alt_model_proxy_lock:
+        if safe_model_name not in _alt_model_proxies:
+            return {
+                "ok": False,
+                "error": f"session_not_found_for_model_{safe_model_name}",
+            }
+        
+        proxy = _alt_model_proxies[safe_model_name]
+    
+    try:
+        result = {
+            "ok": True,
+            "model": safe_model_name,
+            "personality": proxy.get_personality(),
+            "status": proxy.get_status(),
+            "due_tasks": proxy.get_due_tasks(),
+        }
+        
+        if query and query.strip():
+            result["context"] = proxy.get_context(query, top_k=5)
+        
+        return result
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/alt_model/memory_session/writes")
+def alt_model_get_session_writes(model_name: str = "dolphin3"):
+    """Get all isolated writes made by the alternative model in this session."""
+    global _alt_model_proxies
+    
+    safe_model_name = str(model_name or "alt_model").strip().lower()[:64]
+    
+    with _alt_model_proxy_lock:
+        if safe_model_name not in _alt_model_proxies:
+            return {
+                "ok": False,
+                "error": f"session_not_found_for_model_{safe_model_name}",
+            }
+        
+        proxy = _alt_model_proxies[safe_model_name]
+    
+    try:
+        writes = proxy.get_session_writes()
+        return {
+            "ok": True,
+            "model": safe_model_name,
+            "write_count": len(writes),
+            "writes": writes,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/alt_model/memory_session/migrate")
+def alt_model_migrate_to_mina(model_name: str = "dolphin3", confirm: bool = False):
+    """
+    Migrate all isolated session writes to Mina's core memory.
+    Call this when ready to permanently switch the coding agent.
+    Requires explicit confirm=True.
+    """
+    global _alt_model_proxies
+    
+    if not confirm:
+        return {
+            "ok": False,
+            "error": "migration_requires_explicit_confirmation",
+            "message": "set confirm=true to proceed",
+        }
+    
+    safe_model_name = str(model_name or "alt_model").strip().lower()[:64]
+    
+    with _alt_model_proxy_lock:
+        if safe_model_name not in _alt_model_proxies:
+            return {
+                "ok": False,
+                "error": f"session_not_found_for_model_{safe_model_name}",
+            }
+        
+        proxy = _alt_model_proxies[safe_model_name]
+    
+    try:
+        success = proxy.migrate_session_to_mina_memory()
+        if success:
+            with _alt_model_proxy_lock:
+                del _alt_model_proxies[safe_model_name]
+        
+        return {
+            "ok": success,
+            "model": safe_model_name,
+            "message": "migration_complete_session_cleared" if success else "migration_failed",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/alt_model/memory_session/clear")
+def alt_model_clear_session(model_name: str = "dolphin3", confirm: bool = False):
+    """
+    Discard all isolated session writes for this model (use before deletion).
+    Requires explicit confirm=True.
+    """
+    global _alt_model_proxies
+    
+    if not confirm:
+        return {
+            "ok": False,
+            "error": "clear_requires_explicit_confirmation",
+            "message": "set confirm=true to proceed",
+        }
+    
+    safe_model_name = str(model_name or "alt_model").strip().lower()[:64]
+    
+    with _alt_model_proxy_lock:
+        if safe_model_name not in _alt_model_proxies:
+            return {
+                "ok": False,
+                "error": f"session_not_found_for_model_{safe_model_name}",
+            }
+        
+        proxy = _alt_model_proxies[safe_model_name]
+    
+    try:
+        success = proxy.clear_session_writes()
+        return {
+            "ok": success,
+            "model": safe_model_name,
+            "message": "session_cleared" if success else "clear_failed",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/system/shutdown_gate")
+
 def system_shutdown_gate(
     force: bool = False,
     max_wait_seconds: int = 45,

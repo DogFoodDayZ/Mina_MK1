@@ -256,7 +256,7 @@ function Resolve-FancyGuiDir {
         }
     }
 
-    return 'C:\dev\mina-gui'
+    return (Join-Path $PSScriptRoot 'apps\mina-gui')
 }
 
 function Test-FancyGuiDevRunning {

@@ -1,6 +1,7 @@
 import sys
 import json
 import hashlib
+import sqlite3
 import time
 import threading
 from types import SimpleNamespace
@@ -1422,6 +1423,45 @@ def test_memory_hygiene_requires_explicit_authorization_for_mutation():
 
     assert result["ok"] is False
     assert result["error"] == "memory_mutation_requires_explicit_authorization"
+
+
+def test_memory_evidence_report_is_read_only_and_conservative(tmp_path):
+    from memory.mk1_memory import MK1Memory
+
+    db_path = tmp_path / "evidence.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE memories (id INTEGER PRIMARY KEY, text TEXT, kind TEXT, tags TEXT, timestamp REAL)"
+    )
+    now = time.time()
+    rows = [
+        (1, "Verified CPU probe", "fact", json.dumps(["verified", "source:ps_run"]), now),
+        (2, "Older bridge decision", "note", json.dumps(["conversation_digest"]), now - 40 * 86400),
+        (3, "Conflicting identity claim", "fact", json.dumps(["conflicting"]), now),
+        (4, "Unclassified interaction", "interaction", json.dumps([]), now),
+    ]
+    conn.executemany("INSERT INTO memories VALUES (?, ?, ?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+    memory = MK1Memory.__new__(MK1Memory)
+    memory.db_path = str(db_path)
+    memory._begin_memory_operation = lambda *_args, **_kwargs: True
+    memory._memory_operation_serial_lock = threading.RLock()
+    memory._set_error = lambda *_args, **_kwargs: None
+
+    before = sqlite3.connect(db_path).execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    report = memory.memory_evidence_report()
+    after = sqlite3.connect(db_path).execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+
+    assert report["ok"] is True
+    assert report["read_only"] is True
+    assert report["counts"] == {"verified": 1, "historical": 1, "unverified": 1, "conflicting": 1}
+    verified = next(record for record in report["records"] if record["id"] == 1)
+    historical = next(record for record in report["records"] if record["id"] == 2)
+    assert verified["source_evidence"] == ["source:ps_run"]
+    assert historical["freshness"] == "stale"
+    assert before == after == 4
 
 
 def test_long_term_archive_context_surfaces_older_project_decisions():

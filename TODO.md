@@ -1,4 +1,50 @@
 
+### Issue: Dolphin3 conversation used an unnecessary isolated memory lane
+
+- Date: 2026-08-27
+- Reporter: Travis, live Dolphin3 chat test
+- Priority: High
+- Status: Done
+
+#### What Travis asked Mina to do
+- Use Dolphin3 as Mina's conversational half while keeping Mina's existing memory shared.
+
+#### What Mina actually did
+- Normal turns already entered the shared memory, but Dolphin3's dedicated memory writes were routed to a separate JSONL proxy with no model attribution on shared turns.
+
+#### What should have happened
+- Keep one Mina memory store, record normal turns from whichever model is active, and label explicit memory operations with their producing model.
+
+#### Evidence
+- Live Dolphin3 test retrieved Mina context successfully.
+- `tests/test_memory_proxy.py` confirmed the proxy isolated writes, but that isolation was separate from the normal `/process` path.
+- Transcript prompt: `Mina, what do you remember about me and this project?`
+
+#### Failure class
+- Architecture boundary mismatch
+
+#### Root cause
+- The alternate-model proxy was treated as the normal Dolphin3 memory path even though `_store_turn_memory()` already writes conversation turns to Mina's core memory.
+
+#### Minimal fix
+- Keep normal turn and explicit task/memory writes on `self.memory`, and add `model:<active_model>` tags for source attribution. Leave the proxy available only as an isolated test harness.
+
+#### Regression prompt
+- `Dolphin, remember that this is a shared Mina memory test, then tell me what you remember about it.`
+
+#### Implementation choice
+- Chosen approach: shared memory with hardcoded source attribution.
+- Why this fits: one memory system is a stable product invariant, while the model tag preserves provenance without creating a second memory owner.
+- Risk if wrong approach chosen: continued proxy isolation would make Dolphin3 feel like a separate Mina and prevent continuity across the two specialized halves.
+
+#### Verification status
+- Focused turn-memory tests: 5 passed.
+- `agent/core.py` syntax check: passed.
+- Live memory proxy isolation test remains available; no Ostranauts memory was modified.
+- Architecture documented in `ARCHITECTURE.md`.
+
+---
+
 Stop The Churn Spec v1
 Owner intent: Mina must work for human phrasing first, not for internal intent labels.
 
@@ -1220,6 +1266,19 @@ Core change acceptance gate:
 
 ## Next
 
+### Autonomous Work Intake
+
+Use this format only for bounded tasks Mina may consider while idle. Keep the
+task unchecked only after its proof target, permitted scope, and done condition
+are concrete. The template itself is documentation, not a task.
+
+```md
+- [ ] <bounded task title>
+  - Proof target: `tests/test_example.py` or `GET /endpoint`
+  - Allowed action: read-only review | test run | proposed patch
+  - Done when: <observable result and evidence>
+```
+
 ### 1. Useful autonomous idle work
 
 - [ ] Validate the tray launcher behavior on a real reboot/sign-in cycle and confirm the tray icon appears.
@@ -1255,7 +1314,7 @@ Core change acceptance gate:
 ### 3. Fancy GUI alarms and recurrence
 
 - [ ] Detect newly due alarms from `/tasks/list` in `C:\dev\mina-gui`.
-- [ ] Call `POST /tasks/ring_due_alarm` once per newly due alarm with cooldown/debounce.
+- [x] Call `POST /tasks/ring_due_alarm` once per newly due alarm with cooldown/debounce.
 - [ ] Show `repeat_minutes` / `repeat_seconds` in GUI task cards.
 - [ ] Add API tests for alarm ringing and recurring-task tags.
 - [ ] Optional: add a per-task auto-ring toggle.
@@ -2082,6 +2141,8 @@ Live bridge verification checkpoint (2026-08-27): read-only `GET /games/ostranau
 
 Long-term memory verification checkpoint (2026-08-27): read-only SQLite inspection found 610 durable records spanning 2026-07-09 through 2026-08-27, including a durable Ostranauts telemetry/bridge record from 2026-08-05 and later read-only integration verification. Older speculative assistant replies remain short-term interaction records and are excluded from the historical archive lane. Archive and Ostranauts tests passed (`98 passed`). No live memory was injected, rewritten, tagged, promoted, deleted, or cleaned.
 
+Stale file-context checkpoint (2026-08-27): transcript showed a conversational reply being misread as a file request, followed by guessed stale paths (`E:\workspace\scripts\tickles_mina.ps1` and `simple_test_12345.txt`) after Travis supplied the corrected root. Added two guards: missing-path `file_read` calls are rejected with an explicit path-required message and cannot execute; explicit corrections such as `that file is in E:\workspace\` route to the corrected directory. No memory mutation is used for this repair.
+
 Memory management guard checkpoint (2026-08-27): changed `memory_hygiene()` and the core tidy wrapper to report-only by default. Any destructive hygiene apply now requires `authorized_apply=True`; the new `GET /memory/hygiene` route is read-only. No cleanup was run and no live memory was changed.
 
 Memory audit live proof (2026-08-27): `GET /memory/hygiene?max_delete=20` completed in report-only mode. Live memory row count remained exactly 4,960 before and after. The report identified 20 candidates, including repeated test prompts and a prior hallucinated bridge question; none were deleted. Added `POST /memory/hygiene/apply`, which refuses unless `authorized_apply=true`; this endpoint was not called.
@@ -2101,3 +2162,563 @@ Verified-output narration checkpoint (2026-08-27): status-only tool results now 
 - Implementation choice: hardcoded protocol normalization because disabled/enabled reasoning values are transport semantics, not learned memory behavior.
 - Verification: model payload tests passed (`6 passed`); live direct completion returned `OK` in `0.08s`; API and memory remained healthy with zero pending writes.
 - Note: the previous completion stall was reproduced even with minimal payloads and was cleared by a supported model reload. The LM Studio warning was a configuration smell, not proven to be the stall cause.
+
+### Issue: Read-only long-term memory evidence report
+
+- Date: 2026-08-27
+- Status: Done
+- Root cause: memory hygiene exposed candidate rows but did not provide conservative provenance or freshness classification for deciding what deserved review.
+- Minimal fix: added `memory_evidence_report()` and `GET /memory/evidence`; the report reads IDs, kinds, tags, timestamps, source tags, freshness, and classifications without writing, tagging, promoting, deleting, or rebuilding memory.
+- Implementation choice: hardcoded protocol/report behavior because read-only inspection and explicit mutation boundaries are stable safety contracts, not learned conversational behavior.
+- Regression prompt: request a long-term evidence audit through the read-only endpoint and verify the isolated database row count is unchanged.
+- Verification: isolated evidence report test passed; memory and API regressions passed (`93 passed`). No live memory cleanup was authorized or performed.
+
+### Issue: Autonomous research summaries were falsely reported as completed work
+
+- Date: 2026-08-27
+- Reporter: Travis / live autonomy review
+- Priority: High
+- Status: In Progress
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "good morning, mina has been busy we need to find out what her Autonomous local discovery system and other autonomous tools are up to"
+
+#### 2) What Mina actually did
+- Autonomous model-only inspections with a non-empty summary were returned as `ok: true`, then stored and announced as successful work despite `completion_verified: false`.
+
+#### 3) What should have happened
+- A model-only inspection should be recorded as `research_complete`, remain unverified, and never close its TODO item or be labeled a successful action.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py` (`_run_autonomous_work_task`)
+  - `agent/curiosity.py` (`_run_useful_work`)
+- The live audit at `E:\workspace\autonomy\audit.jsonl` had 387 records and zero `completion_verified` entries, while prior work events were labeled successful.
+
+#### 5) Failure class
+- Verification missing
+
+#### 6) Root cause
+- `_run_autonomous_work_task()` computed `ok` from a non-empty model summary and patch transport success, rather than from structured validation evidence. `AutonomousCuriosity` used that `ok` value to deduplicate tasks and apply the `success` tag.
+
+#### 7) Minimal fix
+- Completion is now `verified_complete` only when a patch was applied and its recorded validations passed. Model-only output is `research_complete`; the curiosity lane records it with a `research` tag rather than `success` or `failed`.
+
+#### 8) Regression prompts
+- Prompt 1: a model returns "Found a bounded improvement" without a patch or tool validation -> must be `research_complete`, not `ok`.
+- Prompt 2: ask for autonomous status after research-only work -> the work must remain unverified and eligible for bounded follow-up.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded verification invariant.
+- Why this approach fits: whether an action has execution proof is a stable protocol contract; model wording and learned project context remain memory-driven.
+- Risk if wrong approach chosen: a memory-only or prompt-only rule would allow a plausible model summary to close work again without proof.
+
+#### 10) Done criteria
+- [x] Model-only research cannot report `ok: true`.
+- [x] Research work is not labeled success or failure in the curiosity event/memory lane.
+- [x] Focused autonomy suite passes (`22 passed`).
+- [ ] API restart shows the new completion semantics live without synthetic memory evidence.
+- [x] `tools/refresh_core_reference.ps1` ran; `core_reference.md` and `core_index.json` now match the generated count of 379.
+- Verification: API restarted as PID 30452 with healthy embed, memory, and database checks; source edits remain disabled and the independent watchdog is running as PID 29328.
+
+### Issue: Autonomous discovery accepted irrelevant backup, generated, and web content
+
+- Date: 2026-08-27
+- Reporter: Travis / live autonomy review
+- Priority: Medium
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "well how do we determan relevancy?"
+  - "yah, awesome thanks for the explination lets run with it. proceed."
+
+#### 2) What Mina actually did
+- Local discovery announced an old `G:\.openclaw_backup` shortcut and generated `package-lock.json`; news discovery accepted unrelated Wikipedia material because trusted sources and fixed queries could bypass active-topic relevance.
+
+#### 3) What should have happened
+- Discoveries should require a current conversation-topic match and come from an allowed, useful source. Backup, generated, and lock-file artifacts must not be announced or stored.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/curiosity.py` (`_scan_local`, `_scan_news`)
+  - `tests/test_curiosity_policy.py`
+
+#### 5) Failure class
+- Persona/response contract broken
+
+#### 6) Root cause
+- Local scanning scored any topic-bearing path without quality exclusions. Web scanning accepted Ostranauts/coding trusted sources even when they had no current-topic overlap, while unconditional fixed queries made unrelated discovery likely.
+
+#### 7) Minimal fix
+- Added deterministic relevance helpers. Local candidates now require topic-bearing paths and reject backups, generated directories, and lock files. Web candidates require both current-topic overlap and an approved technical or Ostranauts source; unconditional fixed searches were removed.
+
+#### 8) Regression prompts
+- Prompt 1: active topic `haven` must not announce `G:\.openclaw_backup\workspace\check-haven-shortcut.ps1`.
+- Prompt 2: active topic `python` may accept matching `docs.python.org` content.
+- Prompt 3: active topic `music` must reject an unrelated Wikipedia result.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded relevance acceptance gate with memory-driven topics.
+- Why this approach fits: source quality and exclusion rules are stable autonomy safety boundaries, while what Mina is currently focused on comes from her evolving conversation memory.
+- Risk if wrong approach chosen: hardcoding topics would become another keyword trap; leaving acceptance fully model-driven keeps admitting plausible but useless discoveries.
+
+#### 10) Done criteria
+- [x] Backup and generated local artifacts are rejected.
+- [x] Web discoveries require both trusted source and active-topic overlap.
+- [x] Focused relevance regressions pass (`4 passed`).
+
+### Issue: Historical TODO checklists inflated Mina's autonomous work queue
+
+- Date: 2026-08-27
+- Reporter: Travis / live autonomy review
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "ok lets continue"
+
+#### 2) What Mina actually did
+- Parsed every unchecked checkbox in `TODO.md`, including done criteria and historical issue records. The live work queue reached 92 items and retried old validation statements as if they were current tasks.
+
+#### 3) What should have happened
+- Mina should queue only the current backlog, leaving issue-history checklists as documentation rather than autonomous work.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py` (`_autonomous_work_candidates`)
+  - `tests/test_autonomous_work.py`
+- Live `/curiosity/status` reported 92 queued work items before this change.
+
+#### 5) Failure class
+- Verification missing
+
+#### 6) Root cause
+- Candidate parsing matched `- [ ]` anywhere in the document and had no boundary between `## Next` and subsequent `### Issue:` history.
+
+#### 7) Minimal fix
+- When a TODO contains `## Next`, only parse unchecked items under that heading until the next issue heading. Simple TODO files without `## Next` retain their original whole-file behavior.
+
+#### 8) Regression prompts
+- Prompt 1: a structured TODO with historical unchecked done criteria -> queue only active `## Next` work.
+- Prompt 2: a simple TODO without `## Next` -> preserve its valid unchecked task.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded document-structure boundary.
+- Why this approach fits: separating the active backlog from historical records is a stable workflow contract, not a learned user preference.
+- Risk if wrong approach chosen: semantic guessing can still queue history; applying the boundary to every TODO would break simple task lists.
+
+#### 10) Done criteria
+- [x] Historical issue checklists do not enter the active queue.
+- [x] Standalone TODO compatibility is preserved.
+- [x] Focused candidate-selection regressions pass (`2 passed`).
+- [x] Full focused autonomy suite passes (`25 passed`) and API restarted as PID 25796.
+- [x] Active `## Next` backlog measured at 30 items after historical checklists were excluded; project tracker is empty.
+- [x] Ostranauts work is deferred through `curiosity.suspended_task_keywords=["ostranauts"]` while the integration is on hold, including generic tasks under its section; final planner count is 21 eligible tasks and focused regression passes (`2 passed`).
+
+### Issue: Broad, manual, and destructive TODO items consumed autonomous work cycles
+
+- Date: 2026-08-27
+- Reporter: Travis / autonomy reliability pass
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "continue"
+
+#### 2) What Mina actually did
+- After historical checklist removal, the planner still treated broad initiatives, human-only reboot checks, and archive/delete work as equally eligible background tasks.
+
+#### 3) What should have happened
+- Idle work should start only when Mina can inspect or verify a concrete, non-destructive proof target. Broad items remain available for a user or future code-agent handoff, but they must not burn autonomous cycles.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py` (`_autonomous_task_has_proof_target`, `_autonomous_work_candidates`)
+  - `tests/test_autonomous_work.py`
+- The 21-item filtered queue included broad goals, real reboot/sign-in validation, and workspace deletion/pruning tasks with no bounded autonomous proof path.
+
+#### 5) Failure class
+- Verification missing
+
+#### 6) Root cause
+- Candidate selection checked only whether an item was unchecked and active, not whether its wording supplied a safe observable target.
+
+#### 7) Minimal fix
+- Added a proof-target gate. Eligible items must name a supported file type, HTTP endpoint, or executable test/command. Archive/delete/prune/remove work and reboot, sign-in, parked, or manual validation are deferred.
+
+#### 8) Regression prompts
+- Prompt 1: "Run pytest tests/test_worker.py" -> eligible.
+- Prompt 2: "Verify GET /status returns core_online" -> eligible.
+- Prompt 3: "Improve Mina reliability", "Validate the real reboot/sign-in cycle", and "Review and delete E:\\workspace\\tmp\\old.txt" -> not eligible.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded proof boundary.
+- Why this approach fits: safe, observable task eligibility is a stable execution contract; Mina's learned memory still determines priorities and relevance inside eligible work.
+- Risk if wrong approach chosen: a model-only relevance choice can retry vague busywork, while an overly rigid phrase list would reject naturally worded concrete tasks.
+
+#### 10) Done criteria
+- [x] Broad, manual-only, and destructive items are deferred.
+- [x] Concrete test and endpoint tasks remain eligible.
+- [x] Focused proof-target regression passes (`1 passed`).
+- [x] Configured planner now exposes one bounded eligible task: `POST /tasks/ring_due_alarm` verification.
+- [x] Full focused autonomy suite passes (`27 passed`); core function references refreshed to 380.
+- [x] Mina restarted as API PID 23376 with healthy embed, memory, and database checks; source edits remain disabled and watchdog PID 29328 remains running.
+
+### Issue: Phone alarm dedupe did not notify Mina's due-alarm endpoint
+
+- Date: 2026-08-27
+- Reporter: Travis / bounded autonomy task
+- Priority: Medium
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "sounds good lets do it."
+
+#### 2) What Mina actually did
+- `AlarmSyncService` locally deduplicated and rang a newly due alarm, but never called `POST /tasks/ring_due_alarm`; Mina's backend could not receive the corresponding due-alarm signal.
+
+#### 3) What should have happened
+- Once per newly due task signature, the phone should make a best-effort backend notification while preserving local alarm delivery if the API is unavailable.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `android/mina-voice-app/app/src/main/java/com/mina/voice/AlarmSyncService.kt`
+  - `tests/test_alarm_api.py`
+- Existing `markAlarmUnseen(taskId:dueAt)` persists a signature before the local alarm, providing the one-per-new-due-alarm debounce boundary.
+
+#### 5) Failure class
+- Verification missing
+
+#### 6) Root cause
+- The phone polling loop called `ringPhoneAlarm()` directly after local deduplication but had no request path for `/tasks/ring_due_alarm`.
+
+#### 7) Minimal fix
+- Added a best-effort empty `POST` to `/tasks/ring_due_alarm` immediately after `markAlarmUnseen()` succeeds and before local delivery. Network errors are ignored so an unavailable API never suppresses the phone alarm.
+
+#### 8) Regression prompts
+- Prompt 1: a no-due queue -> `POST /tasks/ring_due_alarm` returns `ok=true`, `played=false`, and `reason=no_due_alarm`.
+- Prompt 2: a stubbed due `alarm_task` -> endpoint returns the task id and `played=true` when its beep launcher succeeds.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded endpoint handoff using the existing memory-backed signature dedupe.
+- Why this approach fits: request ordering and one-per-signature delivery are deterministic transport rules, while task due times and task content remain in Mina's normal task memory.
+- Risk if wrong approach chosen: calling before dedupe can repeatedly notify during every poll; making the call required can silence local alarms during network loss.
+
+#### 10) Done criteria
+- [x] Android notification occurs only after persisted new-alarm deduplication.
+- [x] Local alarm delivery continues on API failure.
+- [x] Isolated endpoint contract tests pass (`2 passed`).
+- [x] Android `:app:compileDebugKotlin` succeeds.
+- [x] Live no-due endpoint proof returned `ok=true`, `played=false`, `reason=no_due_alarm`; due count and task list were unchanged.
+- [ ] A live due-alarm/device notification test remains intentionally deferred until a parked-phone test is requested.
+
+### Issue: Autonomous patches relied on config even when the watchdog was stopped
+
+- Date: 2026-08-27
+- Reporter: Travis / autonomy reliability pass
+- Priority: Critical
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "sounds good proceed."
+
+#### 2) What Mina actually did
+- `_apply_autonomous_patch()` trusted `curiosity.allow_source_edits` and could create/apply a patch candidate while the independent watchdog process was stopped.
+
+#### 3) What should have happened
+- Source patch application must fail closed unless the external watchdog proves that it is running and recently healthy.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py` (`_autonomous_watchdog_ready`, `_apply_autonomous_patch`)
+  - `config/mk1_config.json`
+  - `tests/test_autonomous_work.py`
+- Live review found source edits configured independently from watchdog process state.
+
+#### 5) Failure class
+- Verification missing
+
+#### 6) Root cause
+- Patch validation began with candidate checks and snapshot creation but had no mandatory process/state check for the independently running rollback monitor.
+
+#### 7) Minimal fix
+- Added a fail-closed readiness gate before candidate processing. It requires `state.json` with `healthy=true`, a timestamp no older than 90 seconds, and a live PID from `watchdog.pid`. Windows uses read-only `tasklist.exe` process lookup rather than signal-based liveness checks.
+
+#### 8) Regression prompts
+- Prompt 1: configured source edits with missing watchdog files -> patch is rejected before file mutation.
+- Prompt 2: fresh healthy state plus live PID -> watchdog readiness passes.
+- Prompt 3: live PID plus stale state -> watchdog readiness is rejected.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded safety invariant.
+- Why this approach fits: independent recovery supervision is a deterministic precondition for autonomous code mutation, not learned conversational behavior.
+- Risk if wrong approach chosen: a remembered or prompt-level rule can be bypassed by configuration drift, leaving Mina able to modify source without an active rollback supervisor.
+
+#### 10) Done criteria
+- [x] Missing or unhealthy watchdog blocks patch application.
+- [x] Stale watchdog health blocks patch application.
+- [x] Windows process liveness check is read-only and does not signal the watchdog.
+- [x] Focused watchdog regressions pass (`2 passed`).
+- [x] Full focused autonomy suite passes (`29 passed`); invalid/protected patch diagnostics remain unchanged.
+- [x] Core function references refreshed to 381.
+- [x] Mina restarted as API PID 21684 with healthy service checks. A watchdog restart-transient correctly blocked readiness; an independent `mina_watchdog.ps1 once` pass restored fresh healthy state and the live core returned `watchdog_ready=(True, '')`.
+
+### Issue: Curiosity status could not explain why Mina was idle or blocked
+
+- Date: 2026-08-27
+- Reporter: Travis / autonomy reliability pass
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "ok lets do that."
+
+#### 2) What Mina actually did
+- `/curiosity/status` exposed scheduler timestamps and a cached queue size but did not distinguish eligible work from deferred work, model blocks, or an unavailable watchdog.
+
+#### 3) What should have happened
+- Status should explain the current autonomous decision: eligible tasks, deferred reasons, latest outcome, model-unavailable history, and whether source edits are configured versus actually permitted.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py` (`_autonomous_decision_summary`)
+  - `agent/server/mk1_api.py` (`GET /curiosity/status`)
+  - `tests/test_autonomous_work.py`
+
+#### 5) Failure class
+- Verification missing
+
+#### 6) Root cause
+- The API passed through `AutonomousCuriosity.status()` but did not inspect the active TODO decision boundaries, durable audit outcomes, or watchdog readiness gate.
+
+#### 7) Minimal fix
+- Added a read-only `decision_summary` to both autonomous status surfaces. It reports eligible preview/count, deferred counts by reason, latest audited outcome, model-unavailable count, and watchdog readiness plus configured/permitted source-edit state.
+
+#### 8) Regression prompts
+- Prompt 1: one concrete pytest task plus suspended, broad, manual, and delete tasks -> one eligible task and four exact defer reasons.
+- Prompt 2: an audit row with `model_unavailable` -> reports `last_outcome=blocked` and a model-block count.
+- Prompt 3: configured source edits with a stale watchdog -> reports configured but not permitted.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded read-only observability contract.
+- Why this approach fits: the classification and proof fields are stable runtime facts; task content and priorities remain memory-driven.
+- Risk if wrong approach chosen: opaque status invites invented explanations or makes an intentionally idle system look broken.
+
+#### 10) Done criteria
+- [x] Decision summary distinguishes eligible and deferred work.
+- [x] Model blocks and watchdog permission are visible without memory mutation.
+- [x] Focused summary regression passes (`1 passed`).
+- [x] Focused autonomy/status suite passes (`32 passed`) and core function references refreshed to 384.
+- [x] Live `GET /curiosity/status` reports 0 eligible and 29 deferred tasks: 15 `no_proof_target`, 9 `suspended_topic`, 3 `destructive_operation`, and 2 `manual_validation_required`; it also reports 82 model-unavailable audit outcomes.
+- [x] After an independent watchdog health pass, live status reports watchdog `ready=true`; source edits remain configured/permitted `false`.
+
+### Issue: API route tests initialized the live Mina core and created backup artifacts
+
+- Date: 2026-08-27
+- Reporter: Travis / test isolation review
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "proceed"
+
+#### 2) What Mina actually did
+- Importing `agent.server.mk1_api` during pytest immediately constructed `MK1Core()`. FastAPI `TestClient` teardown then invoked `core.close()`, creating normal live-memory backups even though route tests replaced `core` with fakes before making requests.
+
+#### 3) What should have happened
+- API route tests should import only the route application and inject their own fake core, without initializing, closing, or backing up Mina's live memory engine.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/server/mk1_api.py`
+  - `tests/conftest.py`
+  - `tests/test_api_test_isolation.py`
+- Previous API test runs printed live backup creation after route tests; the isolated suite no longer does.
+
+#### 5) Failure class
+- Verification missing
+
+#### 6) Root cause
+- The API module instantiated production `MK1Core` at import time before pytest could monkeypatch its `core` module variable.
+
+#### 7) Minimal fix
+- `tests/conftest.py` sets `MK1_API_TEST_MODE=1` before test collection. In that mode the API module leaves `core=None`; each route test continues to inject a fake core before requests. Production launchers do not set the flag and still initialize `MK1Core()` normally.
+
+#### 8) Regression prompts
+- Import the API during pytest -> `core is None` before a test injects a fake.
+- Run memory, alarm, action, status-cache, and queue route tests -> routes pass without a live-core backup side effect.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded test-runtime boundary.
+- Why this approach fits: preventing test code from mutating production lifecycle state is a deterministic isolation requirement, not learned behavior.
+- Risk if wrong approach chosen: route tests can silently produce backups, initialize live network dependencies, or contaminate future test observations.
+
+#### 10) Done criteria
+- [x] Pytest API imports do not construct a live core.
+- [x] API route tests can still inject their fake cores.
+- [x] Focused API route suite passes (`9 passed`) without a live backup creation message.
+- [x] Combined API/autonomy suite passes (`39 passed`) without a live backup creation message; production Mina restarted as API PID 4048 with healthy embed, memory, and database checks.
+
+### Issue: Mina needed an explicit intake format for bounded autonomous work
+
+- Date: 2026-08-27
+- Reporter: Travis / autonomy planning pass
+- Priority: Medium
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "ok, lets do that."
+
+#### 2) What Mina actually did
+- The remaining backlog was intentionally deferred, but it had no concise format for promoting a user-approved task into a bounded, evidence-capable autonomous candidate.
+
+#### 3) What should have happened
+- `TODO.md` should show a small intake template that names proof target, allowed scope, and observable done condition. The template must remain documentation and never be selected as work itself.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `TODO.md`
+  - `agent/core.py` (`_autonomous_todo_items`)
+  - `tests/test_autonomous_work.py`
+
+#### 5) Failure class
+- Verification missing
+
+#### 6) Root cause
+- No standardized structure made it easy to turn an intent into a verifiable task; a literal unchecked example in the first template revision was also parsed as a real candidate.
+
+#### 7) Minimal fix
+- Added the `Autonomous Work Intake` documentation section at the start of `## Next` and excluded that section from TODO candidate parsing. Any real task placed in another active section still uses the existing proof-target and safety gates.
+
+#### 8) Regression prompts
+- An active TODO containing the intake example plus a real `pytest` task -> only the real task is eligible.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded document-structure boundary.
+- Why this approach fits: the intake section is a stable documentation format, while actual task wording and priorities remain user- and memory-driven.
+- Risk if wrong approach chosen: the template can become recurring fake work or an overly rigid schema can reject naturally worded real tasks.
+
+#### 10) Done criteria
+- [x] Intake template documents proof target, allowed action, and done condition.
+- [x] Template placeholder does not enter the autonomous planner.
+- [x] Focused intake regression passes (`1 passed`) and live candidate count is zero.
+- [x] Focused autonomy suite passes (`31 passed`); core reference refresh remains synchronized at 384 functions.
+- [x] Production Mina restarted as API PID 14680; live decision summary reports 0 eligible and 29 deferred items.
+
+### Issue: Read-and-summarize file requests could return an unbounded raw file dump
+
+- Date: 2026-08-27
+- Reporter: Travis / authorized live reliability matrix
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - "Read E:\\Mina_MK1\\TODO.md and summarize the active autonomous backlog."
+
+#### 2) What Mina actually did
+- Read the correct file but returned approximately 159,683 characters of raw `TODO.md` content instead of a bounded summary.
+
+#### 3) What should have happened
+- A read-and-summarize request should return the relevant active backlog concisely. A plain explicit file read should retain full-content behavior.
+
+#### 4) Evidence
+- File path(s) affected:
+  - `agent/core.py` (`_render_tool_response_as_mina`)
+  - `tests/test_transcript_regression_prompts.py`
+- `file_read` correctly returned content; the direct renderer had no summary-specific path and could return that full content unchanged.
+
+#### 5) Failure class
+- Persona/response contract broken
+
+#### 6) Root cause
+- The file-read formatter treated a summary request as an ordinary direct read. Its model-analysis fallback could expose the complete verified payload when a concise narration was unavailable.
+
+#### 7) Minimal fix
+- Added a deterministic bounded summary branch before model analysis. For `TODO.md`, it extracts only unchecked tasks inside the active `## Next` backlog, skips the intake template and issue history, and caps the preview at 12 tasks. Other summary requests receive at most eight non-empty lines. Plain file reads remain unchanged.
+
+#### 8) Regression prompts
+- Prompt 1: "Read E:\\Mina_MK1\\TODO.md and summarize the active autonomous backlog." -> only active backlog tasks, no history/template content.
+- Prompt 2: "Read E:\\Mina_MK1\\TODO.md" -> preserves full file content.
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded bounded response protocol.
+- Why this approach fits: respecting an explicit summary request and preserving a full-read request are deterministic response contracts; the selected TODO content remains user-authored.
+- Risk if wrong approach chosen: model-only summarization can fail open into a huge dump, while forcing summaries for every read would remove intentional full-file access.
+
+#### 10) Done criteria
+- [x] Summary requests do not return full raw TODO content.
+- [x] Active TODO summary excludes historical records and the intake placeholder.
+- [x] Explicit full reads remain unchanged.
+- [x] Focused transcript regressions pass (`2 passed`).
+- [x] Affected transcript/autonomy suite passes (`101 passed`); core function references refreshed to 386.
+- [x] Production Mina restarted as API PID 24108 with healthy startup checks.
+- [ ] A repeat live summary prompt is intentionally deferred because it would add another memory interaction and needs separate authorization.
+
+### Issue: Fancy GUI was outside the authoritative repository and compressed all operations into one view
+
+- Date: 2026-08-27
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### Root cause
+- The active Tauri GUI lived in `C:\dev\mina-gui`, outside Mina's repository, and rendered chat, status, tasks, images, controls, and autonomy state concurrently in a three-column layout.
+
+#### Minimal fix
+- Copied the active GUI source into `apps/mina-gui` without deleting the old working copy or copying its `.git`, dependencies, build output, or caches. Preserved the existing command-deck CRT styling, then added tabbed Chat, Status, Autonomy, Tasks, System, and Ostranauts-on-hold views. Updated `gui.fancy_dir` and GUI continuity documentation to the repo-local path.
+
+#### Implementation choice
+- Hardcoded repository ownership and tab layout because application location and view separation are stable operational contracts. API state remains the source of truth for displayed health and autonomy data.
+
+#### Verification
+- Repo-local `pnpm install --frozen-lockfile` and `pnpm build` passed before layout changes; the tabbed GUI build also passed.
+- Mina restart launched GUI development from `E:\Mina_MK1\apps\mina-gui`; browser smoke checks confirmed Chat, Status, Autonomy, Tasks, System, and Ostranauts-on-hold tabs render from the repo-local server.
+- Legacy launch fallbacks now resolve to the repo-local GUI. The prior standalone working copy remains untouched as rollback.
+
+### Issue: Tasks view was only a short queue preview and could not create personal reminders
+
+- Date: 2026-08-27
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### Root cause
+- The Tasks tab used `/tasks/queue_status` and displayed only a small preview. It exposed no structured creation path and placed task completion/snooze controls in the unrelated System view.
+
+#### Minimal fix
+- Added `POST /tasks/create` backed by Mina's existing `add_task_memory` storage API. The repo-local Tasks tab now fetches the full `/tasks/list` feed, summarizes due/upcoming/recurring counts, displays due, recurrence, alarm, and tag details, contains selected-task `DONE`, `+10m`, and `+30m` controls, and provides a structured local-date reminder form. Phone delivery is explicitly reported as unconfirmed until an endpoint supplies that status.
+
+#### Implementation choice
+- Memory for task content and lifecycle, because reminders are user-owned evolving data and the existing task-memory APIs are authoritative. Hardcoded API/form schema only, because request validation and UI field mapping are deterministic service contracts. Using a parallel hardcoded task store would fragment Mina's reminder history.
+
+#### Verification
+- Focused task API suite passed (`6 passed`), including isolated `/tasks/create` coverage. `apps/mina-gui` production build passed twice after the UI edits. Browser smoke check confirmed the empty task-memory state, live API status, recurrence summary, quiet disabled selected-task controls, and creation form without creating or mutating a live reminder. Mina API restarted successfully as PID 33364; `/status` reported `task_queue.available: true`.
+
+### Issue: Autonomy view showed deferred work but gave no deliberate promotion path
+
+- Date: 2026-08-27
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### Root cause
+- The Autonomy tab displayed aggregate defer reasons but did not show individual deferred work, let Travis add bounded tasks, or allow a deferred task to be converted into a user-approved planner candidate.
+
+#### Minimal fix
+- Added a separate `E:\workspace\autonomy\approved_tasks.json` intake store, `GET/POST /autonomy/tasks`, deferred-task previews, and an Autonomy-tab promotion/form flow. Approval requires title, proof target, allowed action (`read_only`, `test_run`, or `proposed_patch`), and an observable done condition. Approved tasks become a distinct planner source; no memory record is written and source edits remain subject to the existing disabled config plus watchdog gate.
+
+#### Implementation choice
+- Hardcoded approval schema and persistence boundary because explicit user approval and proof requirements are stable execution contracts. Task content remains user-authored and the autonomous planner still applies its normal safeguards.
+
+#### Verification
+- Core/API approval tests passed (`23 passed`) and the approved-task regression passed after malformed payload handling was added. Browser smoke check confirmed all deferred tasks, exact defer reasons, `PROMOTE` buttons, the required approval form, and the pending approved-task list. A promotion click prefills the form but does not create a task before explicit form submission.

@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -104,11 +105,30 @@ class AlarmSyncService : Service() {
                     if (!markAlarmUnseen(signature)) continue
 
                     val text = task.optString("text", "Mina alarm").ifBlank { "Mina alarm" }
+                    notifyMinaDueAlarm(base)
                     ringPhoneAlarm(taskId, text)
                 }
             }
         } catch (_: Exception) {
             // Connectivity may come and go; the next poll retries without disturbing the app.
+        }
+    }
+
+    private fun notifyMinaDueAlarm(base: String) {
+        val ringUrl = base.toHttpUrlOrNull()
+            ?.newBuilder()
+            ?.encodedPath("/tasks/ring_due_alarm")
+            ?.query(null)
+            ?.build()
+            ?: return
+        val request = Request.Builder()
+            .url(ringUrl)
+            .post(ByteArray(0).toRequestBody())
+            .build()
+        try {
+            httpClient.newCall(request).execute().use { }
+        } catch (_: Exception) {
+            // Local alarm delivery remains available while the API is unreachable.
         }
     }
 

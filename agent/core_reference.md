@@ -20,7 +20,7 @@ Memory is Mina. Do not replace normal learned behavior with hardcoded chat or ro
 
 ## File Scale Snapshot
 
-- Function count: 368
+- Function count: 390
 - Main classes:
   - `LMStudioClient`
   - `MK1Core`

@@ -23,6 +23,7 @@ except Exception as exc:  # pragma: no cover
 
 ROOT = Path(__file__).resolve().parent
 MK1_PS1 = ROOT / "mk1_api.ps1"
+GUI_DIR = ROOT / "apps" / "mina-gui"
 CONFIG_DIR = Path(os.getenv("APPDATA", str(ROOT))) / "Mina_MK1"
 CONFIG_PATH = CONFIG_DIR / "tray_launcher_config.json"
 
@@ -36,6 +37,7 @@ class LauncherConfig:
 	voice_device: int = -1
 	voice_hint: str = "en-US-AnaNeural"
 	api_port: int = 8000
+	gui_port: int = 1420
 
 
 class MinaTrayLauncher:
@@ -49,10 +51,19 @@ class MinaTrayLauncher:
 		self.icon.menu = self._build_menu()
 
 	def _build_icon(self) -> Image.Image:
-		image = Image.new("RGB", (64, 64), color=(22, 22, 26))
+		image = Image.new("RGB", (64, 64), color=(9, 14, 18))
 		draw = ImageDraw.Draw(image)
-		draw.rectangle((8, 8, 56, 56), fill=(36, 145, 255))
-		draw.text((20, 20), "M", fill=(255, 255, 255))
+		draw.rectangle((3, 3, 60, 60), outline=(0, 255, 136), width=2)
+		draw.rectangle((7, 7, 56, 56), outline=(28, 82, 92), width=1)
+		draw.polygon([(12, 25), (17, 10), (28, 21), (36, 21), (47, 10), (52, 25), (48, 45), (16, 45)], fill=(24, 34, 39), outline=(0, 255, 136))
+		draw.polygon([(17, 15), (20, 25), (25, 21)], fill=(255, 72, 151))
+		draw.polygon([(47, 15), (44, 25), (39, 21)], fill=(255, 72, 151))
+		draw.rectangle((19, 28, 27, 33), fill=(0, 255, 136))
+		draw.rectangle((37, 28, 45, 33), fill=(0, 255, 136))
+		draw.rectangle((22, 29, 24, 31), fill=(9, 14, 18))
+		draw.rectangle((40, 29, 42, 31), fill=(9, 14, 18))
+		draw.line((29, 38, 35, 38), fill=(255, 184, 77), width=2)
+		draw.line((32, 35, 32, 41), fill=(255, 184, 77), width=1)
 		return image
 
 	def _load_config(self) -> LauncherConfig:
@@ -68,6 +79,7 @@ class MinaTrayLauncher:
 						voice_device=int(raw.get("voice_device", -1)),
 						voice_hint=str(raw.get("voice_hint", "en-US-AnaNeural")),
 						api_port=int(raw.get("api_port", 8000)),
+						gui_port=int(raw.get("gui_port", 1420)),
 					)
 		except Exception:
 			pass
@@ -87,6 +99,30 @@ class MinaTrayLauncher:
 				return True
 			time.sleep(0.8)
 		return False
+
+	def _launch_external_gui(self) -> None:
+		if not self.config.load_fancy_gui:
+			return
+		if not GUI_DIR.exists():
+			raise FileNotFoundError(f"Missing GUI directory: {GUI_DIR}")
+		if self._is_port_open(self.config.gui_port):
+			return
+
+		gui_path = str(GUI_DIR).replace("'", "''")
+		command = f"Set-Location -LiteralPath '{gui_path}'; pnpm tauri dev"
+		subprocess.Popen(
+			[
+				"powershell",
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-NoExit",
+				"-Command",
+				command,
+			],
+			cwd=str(ROOT),
+			creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+		)
 
 	def _verify_stopped(self, timeout_seconds: float = 70.0) -> bool:
 		deadline = time.monotonic() + max(1.0, float(timeout_seconds))
@@ -168,8 +204,7 @@ class MinaTrayLauncher:
 			str(self.config.voice_hint or "en-US-AnaNeural"),
 		]
 
-		if not self.config.load_fancy_gui:
-			cmd.append("-NoGuiDev")
+		cmd.append("-NoGuiDev")
 		if self.config.start_voice_interfaces:
 			cmd.append("-AutoVoice")
 		if self.config.gui_speak:
@@ -190,6 +225,8 @@ class MinaTrayLauncher:
 		try:
 			cmd = self._build_start_command()
 			self._run_detached(cmd)
+			if self.config.load_fancy_gui:
+				self._launch_external_gui()
 			self._set_status("launch requested", "Mina Tray Launcher (launch requested)")
 
 			def _verify() -> None:

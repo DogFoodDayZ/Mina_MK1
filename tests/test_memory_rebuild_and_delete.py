@@ -124,7 +124,7 @@ def test_memory_hygiene_reports_true_result_even_if_rebuild_fails(tmp_path, monk
     mem.backup = lambda reason="hygiene", force=False: "backup-path"
     monkeypatch.setattr(mem, "_rebuild_indexes", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
 
-    result = mem.memory_hygiene(dry_run=False, max_delete=500)
+    result = mem.memory_hygiene(dry_run=False, max_delete=500, authorized_apply=True)
 
     assert result["ok"] is True
     assert result["delete_count"] == 1

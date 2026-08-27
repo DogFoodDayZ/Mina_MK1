@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -8,6 +9,8 @@ import mk1_api
 
 
 class _FakeCore:
+    model = SimpleNamespace(default_model="test-model")
+
     def process(self, user_input):
         if 'save that' in user_input.lower():
             return {'reply': 'Stored memory: my eyes are deep water blue'}

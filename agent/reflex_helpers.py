@@ -99,12 +99,6 @@ def handle_identity_reflex(core: Any, tool_name: str, tool_args: Dict[str, Any],
 
 
 def handle_direct_response_reflex(core: Any, tool_name: str, tool_args: Dict[str, Any], user_input: str) -> Optional[Dict[str, Any]]:
-    if tool_name == "__spotify_dj_capability__":
-        return message_choice(
-            "Yes. I can do that. I can read track duration and auto-switch songs from your liked list when each song ends. "
-            "Say: 'start dj mode from my favorite list'. You can stop it with: 'stop dj mode'."
-        )
-
     if tool_name == "__tool_self_test__":
         result = core._run_tool_self_test(str(tool_args.get("request") or user_input))
         formatted = core._format_tool_result(tool_name, result)

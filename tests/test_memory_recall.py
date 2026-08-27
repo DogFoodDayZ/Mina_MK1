@@ -92,6 +92,105 @@ def test_build_context_combines_short_and_long_recall():
     assert "Host is Windows" in context
 
 
+def test_build_context_keeps_exact_durable_fact_when_semantic_hits_are_noisy():
+    class NoisyMemory(FakeMemory):
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_kinds == ["fact", "tool", "preference", "procedure"]:
+                return [
+                    {"text": "Unrelated recent capability snapshot", "kind": "fact", "tags": []},
+                    {"text": "User's favorite color is green", "kind": "preference", "tags": []},
+                ]
+            return []
+
+        def recent_memories(self, top_k=6, include_kinds=None, include_tags=None, since_ts=None):
+            return [
+                {"text": "A noisy recent assistant reply", "kind": "interaction", "tags": ["short_term"]},
+            ]
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = NoisyMemory()
+
+    context = MK1Core.build_context(core, "what is my name")
+
+    assert "Long-term recall:" in context
+    assert "User's favorite color is green" in context
+
+
+def test_build_context_excludes_unrelated_recent_turns():
+    core = MK1Core.__new__(MK1Core)
+
+    recent = [
+        {"text": "The old refusal about changing source code", "tags": ["short_term"]},
+        {"text": "The reactor panel needs the control key", "tags": ["short_term"]},
+    ]
+
+    selected = MK1Core._relevant_recent_turns(core, "what key opens the reactor panel", recent)
+
+    assert [item["text"] for item in selected] == ["The reactor panel needs the control key"]
+
+
+def test_build_context_caps_recalled_prompt_size():
+    class LargeMemory(FakeMemory):
+        def recent_memories(self, top_k=6, include_kinds=None, include_tags=None, since_ts=None):
+            return []
+
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_kinds == ["fact", "tool", "preference", "procedure"]:
+                return [{"text": f"fact-{index} " + ("x" * 1800)} for index in range(20)]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = LargeMemory()
+
+    context = MK1Core.build_context(core, "what do you remember about the facts")
+
+    assert len(context) <= 12000
+
+
+def test_build_turn_working_memory_excludes_large_write_payloads():
+    class WorkingMemoryNoise(FakeMemory):
+        def recent_memories(self, top_k=6, include_kinds=None, include_tags=None, since_ts=None):
+            return [
+                {"text": "Tool 'file_write' called with args={'path': 'bad', 'content': '" + ('x' * 900) + "'}"},
+                {"text": "hardware_snapshot::CPU Ryzen 7 GPU RTX 4080"},
+            ]
+
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = WorkingMemoryNoise()
+
+    out = MK1Core._build_turn_working_memory(core, "what hardware do I have")
+
+    assert "file_write" not in out
+    assert "hardware_snapshot::CPU Ryzen 7 GPU RTX 4080" in out
+
+
+def test_build_context_excludes_verbose_artifact_and_capability_records():
+    class ContextNoise(FakeMemory):
+        def recent_memories(self, top_k=6, include_kinds=None, include_tags=None, since_ts=None):
+            return []
+
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_kinds == ["fact", "tool", "preference", "procedure"]:
+                return [
+                    {"text": "code_artifact::path=old.py " + ("x" * 900)},
+                    {"text": "mina_capability_snapshot::old snapshot " + ("x" * 900)},
+                    {"text": "The current active project is Ostranauts."},
+                ]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = ContextNoise()
+
+    context = MK1Core.build_context(core, "what project are we working on")
+
+    assert "code_artifact::" not in context
+    assert "mina_capability_snapshot::" not in context
+    assert "current active project" in context
+
+
 def test_build_context_includes_learning_lessons():
     class LessonMemory(FakeMemory):
         def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
@@ -143,6 +242,30 @@ def test_build_context_prioritizes_retry_attempt_lessons():
     assert retry_idx < failure_idx
 
 
+def test_build_context_includes_active_task_heartbeat_state():
+    class HeartbeatMemory(FakeMemory):
+        def recent_memories(self, top_k=6, include_kinds=None, include_tags=None):
+            return []
+
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_tags == ["task_state", "heartbeat", "active_issue"]:
+                return [{
+                    "text": "Task heartbeat: avatar fix still in progress; last verified: API is running on port 8000.",
+                    "tags": ["task_state", "heartbeat"],
+                    "timestamp": 200.0,
+                }]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = HeartbeatMemory()
+
+    context = MK1Core.build_context(core, "what were we working on")
+
+    assert "Task heartbeat:" in context
+    assert "avatar fix" in context
+    assert "port 8000" in context
+
+
 def test_process_stores_turn_memory_for_reflex_reply():
     core = MK1Core.__new__(MK1Core)
     core.memory = FakeMemory()
@@ -183,9 +306,10 @@ def test_process_stores_turn_memory_for_reflex_reply():
     result = MK1Core.process(core, "hardware info")
 
     assert result["reply"] == "Tool says hi"
-    assert len(core.memory.writes) == 2
+    assert len(core.memory.writes) >= 3
     assert core.memory.writes[0]["kind"] == "interaction"
     assert "short_term" in core.memory.writes[0]["tags"]
+    assert any(item.get("kind") == "note" and "task_state" in (item.get("tags") or []) for item in core.memory.writes)
     assert len(core.memory.promotions) == 1
     assert core.memory.promotions[0]["seed_text"] == "hardware info"
 
@@ -394,13 +518,13 @@ def test_store_turn_memory_records_retry_attempt_note_when_guided():
         retry_guided=True,
     )
 
-    assert len(core.memory.writes) == 3
-    lesson = core.memory.writes[2]
-    assert lesson["kind"] == "note"
+    assert len(core.memory.writes) >= 4
+    lesson = next(item for item in reversed(core.memory.writes) if item["kind"] == "note" and "learning_lesson" in item.get("tags", []))
     assert "learning_lesson" in lesson["tags"]
     assert "retry_attempt" in lesson["tags"]
     assert "Retry attempt:" in lesson["text"]
     assert "checked the local status endpoint instead" in lesson["text"]
+    assert any(item.get("kind") == "note" and "task_state" in (item.get("tags") or []) for item in core.memory.writes)
 
 
 def test_store_turn_memory_records_ostranauts_lesson_note():
@@ -814,10 +938,8 @@ def test_git_status_response_is_grounded_in_verified_output():
         tool_ok=True,
     )
 
-    assert "dirty with modified and untracked files" in out
-    assert "VERIFIED OUTPUT:" in out
-    system_messages = [m["content"] for m in captured["messages"] if m.get("role") == "system"]
-    assert any("concise summary of the verified state" in msg for msg in system_messages)
+    assert out == formatted
+    assert captured == {}
 
 
 def test_memory_status_response_is_grounded_in_verified_output():
@@ -856,10 +978,29 @@ def test_memory_status_response_is_grounded_in_verified_output():
         tool_ok=True,
     )
 
-    assert "recall should be available" in out
-    assert "VERIFIED OUTPUT:" in out
-    system_messages = [m["content"] for m in captured["messages"] if m.get("role") == "system"]
-    assert any("concise summary of the verified state" in msg for msg in system_messages)
+    assert out == formatted
+    assert captured == {}
+
+
+def test_verified_status_does_not_trigger_optional_model_narration():
+    core = MK1Core.__new__(MK1Core)
+
+    class _FailingModel:
+        def chat(self, *_args, **_kwargs):
+            raise AssertionError("status-only output should not call the model")
+
+    core.model = _FailingModel()
+
+    out = MK1Core._render_tool_response_as_mina(
+        core,
+        messages=[],
+        user_input="show me the current status",
+        tool_name="__git_status__",
+        formatted="Branch: main\nStatus:\n(clean)",
+        tool_ok=True,
+    )
+
+    assert out == "Branch: main\nStatus:\n(clean)"
 
 
 def test_ps_run_response_returns_verified_output_directly():
@@ -1233,6 +1374,164 @@ def test_remember_tool_output_persists_hardware_snapshot():
 
     assert any("hardware_snapshot::" in w["text"] for w in core.memory.writes)
     assert any("suggestion_context" in w["tags"] for w in core.memory.writes)
+
+
+def test_explicit_hardware_command_persists_snapshot_for_followup_recall():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+
+    MK1Core._remember_tool_output(
+        core,
+        tool_name="ps_run",
+        user_input="Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM",
+        tool_args={"script": "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM"},
+        result={"ok": True, "result": {"stdout": "AMD Radeon RX 6700 XT"}},
+        formatted="AMD Radeon RX 6700 XT",
+    )
+
+    assert any("hardware_snapshot::" in write["text"] for write in core.memory.writes)
+
+
+def test_hardware_followup_context_surfaces_prior_snapshot_without_running_tools():
+    class HardwareMemory(FakeMemory):
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_tags == ["hardware_snapshot"]:
+                return [{"text": "hardware_snapshot::ram probe => FreePhysicalMemory: 5061880"}]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = HardwareMemory()
+
+    context = MK1Core._build_hardware_followup_context(core, "we need to do something about the RAM situation")
+
+    assert "Hardware snapshot memory:" in context
+    assert "FreePhysicalMemory" in context
+
+
+def test_memory_hygiene_requires_explicit_authorization_for_mutation():
+    class HygieneMemory:
+        def memory_hygiene(self, dry_run=True, max_delete=500, authorized_apply=False):
+            if not dry_run and not authorized_apply:
+                return {"ok": False, "error": "memory_mutation_requires_explicit_authorization"}
+            return {"ok": True, "result": {}}
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = HygieneMemory()
+
+    result = MK1Core._memory_tidy(core, dry_run=False)
+
+    assert result["ok"] is False
+    assert result["error"] == "memory_mutation_requires_explicit_authorization"
+
+
+def test_long_term_archive_context_surfaces_older_project_decisions():
+    class ArchiveMemory(FakeMemory):
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_tags and "conversation_digest" in include_tags:
+                return [{
+                    "text": "Conversation digest 2026-06-01. Ostranauts bridge decision: keep telemetry read-only.",
+                    "tags": ["conversation_digest", "user_memory"],
+                }]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = ArchiveMemory()
+
+    context = MK1Core._build_long_term_archive_context(
+        core,
+        "what did we decide about the Ostranauts bridge months ago",
+    )
+
+    assert "Historical memory archive:" in context
+    assert "telemetry read-only" in context
+    assert "not current game state" in context
+    assert "live telemetry or source files" in context
+
+
+def test_long_term_archive_context_marks_missing_history_as_unverified():
+    class EmptyArchiveMemory(FakeMemory):
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_tags:
+                return []
+            return super().search(query, top_k, include_kinds, include_tags, since_ts)
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = EmptyArchiveMemory()
+
+    context = MK1Core._build_long_term_archive_context(
+        core,
+        "what did we decide about the Ostranauts bridge months ago",
+    )
+
+    assert "no grounded matching record was found" in context
+    assert "Do not invent historical details" in context
+
+
+def test_long_term_archive_context_ignores_semantic_noise_without_topic_overlap():
+    class NoisyArchiveMemory(FakeMemory):
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_tags:
+                return [{"text": "Unrelated memory about a weather forecast", "tags": ["user_memory"]}]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = NoisyArchiveMemory()
+
+    context = MK1Core._build_long_term_archive_context(
+        core,
+        "what did we decide about the Ostranauts bridge months ago",
+    )
+
+    assert "no grounded matching record was found" in context
+
+
+def test_long_term_archive_context_is_read_only():
+    class ReadOnlyArchiveMemory(FakeMemory):
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_tags and "conversation_digest" in include_tags:
+                return [{
+                    "text": "Conversation digest 2026-06-01. Ostranauts bridge used live telemetry.",
+                    "tags": ["conversation_digest", "user_memory"],
+                }]
+            return []
+
+        def add_memory(self, *args, **kwargs):
+            raise AssertionError("archive verification must not write memory")
+
+        def delete_memory_ids(self, *args, **kwargs):
+            raise AssertionError("archive verification must not delete memory")
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = ReadOnlyArchiveMemory()
+
+    context = MK1Core._build_long_term_archive_context(
+        core,
+        "what did we decide about the Ostranauts bridge months ago",
+    )
+
+    assert "live telemetry" in context
+
+
+def test_ostranauts_context_includes_historical_archive_lane():
+    class OstranautsArchiveMemory(FakeMemory):
+        def search(self, query, top_k=5, include_kinds=None, include_tags=None, since_ts=None):
+            if include_tags and "conversation_digest" in include_tags:
+                return [{"text": "Conversation digest: Ostranauts bridge telemetry stayed read-only."}]
+            if include_tags == ["ostranauts"]:
+                return []
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = OstranautsArchiveMemory()
+
+    context = MK1Core._build_ostranauts_memory_context(
+        core,
+        "what did we decide about the Ostranauts bridge months ago",
+    )
+
+    assert "Historical memory archive:" in context
+    assert "telemetry stayed read-only" in context
+    assert "not current game state" in context
 
 
 def test_remember_tool_output_stores_hardware_snapshot_as_fact():

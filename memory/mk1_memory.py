@@ -201,7 +201,9 @@ class MK1Memory:
             if since_ts is not None:
                 sql += " AND timestamp >= ?"
                 params.append(since_ts)
-            sql += " ORDER BY timestamp DESC LIMIT 500"
+            # Search the retained archive, not only the newest page. Older durable
+            # facts and conversation digests must remain discoverable by keyword.
+            sql += " ORDER BY timestamp DESC LIMIT 5000"
             cur.execute(sql, params)
             rows = cur.fetchall()
             conn.close()
@@ -217,7 +219,14 @@ class MK1Memory:
             text_lower = (text or "").lower()
             score = sum(1 for t in tokens if t in text_lower)
             if score > 0:
-                scored.append((score, {"id": rid, "text": text, "kind": kind, "tags": row_tags, "timestamp": ts}))
+                scored.append((score, {
+                    "id": rid,
+                    "text": text,
+                    "kind": kind,
+                    "tags": row_tags,
+                    "timestamp": ts,
+                    "_keyword_score": score,
+                }))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in scored[:top_k]]
@@ -612,6 +621,10 @@ class MK1Memory:
         mem_id = cur.lastrowid
         conn.close()
 
+        if mem_id is None:
+            return None
+        mem_id = int(mem_id)
+
         self.small_index.add_with_ids(np.array([vs]), np.array([mem_id], dtype=np.int64))
         self.base_index.add_with_ids(np.array([vb]), np.array([mem_id], dtype=np.int64))
 
@@ -635,7 +648,7 @@ class MK1Memory:
             timestamp=time.time(),
         )
 
-        return int(mem_id) if mem_id is not None else None
+        return int(mem_id)
 
     def _flush_pending_memories(self, max_items: int = 20) -> Dict[str, int]:
         flushed = 0
@@ -1142,13 +1155,29 @@ class MK1Memory:
         "memory_hygiene",
         rejected=lambda self, *args, **kwargs: {"ok": False, "error": "memory_quiescing"},
     )
-    def memory_hygiene(self, dry_run: bool = False, max_delete: int = 500) -> Dict[str, Any]:
+    def memory_hygiene(
+        self,
+        dry_run: bool = True,
+        max_delete: int = 500,
+        authorized_apply: bool = False,
+    ) -> Dict[str, Any]:
         """
         Conservative memory cleanup pass:
         - keeps user-authored long-term facts/preferences/procedures
         - removes noisy interaction artifacts
         - deduplicates repeated interaction lines (keeps latest 2 copies)
         """
+        if not dry_run and not authorized_apply:
+            return {
+                "ok": False,
+                "dry_run": False,
+                "total_rows": 0,
+                "delete_count": 0,
+                "delete_ids": [],
+                "samples": [],
+                "error": "memory_mutation_requires_explicit_authorization",
+            }
+
         try:
             conn = sqlite3.connect(self.db_path)
             cur = conn.cursor()
@@ -2290,9 +2319,28 @@ class MK1Memory:
 
         conn.close()
 
-        merged = sorted(results.values(), key=lambda r: r["score"])
+        # Semantic ranking can bury an exact fact among noisy, newer memories.
+        # Merge lexical hits whenever the database is available so explicit facts
+        # remain recoverable even when embeddings are weak or only partly useful.
+        lexical = self._sqlite_keyword_search(query, candidate_k, include_kinds, include_tags, since_ts)
+        for item in lexical:
+            mem_id = int(item["id"])
+            if mem_id not in results:
+                keyword_score = float(item.pop("_keyword_score", 0) or 0)
+                item["score"] = -keyword_score
+                results[mem_id] = item
+
+        merged = sorted(
+            results.values(),
+            key=lambda r: (
+                0 if self._normalize_text(query) == self._normalize_text(str(r.get("text") or "")) else 1,
+                r.get("score", float("inf")),
+                -float(r.get("timestamp") or 0.0),
+            ),
+        )
         for r in merged:
             r.pop("score", None)
+            r.pop("_keyword_score", None)
 
         return merged[:top_k]
 

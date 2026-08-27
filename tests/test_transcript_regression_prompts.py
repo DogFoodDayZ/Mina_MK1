@@ -202,6 +202,372 @@ def test_command_like_query_detects_explicit_run_script_phrase():
     assert MK1Core._is_command_like_query(core, "run powershell script deploy_mina_android_auto.ps1") is True
 
 
+def test_shared_process_tool_executor_formats_and_captures_failure():
+    core = _core_for_intent_tests()
+    captured = {}
+    core._capture_tool_failure_for_learning = lambda **kwargs: captured.update(kwargs)
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda _name, _args: {"ok": False, "result": None, "error": "permission_denied"},
+    )
+
+    tool_name, result, message = MK1Core._execute_process_tool_call(
+        core,
+        tool_name="ps_run",
+        args_str="script:'Get-Date'",
+        user_intent="run the command",
+    )
+
+    assert tool_name == "ps_run"
+    assert result["ok"] is False
+    assert message == "[TOOL FAILED] ps_run: permission_denied"
+    assert captured["tool_name"] == "ps_run"
+
+
+def test_shared_process_tool_executor_corrects_web_fetch_for_local_hardware_question():
+    core = _core_for_intent_tests()
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    calls = []
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda name, args: calls.append((name, args)) or {"ok": True, "result": {"stdout": "CPU: Ryzen"}},
+    )
+
+    tool_name, result, message = MK1Core._execute_process_tool_call(
+        core,
+        tool_name="web_fetch",
+        args_str="url:'https://example.invalid/invented-by-model'",
+        user_intent="What CPU and GPU are actually installed in this computer?",
+    )
+
+    assert tool_name == "ps_run"
+    assert result["ok"] is True
+    assert calls[0][0] == "ps_run"
+    assert "Win32_Processor" in calls[0][1]["script"]
+    assert "CPU: Ryzen" in message
+
+
+def test_tool_call_parser_accepts_json_tool_block():
+    core = _core_for_intent_tests()
+    core._tool_registry = lambda: {"ps_run": object()}
+
+    calls = MK1Core._extract_tool_calls_from_text(
+        core,
+        '```json\n{"tool":"ps_run","args":{"script":"Get-Date"}}\n```',
+    )
+
+    assert calls == [("ps_run", '{"script": "Get-Date"}')]
+
+
+def test_tool_call_parser_accepts_single_quoted_json_shaped_block():
+    core = _core_for_intent_tests()
+    core._tool_registry = lambda: {"ps_run": object()}
+
+    calls = MK1Core._extract_tool_calls_from_text(
+        core,
+        "```json\n{'tool': 'ps_run', 'args': {'script': 'Get-Date'}}\n```",
+    )
+
+    assert calls == [("ps_run", '{"script": "Get-Date"}')]
+
+
+def test_shared_process_tool_executor_maps_unknown_system_info_alias():
+    core = _core_for_intent_tests()
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    calls = []
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda name, args: calls.append((name, args)) or {"ok": True, "result": {"stdout": "CPU: Ryzen"}},
+    )
+
+    tool_name, result, _message = MK1Core._execute_process_tool_call(
+        core,
+        tool_name="system_info",
+        args_str="",
+        user_intent="What CPU and GPU are actually installed in this computer?",
+    )
+
+    assert tool_name == "ps_run"
+    assert result["ok"] is True
+    assert calls[0][0] == "ps_run"
+    assert "Win32_Processor" in calls[0][1]["script"]
+
+
+def test_shared_process_tool_executor_blocks_external_search_for_local_hardware():
+    core = _core_for_intent_tests()
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    calls = []
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda name, args: calls.append((name, args)) or {"ok": True, "result": {"stdout": "CPU: Ryzen"}},
+    )
+
+    tool_name, _result, _message = MK1Core._execute_process_tool_call(
+        core,
+        tool_name="web_search",
+        args_str="query:'invented query'",
+        user_intent="What CPU and GPU are actually installed in this computer?",
+    )
+
+    assert tool_name == "ps_run"
+    assert calls[0][0] == "ps_run"
+
+
+def test_shared_process_tool_executor_recovers_empty_powershell_hardware_call():
+    core = _core_for_intent_tests()
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    calls = []
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda name, args: calls.append((name, args)) or {"ok": True, "result": {"stdout": "CPU: Ryzen"}},
+    )
+
+    tool_name, result, _message = MK1Core._execute_process_tool_call(
+        core,
+        tool_name="powershell",
+        args_str="",
+        user_intent="What CPU and GPU are actually installed in this computer?",
+    )
+
+    assert tool_name == "ps_run"
+    assert result["ok"] is True
+    assert calls[0][0] == "ps_run"
+
+
+def test_shared_process_tool_executor_recovers_empty_powershell_ram_followup():
+    core = _core_for_intent_tests()
+    core.memory = SimpleNamespace(
+        search=lambda *_args, **_kwargs: [
+            {"text": "hardware_snapshot::ram probe => FreePhysicalMemory: 4848168"},
+        ],
+    )
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    calls = []
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda name, args: calls.append((name, args)) or {"ok": True, "result": {"stdout": "RAM snapshot"}},
+    )
+
+    tool_name, result, _message = MK1Core._execute_process_tool_call(
+        core,
+        tool_name="powershell",
+        args_str="",
+        user_intent="Looks like we need to do something about the RAM situation.",
+    )
+
+    assert tool_name == "memory_read"
+    assert result["ok"] is True
+    assert calls == []
+
+
+def test_shared_process_tool_executor_recovers_empty_ps_run_ram_followup():
+    core = _core_for_intent_tests()
+    core.memory = SimpleNamespace(
+        search=lambda *_args, **_kwargs: [
+            {"text": "hardware_snapshot::ram probe => FreePhysicalMemory: 4848168"},
+        ],
+    )
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    calls = []
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda name, args: calls.append((name, args)) or {"ok": True, "result": {"stdout": "RAM snapshot"}},
+    )
+
+    tool_name, result, message = MK1Core._execute_process_tool_call(
+        core,
+        tool_name="ps_run",
+        args_str="",
+        user_intent="Looks like we need to do something about the RAM situation.",
+    )
+
+    assert tool_name == "memory_read"
+    assert result["ok"] is True
+    assert "FreePhysicalMemory" in message
+    assert calls == []
+
+
+def test_hardware_rescue_executes_fenced_powershell_suggestion():
+    core = _core_for_intent_tests()
+    captured = {}
+
+    def fake_reflex(messages, reply, user_input, request_context=None):
+        captured["user_input"] = user_input
+        return {"choices": [{"message": {"content": "verified hardware"}}]}
+
+    core._reflex_tools_and_memory = fake_reflex
+
+    result = MK1Core._maybe_rescue_chat_suggested_action(
+        core,
+        messages=[],
+        user_input="What CPU and GPU are actually installed in this computer?",
+        assistant_text="```powershell\nGet-CimInstance Win32_Processor | Select-Object Name\n```",
+    )
+
+    assert result is not None
+    assert "Win32_Processor" in captured["user_input"]
+
+
+def test_hardware_ps_probe_is_upgraded_to_combined_cpu_gpu_query():
+    core = _core_for_intent_tests()
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    calls = []
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda name, args: calls.append((name, args)) or {"ok": True, "result": {"stdout": "CPU and GPU"}},
+    )
+
+    _tool_name, _result, _message = MK1Core._execute_process_tool_call(
+        core,
+        tool_name="ps_run",
+        args_str="script:'Get-CimInstance Win32_VideoController | Select-Object Name'",
+        user_intent="What CPU and GPU are actually installed in this computer?",
+    )
+
+    assert calls[0][0] == "ps_run"
+    assert "Win32_Processor" in calls[0][1]["script"]
+    assert "Win32_VideoController" in calls[0][1]["script"]
+
+
+def test_shared_model_tool_loop_executes_tool_and_stops_on_final_reply():
+    core = _core_for_intent_tests()
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    calls = []
+    replies = iter([
+        {"choices": [{"message": {"content": "call"}}]},
+        {"choices": [{"message": {"content": "done"}}]},
+    ])
+    core._extract_tool_calls_from_text = lambda text: [("ps_run", "script:'Get-Date'")] if text == "call" else []
+    core.model = SimpleNamespace(chat=lambda **_kwargs: next(replies))
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda name, args: calls.append((name, args)) or {"ok": True, "result": {"stdout": "ready"}},
+    )
+    messages = []
+
+    reply, events = MK1Core._run_process_tool_loop(core, messages, next(replies), "run the command")
+
+    assert reply["choices"][0]["message"]["content"] == "done"
+    assert len(events) == 1
+    assert calls[0][0] == "ps_run"
+    assert messages[-1]["content"] == "{'ok': True, 'result': {'stdout': 'ready'}}"
+
+
+def test_shared_model_tool_loop_stops_repeated_identical_tool_reply():
+    core = _core_for_intent_tests()
+    core._capture_tool_failure_for_learning = lambda **_kwargs: None
+    run_count = []
+    core._extract_tool_calls_from_text = lambda _text: [("ps_run", "script:'Get-Date'")]
+    core.model = SimpleNamespace(chat=lambda **_kwargs: {"choices": [{"message": {"content": "same"}}]})
+    core.tools = SimpleNamespace(
+        tools={},
+        run=lambda _name, _args: run_count.append(True) or {"ok": True, "result": {}},
+    )
+
+    _reply, events = MK1Core._run_process_tool_loop(
+        core,
+        [],
+        {"choices": [{"message": {"content": "same"}}]},
+        "run the command",
+    )
+
+    assert len(events) == 1
+    assert len(run_count) == 1
+
+
+def test_obsolete_spotify_dj_canned_response_no_longer_short_circuits_chat():
+    core = _core_for_intent_tests()
+
+    result = core._handle_direct_response_reflex(
+        "__spotify_dj_capability__",
+        {},
+        "can you keep playing my liked songs",
+    )
+
+    assert result is None
+
+
+def test_removed_unused_interface_response_has_no_live_callers():
+    source = open("agent/core.py", encoding="utf-8").read()
+
+    assert "def _maybe_reply_interface_name" not in source
+
+
+def test_conversational_system_matcher_blocks_are_removed():
+    source = open("agent/core.py", encoding="utf-8").read()
+
+    assert "system_query_terms = [" not in source
+    assert "hardware_count_query = (" not in source
+    assert "cpu_probe_query" in source
+
+
+def test_file_index_status_and_refresh_use_single_routing_block():
+    core = _core_for_intent_tests()
+
+    status_tool, status_args = MK1Core.detect_tool_intent(core, "show the file index")
+    refresh_tool, refresh_args = MK1Core.detect_tool_intent(core, "refresh the file index")
+
+    assert status_tool == "__file_index_status__"
+    assert status_args == {}
+    assert refresh_tool == "__file_index_refresh__"
+    assert refresh_args == {}
+
+
+def test_core_uses_its_authoritative_file_intent_parser():
+    source = open("agent/core.py", encoding="utf-8").read()
+
+    assert "from agent.file_intents import detect_file_directory_intent" not in source
+    assert "def _detect_file_directory_intent" in source
+    assert "def _message_choice" not in source
+
+
+def test_ps_inference_does_not_duplicate_hardware_count_rules():
+    source = open("agent/core.py", encoding="utf-8").read()
+    tool_source = open("tools/ps_run.py", encoding="utf-8").read()
+
+    assert source.count('return "(Get-CimInstance Win32_VideoController).Count"') == 0
+    assert source.count('return "(Get-CimInstance Win32_DiskDrive).Count"') == 0
+    assert "Win32_VideoController" in tool_source
+
+
+def test_core_ps_inference_delegates_to_tool_normalizer():
+    source = open("agent/core.py", encoding="utf-8").read()
+
+    infer_start = source.index("        def _infer_ps_command(text_value: str) -> str:")
+    direct_markup = source.index("        # ====================================================\n        # DIRECT TOOL MARKUP", infer_start)
+    infer_body = source[infer_start:direct_markup]
+
+    assert "from tools.ps_run import _normalize_command" in infer_body
+    assert "return normalized" in infer_body
+    assert 'Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsHardwareAbstractionLayer' not in infer_body
+
+
+def test_verified_tool_fallback_does_not_append_canned_flair():
+    source = open("agent/core.py", encoding="utf-8").read()
+
+    assert "def _with_mina_flair" not in source
+    assert "Gremlin check complete." not in source
+
+
+def test_transcript_memory_recall_drops_unrelated_recent_turns_after_topic_shift():
+    core = _core_for_intent_tests()
+    recent_turns = [
+        {"text": "Mina refused to modify source code autonomously", "tags": ["short_term"]},
+        {"text": "We chose the cobalt lantern protocol for memory reliability", "tags": ["short_term"]},
+        {"text": "The weather forecast says rain tomorrow", "tags": ["short_term"]},
+    ]
+
+    selected = MK1Core._relevant_recent_turns(
+        core,
+        "what protocol did we choose for memory reliability",
+        recent_turns,
+    )
+
+    assert [item["text"] for item in selected] == [
+        "We chose the cobalt lantern protocol for memory reliability",
+    ]
+
+
 def test_incident_report_routes_to_startup_status_diagnostic_tool():
     core = _core_for_intent_tests()
 

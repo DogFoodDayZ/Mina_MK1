@@ -60,6 +60,15 @@ If verification fails:
 Report failure plainly.
 Retry once with corrected arguments.
 If still failing, ask one precise question.
+
+5a) Memory Integrity Contract
+
+Database reads are allowed for diagnosis, verification, and retrieval debugging.
+Do not inject, seed, rewrite, tag, promote, delete, clean, or otherwise mutate Mina's memories during investigation unless Travis explicitly authorizes that specific mutation.
+Do not use synthetic memories or repeated live prompts to manufacture evidence of recall.
+Treat hallucinated or test-generated responses as untrusted evidence; do not store them as facts.
+When a test needs historical memory, use an isolated test database or in-memory fixture that cannot alter Mina's live memory.
+Repeatedly asking the same live question is not a valid repair strategy because it can reinforce a wrong answer in short-term memory.
 6) Conversation Behavior Contract
 
 Keep Mina personality and tone.
@@ -1814,3 +1823,281 @@ Investigated live: Amuse v3.1.0 is a WPF app built on OnnxStack + DirectML (AMD 
 - [ ] Add intent routing in `agent/core.py` for "generate an image of ..." / "draw ..." style prompts.
 - [ ] Verification: saved image file must exist at a known path before Mina reports success (per verification contract — no claiming an image was made without a real file on disk).
 - [ ] Regression prompts once implemented: "draw a picture of a raccoon playing guitar", "generate an image of a mountain landscape", "make me an image" (missing subject → should ask one clarification, not invent a prompt).
+
+---
+
+### Issue: Model Hallucinated Success Over Real Tool Failures (Learning Loop Broken)
+
+- Date: 2026-08-26
+- Reporter: Travis (transcript: GPU test script, Unicode error → fake "File written to" response)
+- Priority: Critical
+- Status: In Progress
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - Save and run this GPU test script (pygame + OpenGL cube renderer)
+  - TRAVIS try again (after Unicode error in first attempt)
+
+#### 2) What Mina actually did
+- First attempt: ps_run threw `UnicodeEncodeError: 'charmap' codec can't encode character 0x1f99d`
+- Mina's response: "File written to: E:\workspace\return codecs.charmap" (extracted text from error, hallucinated success)
+- File destroy: Overwrote original tickle_mina.py with corrupted content
+- Conversation impact: Made up file structures, redirected instead of owning the mistake
+
+#### 3) What should have happened
+- When tool fails, response must explicitly state failure
+- Memory records the failure so next similar request isn't repeated
+- Conversation acknowledges what went wrong, proposes alternative
+
+#### 4) Evidence
+- Transcript snippet: "`File written to: E:\workspace\return codecs.charmap`" (path extracted from error text)
+- File destroyed: `tickle_mina.py` overwritten with wrong content
+- Memory corruption: failure was never recorded, so no learning occurred
+- Regression: next "save a script" request would likely fail the same way
+
+#### 5) Failure class
+- Model hallucination + broken learning loop
+
+#### 6) Root cause (after investigation)
+- Tool failures were formatted as bare dict strings: `str({'ok': False, 'error': 'UnicodeEncodeError: ...'})` → model sees garbled text
+- Model extracted key text and invented a successful-sounding response
+- Failure context was added to memory but only in turn summary, not immediately
+- Model response (false success) was stored instead of real failure details
+
+#### 7) Minimal fix (COMPLETED)
+- Added explicit `[TOOL FAILED] tool_name: error` prefix when passing failed tool results to model (lines 9607-9615)
+- Added `_capture_tool_failure_for_learning()` called immediately after tool execution (line 3743-3774)
+- Captured failures tagged with ["tool_failure", tool_name] for semantic recall
+- Restored tickle_mina.py to correct version
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: TRAVIS save and run this GPU test script [provides code]
+- Prompt 2: TRAVIS try again (after failure)
+- Prompt 3: TRAVIS create a script call it screen_filler.py have it fill the screen with random ascii for ten seconds then exit
+  - Expected: Honest "Failed because: X" or successful file write, NOT fake success like "File written to: [garbage text]"
+
+#### 9) Implementation choice
+- Chosen approach: hardcoded + memory system
+- Why this approach fits:
+  - Tool result formatting is a protocol contract (must be unambiguous for model)
+  - Failure capture is deterministic, not user-preference (every failure matters for learning)
+- Risk if wrong approach chosen: model-only fix would allow model to decide whether to report failures (defeats the purpose); memory-only would lose failures across sessions
+
+#### 10) Done criteria
+- [x] Explicit `[TOOL FAILED]` prefix appears in tool results passed to model
+- [x] Failed tool events recorded in memory immediately (not just in turn summary)
+- [x] Model responds honestly when seeing `[TOOL FAILED]` marker (verified via /process API)
+- [x] All 3 regression prompts succeed without hallucinating success over failure
+- [x] No regression on successful tool operations
+- [x] Conversation continues appropriately after failure (proposes workaround/alternative)
+
+#### Implementation summary
+- **agent/core.py line 3743-3774**: Added `_capture_tool_failure_for_learning()` method
+- **agent/core.py line 9595-9615**: Added explicit `[TOOL FAILED]` formatting for failed tool results passed to model
+- **tests/test_tool_failure_honesty_regression.py**: Created regression tests (both PASSED 2026-08-26)
+- **e:\workspace\tickle_mina.py**: Restored to original working version
+
+#### Test results (2026-08-26 15:50 UTC)
+```
+tests/test_tool_failure_honesty_regression.py::TestToolFailureHonesty::test_successful_file_operations_still_work PASSED
+tests/test_tool_failure_honesty_regression.py::TestToolFailureHonesty::test_tool_failure_not_masked PASSED
+```
+
+#### Follow-up notes
+- Tool failures are now being recorded in memory with tags ["tool_failure", tool_name] for learning
+- Model sees clear `[TOOL FAILED]` prefix and cannot mistake error text for success
+- Next similar request will benefit from failure context stored in memory
+- Conversation can now learn from this event and avoid repeating it
+
+---
+
+### Issue: Embed server returned HTTP 500 for long memory records
+
+- Date: 2026-08-26
+- Reporter: Travis / live embed server traceback
+- Priority: High
+- Status: Done
+
+#### Root cause
+- The tokenizer produced more tokens than the 512-row positional embedding table. `HybridEmbedder.embed()` attempted to add arrays shaped `(688, d_model)` or `(2500, d_model)` and `(512, d_model)`, causing a NumPy broadcast error and HTTP 500.
+
+#### Minimal fix
+- Truncate token IDs to the positional embedding table length before constructing token and position arrays.
+
+#### Implementation choice
+- Chosen approach: hardcoded protocol/model-boundary guard.
+- Why this fits: the maximum positional length is a fixed model invariant, not learned conversational behavior.
+- Risk if wrong approach chosen: letting oversized writes fail would place memories in the pending buffer and make recall timing-dependent.
+
+#### Verification
+- Replaced stale listener PID 15908 with project-venv listener PID 30864.
+- Oversized live request: `/embed_small` returned 384 dimensions; `/embed_base` returned 768 dimensions.
+- Added `tests/test_embed_server.py` regression for truncation.
+- Source diagnostics: clean.
+
+---
+
+### Issue: Recall could lose durable facts behind noisy semantic results
+
+- Date: 2026-08-26
+- Reporter: Travis
+- Priority: High
+- Status: In Progress
+
+#### 1) What I asked Mina to do
+- Exact prompt(s):
+  - Natural follow-up questions that depend on facts remembered earlier in the conversation.
+
+#### 2) What Mina actually did
+- Recall was inconsistent: a fact could exist in the database but fail to reach the model when unrelated recent or semantically similar memories occupied the result window.
+
+#### 3) What should have happened
+- Stored facts should remain recoverable when semantic ranking is noisy or the query uses direct terms from the fact.
+
+#### 4) Evidence
+- `build_context()` requested only four long-term semantic results and combined them with six newest short-term turns.
+- `MK1Memory.search()` used lexical search only when both embedding calls failed; useful lexical matches were not merged when semantic search returned weak results.
+- Regression coverage: `tests/test_memory_recall.py` passes 78 tests.
+
+#### 5) Failure class
+- Memory retrieval reliability
+
+#### 6) Root cause
+- Semantic ranking was the effective gate for normal stored memories, while unrelated recent context could consume the small recall budget.
+
+#### 7) Minimal fix
+- Merge SQLite keyword hits into successful semantic searches.
+- Rank keyword-overlap hits ahead of weak semantic candidates, with exact normalized text matches first.
+- Preserve existing semantic search, filters, and durable-fact storage.
+
+#### 8) Regression prompts
+- Prompt 1: Ask Mina to remember a personal fact, then ask about it later using the same distinctive words.
+- Prompt 2: Ask about an older project decision after several unrelated turns.
+- Prompt 3: Ask what Mina remembers while semantic results contain unrelated recent memories.
+
+#### 9) Implementation choice
+- Chosen approach: memory-first retrieval repair with a deterministic lexical fallback.
+- Why this approach fits: the problem is recoverability of changing user facts and conversation history; the database remains the source of truth while lexical ranking provides a stable retrieval backstop.
+- Risk if the wrong approach is chosen: hardcoded topic branches would create more brittle routing and still fail for new facts or wording.
+
+#### 10) Done criteria
+- [x] Lexical hits are merged when semantic search succeeds.
+- [x] Exact normalized matches receive highest priority.
+- [x] `tests/test_memory_recall.py` passes (`78 passed`).
+- [x] Changed Python files compile successfully.
+- [ ] Live API proof across a write, unrelated turns, and later recall.
+- [ ] Broader long-thread recall tuning and irrelevant-memory suppression.
+
+Live checkpoint (2026-08-26): direct user-memory write and natural-language recall both succeeded after restarting the API. A multi-turn `/process` proof was inconclusive because the model request sequence lost its connection; the API recovered healthy with zero pending writes. The deterministic transcript regression now protects the topic-shift behavior independently.
+
+### Issue: Recalled context made normal process prompts stall
+
+- Date: 2026-08-26
+- Reporter: Travis / staged live process diagnostic
+- Priority: Critical
+- Status: In Progress
+
+#### Root cause
+- `build_context()` limited memory by line count but not by character count. Noisy stored memories produced a 50,123-character recall block and a 57,031-character model payload. Direct tiny LM Studio requests worked, while full `/process` requests timed out at 60 seconds.
+
+#### Minimal fix
+- Compact each recalled memory entry and cap the assembled recall block at 12,000 characters. Stored memories remain in SQLite/FAISS; only the per-request context is bounded.
+
+#### Implementation choice
+- Chosen approach: memory-first bounded retrieval, not hardcoded topic routing.
+- Why this fits: context size is a runtime safety invariant, while which facts are retained remains controlled by normal memory ranking and relevance.
+- Risk if the wrong approach is chosen: leaving the prompt unbounded can stall model generation and make Mina appear to lose memory; hardcoded topic rules would be brittle and bypass general recall.
+
+#### Verification
+- Staged recall block reduced from 50,123 to 5,697 characters; assembled system messages measured 12,605 characters.
+- `tests/test_memory_recall.py`: 80 passed.
+- One live bounded `/process` probe returned successfully in 24.19 seconds; API remained healthy with memory healthy and zero pending writes.
+- Follow-up live probe output was inconclusive and remains open for a cleaner single-request verification.
+
+Follow-up compaction (2026-08-26): removed stale `code_artifact::`, capability snapshot, and capability delta records from default per-turn context, excluded large write payloads from working memory, shortened retained working records, and capped the working-memory lane at eight records. Staged payload fell to 9,874 characters, with 4,931 characters of recalled context and 754 characters of working memory. Memory tests: 82 passed. Live API remained healthy with zero pending writes; the bounded `/process` result was not returned by the terminal wrapper and remains unconfirmed.
+
+Live multi-turn checkpoint (2026-08-26): stored a distinctive `user_memory` fact, sent two unrelated `/process` turns, then asked a natural-language recall question. All three process requests completed successfully in 11.45s, 15.15s, and 19.17s. Mina recalled the cobalt lantern protocol correctly; API and memory remained healthy with zero pending writes. This closes the previously inconclusive live proof for the bounded-context slice.
+
+Process timing checkpoint (2026-08-26): added read-only `last_process_timings` telemetry to core status. A live request completed in 13.69s: memory context 0.39s, message assembly 0.01s, first model call 13.27s, total 13.68s. Memory remained healthy with zero pending writes. This confirms the remaining latency is model evaluation/generation, not memory retrieval or prompt assembly.
+
+Shared process preparation checkpoint (2026-08-26): `process_stream()` now reuses the same memory-context selection and base system-message assembly helpers as `process()`. Live `/process-stream` proof emitted `chunk` then `done` in 19.93s. Focused model, memory, transcript, and core route-guard checks passed (`134 passed`). The top-level `test_streaming.py` remains an interactive probe that pytest cannot collect without its required `prompt` argument; it was not used as unit coverage.
+
+Shared tool execution checkpoint (2026-08-26): normal `process()` and streaming preflight now use `_execute_process_tool_call()`. This centralizes shorthand Spotify normalization, structured invalid-result handling, `[TOOL FAILED]` formatting, and immediate failure learning capture. Added a transcript regression for the shared failure contract. Focused affected tests passed (`134 passed`); required core route guard passed; live `/process-stream` emitted `chunk` then `done` in 15.79s after restart.
+
+Shared model/tool loop checkpoint (2026-08-26): normal `process()` and streaming preflight now use `_run_process_tool_loop()`, centralizing the three-loop limit, duplicate model-output guard, assistant/tool message append, follow-up model call, and model-error break behavior. Focused affected tests passed (`134 passed`); live normal `/process` completed in 22.69s and live `/process-stream` emitted `chunk` then `done` in 17.25s after restart.
+
+Shared loop regression checkpoint (2026-08-26): added deterministic transcript tests for successful shared tool execution, structured failure propagation, immediate failure capture, and repeated identical tool-call stopping. Affected tests passed (`136 passed`). After restart, live normal `/process` completed in 20.14s; memory stayed healthy with zero pending writes. Status timing showed 19.98s in the first model call and 0.37s before model generation.
+
+Hardcoded response pruning checkpoint (2026-08-26): removed the orphan `__spotify_dj_capability__` canned product response from `agent/reflex_helpers.py`; repository search found no callers. Added a transcript regression proving that obsolete token no longer short-circuits normal model handling. Stable identity, authorization, safety, and verified-tool responses remain intentionally hardcoded.
+
+Hardcoded response pruning checkpoint 2 (2026-08-26): removed unused `_maybe_reply_interface_name()` from `agent/core.py`; repository search found no callers. Its GUI answers were redundant with the interface context already supplied to the model. Added a regression guard; stable interface metadata helpers remain because they describe the active client contract rather than answer user content.
+
+Routing prune checkpoint (2026-08-26): removed unused broad `system_query_terms` and `hardware_count_query` matcher blocks from `detect_tool_intent()`. These contradicted the model-owned conversational hardware contract and were dead in the active path. Preserved the narrow `cpu_probe_query` route required by the startup guard and preserved explicit pasted PowerShell handling. Added a transcript regression guard.
+
+Routing deduplication checkpoint (2026-08-26): removed a second unreachable `file index` status/refresh matcher from `detect_tool_intent()`. The earlier block already owns both variants. Added transcript coverage for `show the file index` and `refresh the file index`; no action, memory, or safety behavior changed.
+
+Dead routing-remnant checkpoint (2026-08-26): removed the unused legacy `detect_file_directory_intent` import and unused `_message_choice()` wrapper. Live routing already uses `MK1Core._detect_file_directory_intent()` and `reflex_helpers.message_choice()` through its owning wrappers. Added a regression guard to prevent the old parser import and wrapper from returning.
+
+Inference deduplication checkpoint (2026-08-26): removed duplicate GPU-count and disk-count PowerShell inference rules from `_infer_ps_command()`. The first implementations remain authoritative; explicit pasted commands and model-owned conversational hardware prompts are unchanged. Added a regression asserting each generated count command has one definition.
+
+Inference ownership checkpoint (2026-08-26): `_infer_ps_command()` now delegates to `tools.ps_run._normalize_command()` before any legacy fallback logic. Hardware/time/date/memory command translation therefore has one active tool-owned normalizer, reducing core-level hardcoded behavior while preserving the narrow CPU-probe route and explicit command handling. Added a source-level regression for delegation.
+
+Inference fallback removal checkpoint (2026-08-26): removed the now-unreachable legacy hardware/time/date/memory translation body from `_infer_ps_command()`. If the tool normalizer fails, core now returns the original query rather than maintaining a second translation table. Existing explicit command parsing and the startup CPU-probe invariant remain covered.
+
+Verified-response pruning checkpoint (2026-08-27): removed the single-use `_with_mina_flair()` fallback and its canned `Gremlin check complete.` suffix. Verified tool output now remains the direct fallback when optional model narration fails; no factual or safety behavior changes.
+
+Baseline fixture checkpoint (2026-08-26): full `tests/` baseline exposed one unrelated stale `_FakeCore` fixture in `test_api_memory_flow.py`; it lacked the `model.default_model` field now read by API request fingerprinting. Added the minimal fixture field so the baseline can report genuine production failures separately.
+
+Hardware capability recovery checkpoint (2026-08-26): live test showed a natural question about the actually installed CPU/GPU was model-routed to `web_fetch` and failed with HTTP 404. Added a narrow shared-boundary correction: a no-URL web-fetch call for an explicit local hardware/system question is normalized to the existing local `ps_run` command path. Ordinary conversation and URL fetches remain model-owned; this is a deterministic wrong-tool guard, not broad hardware keyword routing.
+
+Hardware parser checkpoint (2026-08-26): live retry showed Qwen emitted the instructed JSON tool format as plain text, which the legacy parser did not recognize. Extended `_extract_tool_calls_from_text()` to parse fenced JSON `{tool,args}` blocks, allowing the existing shared executor to run the suggested local command. Added transcript regression coverage.
+
+Hardware tool-alias checkpoint (2026-08-26): live JSON parsing reached an unsupported `system_info` tool name. Added a narrow alias guard mapping `system_info`, `hardware_info`, and `computer_info` to the existing `ps_run` normalizer only for explicit local hardware questions. This restores the available capability without adding a new fake tool or broad keyword routing.
+
+Hardware external-search checkpoint (2026-08-26): live retry executed a valid CPU probe, then the model emitted an empty `web_search` and invented a GPU conclusion. Extended the local-hardware guard to `web_search` as well as `web_fetch`, ensuring explicit current-machine questions stay on verified local data. Added a transcript regression for the wrong-tool correction.
+
+Hardware malformed-JSON checkpoint (2026-08-26): live retry emitted a JSON-shaped tool block with single quotes. Strict JSON parsing skipped it, leading to an empty `ps_run` attempt. Added an `ast.literal_eval` fallback for this limited parser variant, with regression coverage; parsed arguments still flow through the shared executor and existing verification path.
+
+Hardware empty-tool checkpoint (2026-08-26): live retry reached real CPU/GPU data but first emitted an empty `powershell` call, causing avoidable failure narration. Added the local-hardware guard for empty `powershell` arguments, mapping it to the existing normalized `ps_run` probe. Added regression coverage.
+
+Hardware fenced-command checkpoint (2026-08-26): live retry emitted fenced PowerShell suggestions instead of a parseable tool call, so rescue logic returned the unverified text. Added a narrow rescue for explicit local hardware questions only: fenced PowerShell suggestions are replayed through the normal `ps_run` intent path and verified-result formatting.
+
+Hardware completeness checkpoint (2026-08-26): final live retry returned verified GPU data but omitted the CPU because Qwen suggested a GPU-only `ps_run` command. Added a narrow completeness guard: explicit CPU+GPU questions upgrade incomplete local probes to the combined CPU/GPU normalizer before execution. Added regression coverage.
+
+Spotify baseline checkpoint (2026-08-26): restored narrow explicit song-title, playlist-add, and music-session routing. Full suite reached 271 passed with one stale ambiguity test still expecting the retired broad time-to-PowerShell behavior; updated that test to assert model-owned time handling and stale-alias confirmation. Spotify behavior remains covered separately from general time queries.
+
+Capability matrix checkpoint (2026-08-27): added `tests/test_capability_matrix.py` as the regression boundary for recovered abilities. It covers model-owned conversational hardware questions, verified local CPU probes and explicit PowerShell, K2200 web research, explicit Spotify playback, neutral bare-play clarification, game-play separation, and relevant memory surviving unrelated recent turns. This matrix is the required gate for future core pruning.
+
+Prompt consolidation checkpoint (2026-08-27): shortened truth/tool guidance and made detailed tool-decision rules action-sensitive in shared message assembly for both normal and streaming paths. Live ordinary chat completed in 8.9s; explicit PowerShell hardware output completed in 0.94s. API and memory stayed healthy with zero pending writes. Full suite remained green at 281 passed.
+
+Explicit-command memory checkpoint (2026-08-27): hardware snapshots are now persisted for explicit PowerShell probes as well as natural-language hardware questions. Probe signatures such as `Win32_Processor`, `Win32_VideoController`, `AdapterRAM`, and memory CIM fields identify hardware output without requiring a keyword in the user sentence, allowing later follow-ups such as “we need to do something about the RAM situation” to retrieve the verified result.
+
+RAM follow-up checkpoint (2026-08-27): vague hardware follow-ups now use the tagged `hardware_snapshot` memory lane. Empty `powershell`/`ps_run` attempts during a RAM concern are replaced with verified snapshot context instead of executing a blank command. Live proof connected the prior total/free-memory result to “Looks like we need to do something about the RAM situation.” API and memory stayed healthy with zero pending writes. Remaining gap: model-side unit conversion of raw memory values needs a focused interpretation test.
+
+Archive integrity checkpoint (2026-08-27): read-only live inspection found an existing Ostranauts memory record describing use of live telemetry for current game-state questions, alongside unrelated artifact/alias noise. Added a regression proving historical archive verification can retrieve matching evidence without calling memory mutation or deletion APIs.
+
+Archive provenance checkpoint (2026-08-27): historical archive context now explicitly identifies recalled records as remembered evidence rather than current game state and directs present-state claims to live telemetry or source files. This is labeling only; it does not write, seed, or alter Mina's memories.
+
+Live bridge verification checkpoint (2026-08-27): read-only `GET /games/ostranauts/status` confirms the game, BepInEx, and Mina plugin are installed, but telemetry is stale by approximately 21 days and reports `bridge: stopped`. Current scene/player/ship fields are therefore historical residue, not valid present-state evidence. No live memory was mutated; the next current-state proof must happen after launching the game and producing fresh telemetry.
+
+Long-term memory verification checkpoint (2026-08-27): read-only SQLite inspection found 610 durable records spanning 2026-07-09 through 2026-08-27, including a durable Ostranauts telemetry/bridge record from 2026-08-05 and later read-only integration verification. Older speculative assistant replies remain short-term interaction records and are excluded from the historical archive lane. Archive and Ostranauts tests passed (`98 passed`). No live memory was injected, rewritten, tagged, promoted, deleted, or cleaned.
+
+Memory management guard checkpoint (2026-08-27): changed `memory_hygiene()` and the core tidy wrapper to report-only by default. Any destructive hygiene apply now requires `authorized_apply=True`; the new `GET /memory/hygiene` route is read-only. No cleanup was run and no live memory was changed.
+
+Memory audit live proof (2026-08-27): `GET /memory/hygiene?max_delete=20` completed in report-only mode. Live memory row count remained exactly 4,960 before and after. The report identified 20 candidates, including repeated test prompts and a prior hallucinated bridge question; none were deleted. Added `POST /memory/hygiene/apply`, which refuses unless `authorized_apply=true`; this endpoint was not called.
+
+Long-term archive checkpoint (2026-08-27): added a bounded historical-memory lane for queries that combine older-history language with a meaningful topic such as projects, Ostranauts, memory, hardware, scripts, tools, avatar, or API. It searches durable facts, lessons, tagged snapshots, and conversation digests, then adds at most five compact lines to the existing context budget. Stored memory and retention behavior are unchanged.
+
+Archive retrieval correction (2026-08-27): SQLite lexical fallback now scans up to 5,000 retained rows instead of only the newest 500, so older durable memories can be found. Historical queries with no matching grounded record now receive an explicit no-evidence marker instructing Mina not to invent details.
+
+Verified-output narration checkpoint (2026-08-27): status-only tool results now bypass the optional second model narration call. Model interpretation remains available for prompts asking to analyze, explain, review, improve, suggest, or recommend. This keeps verified output authoritative, reduces latency, and removes unnecessary scripted fluff from ordinary status responses.
+
+### Issue: Disabled reasoning setting was sent as a backend-specific field
+
+- Date: 2026-08-26
+- Status: Done
+- Root cause: Mina configured reasoning as `none`, while LM Studio's Qwen loader reported that its disabled setting could not be converted to custom reasoning fields and referred to `off`.
+- Minimal fix: `LMStudioClient` now omits `reasoning_effort` for `none`, `off`, or an empty value, while forwarding enabled values such as `low`, `medium`, and `high`.
+- Implementation choice: hardcoded protocol normalization because disabled/enabled reasoning values are transport semantics, not learned memory behavior.
+- Verification: model payload tests passed (`6 passed`); live direct completion returned `OK` in `0.08s`; API and memory remained healthy with zero pending writes.
+- Note: the previous completion stall was reproduced even with minimal payloads and was cleared by a supported model reload. The LM Studio warning was a configuration smell, not proven to be the stall cause.

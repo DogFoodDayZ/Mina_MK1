@@ -65,6 +65,46 @@ def test_chat_max_tokens_override_replaces_configured_default(monkeypatch):
     assert captured["payload"]["max_tokens"] == 1200
 
 
+def test_chat_omits_disabled_reasoning_effort_values(monkeypatch):
+    client = LMStudioClient({
+        "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
+        "default_model": "test-model",
+        "reasoning_effort": "none",
+    })
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["payload"] = json
+        return FakeResponse(_completion_payload())
+
+    monkeypatch.setattr(core_module.requests, "post", fake_post)
+
+    client.chat([{"role": "user", "content": "hi"}])
+
+    assert "reasoning_effort" not in captured["payload"]
+
+
+def test_chat_forwards_enabled_reasoning_effort(monkeypatch):
+    client = LMStudioClient({
+        "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
+        "default_model": "test-model",
+        "reasoning_effort": "low",
+    })
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["payload"] = json
+        return FakeResponse(_completion_payload())
+
+    monkeypatch.setattr(core_module.requests, "post", fake_post)
+
+    client.chat([{"role": "user", "content": "hi"}])
+
+    assert captured["payload"]["reasoning_effort"] == "low"
+
+
 def test_extract_text_does_not_promote_reasoning_to_chat_reply():
     core = MK1Core.__new__(MK1Core)
 

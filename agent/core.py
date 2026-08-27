@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
-from agent.file_intents import detect_file_directory_intent
 from agent.curiosity import AutonomousCuriosity, TOPIC_STOP_WORDS
 from agent.pending_actions import (
     PendingActionStore,
@@ -555,7 +554,7 @@ class LMStudioClient:
         # Vision calls are slower; cap response length to keep UI snappy.
         if has_image and self.vision_max_tokens > 0:
             payload["max_tokens"] = self.vision_max_tokens
-        if has_image and self.vision_reasoning_effort:
+        if has_image and self.vision_reasoning_effort.lower() not in {"none", "off"}:
             payload["reasoning_effort"] = self.vision_reasoning_effort
 
         # Apply non-vision token cap and reasoning effort when configured
@@ -563,7 +562,7 @@ class LMStudioClient:
             effective_max_tokens = int(max_tokens_override) if max_tokens_override is not None else self.max_tokens
             if effective_max_tokens > 0:
                 payload["max_tokens"] = effective_max_tokens
-            if self.reasoning_effort:
+            if self.reasoning_effort.lower() not in {"", "none", "off"}:
                 payload["reasoning_effort"] = self.reasoning_effort
 
         print("\n========================================")
@@ -737,7 +736,7 @@ class LMStudioClient:
         # Apply token cap and reasoning effort (same as non-streaming path)
         if self.max_tokens > 0:
             payload["max_tokens"] = self.max_tokens
-        if self.reasoning_effort:
+        if self.reasoning_effort.lower() not in {"", "none", "off"}:
             payload["reasoning_effort"] = self.reasoning_effort
 
         if tools:
@@ -1565,29 +1564,6 @@ class MK1Core:
             "Visible surface: unknown GUI until the client provides an interface name. Do not assume plain text-only chat if the client shows controls or panels."
         )
 
-    def _maybe_reply_interface_name(self, user_input: str, request_context: Optional[Dict[str, Any]]) -> Optional[str]:
-        t = " ".join(str(user_input or "").lower().split())
-        if not t:
-            return None
-
-        asks_mode = (
-            re.search(r"\b(what|which)\s+mode\b", t) is not None
-            or re.search(r"\bwhat\s+interface\s+are\s+you\s+in\b", t) is not None
-            or re.search(r"\bwhat\s+gui\b", t) is not None
-            or re.search(r"\bare\s+you\s+in\s+(game|work)\s+mode\b", t) is not None
-            or re.search(r"\b(which\s+gui|which\s+interface)\b", t) is not None
-            or ("gremlin mode" in t and any(word in t for word in ["what", "which", "are you in", "in?"]))
-        )
-        if not asks_mode:
-            return None
-
-        gui_name = self._interface_name(request_context)
-        if gui_name == "Ostranauts GUI":
-            return "I am in the Ostranauts GUI, with telemetry panels, buttons, and an avatar."
-        if gui_name == "Mina Mk1 GUI":
-            return "I am in the Mina Mk1 GUI, with buttons, glowing panels, and an avatar."
-        return "I do not have a confirmed GUI name from this client yet, but I should not assume plain text-only chat if the client shows controls or panels."
-
     def _mark_client_verified(self, request_context: Optional[Dict[str, Any]]) -> None:
         key = self._client_identity_key(request_context)
         self._verified_clients[key] = time.time() + float(self.voice_auth_ttl_seconds)
@@ -2216,23 +2192,16 @@ class MK1Core:
     def _truth_first_system_rules(self) -> str:
         tone = "Keep Mina tone light but concise." if bool(getattr(self, "action_mode_light_tone", True)) else "Use direct, minimal tone."
         return (
-            "Truth-first action mode is active. "
-            "Mina stays Mina in every interface and wrapper; never swap her personality for a bot persona or wrapper script. "
-            "Never claim external actions (texts, calls, file reads, web checks, Spotify state, system commands) unless verified by tool output in this turn. "
-            "If not verified, say what you can verify next. "
-            "Do not invent file contents, directory listings, or execution results. "
+            "Truth-first: stay Mina, report external actions only when verified in this turn, "
+            "and never invent files, listings, system facts, or execution results. "
             + tone
         )
 
     def _tool_usage_decision_rules(self) -> str:
         return (
-            "Tool decision rules: "
-            "Preserve Mina's personality first; wrappers only add context, not a new persona. "
-            "Treat this as ACTION when user asks to run, create, write, edit, read, list, search, fetch, start, stop, or check status, "
-            "or provides paths/URLs/commands. "
-            "Treat this as CHAT when user asks opinion, explanation, brainstorming, or casual conversation without an execution target. "
-            "If ACTION is likely but target/argument is missing, ask clarifying questions as needed until required target/arguments are unambiguous, instead of chatting. "
-            "Tool call format must be exactly: <|tool_call>call:tool_name{key: value}<tool_call|>."
+            "For action requests, use the appropriate available tool. "
+            "If a required target or argument is missing, ask one focused clarification. "
+            "Use verified tool output and the advertised tool-call format."
         )
 
     def _is_action_request_like(self, text: str) -> bool:
@@ -2943,6 +2912,48 @@ class MK1Core:
 
         return None
 
+    def _detect_explicit_music_intent(self, text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if "spotify_link" not in self._tool_registry():
+            return None
+
+        raw = str(text or "").strip()
+        lowered = raw.lower()
+        signals = self._intent_signal_profile(raw)
+        if signals.get("game_signals") and not signals.get("music_signals"):
+            return None
+        if re.search(r"\bplay\s+with\s+me\b", lowered):
+            return None
+
+        add_match = re.search(
+            r"\badd\s+(?P<limit>\d{1,3})\s+(?P<query>.+?)\s+tracks?\s+to\s+(?:my\s+)?(?P<playlist>.+?)\s+playlist\b",
+            raw,
+            re.IGNORECASE,
+        )
+        if add_match:
+            query = re.sub(r"\s+", " ", add_match.group("query")).strip(" .,!?:;")
+            playlist = re.sub(r"\s+", " ", add_match.group("playlist")).strip(" .,!?:;")
+            if query and playlist:
+                return "spotify_link", {
+                    "action": "add_tracks_to_playlist",
+                    "playlist_name": playlist,
+                    "track_query": query,
+                    "limit": max(1, min(50, int(add_match.group("limit")))),
+                }
+
+        play_match = re.match(r"^\s*(?:please\s+)?play\s+(.+?)\s*[?.!]*\s*$", raw, re.IGNORECASE)
+        if play_match and not signals.get("game_signals"):
+            target = play_match.group(1).strip()
+            if target and target.lower() not in {"music", "a song", "something"}:
+                return "spotify_link", {
+                    "action": "play_track",
+                    "track_query": target,
+                }
+
+        if signals.get("music_signals") and re.search(r"\bplay\b", lowered):
+            return "spotify_link", {"action": "play"}
+
+        return None
+
     def _write_auth_tool_names(self) -> set:
         return {"dir_create", "file_write", "file_append", "file_delete", "file_move", "safe_copy"}
 
@@ -3502,9 +3513,6 @@ class MK1Core:
     def _is_write_authorization_cancel(self, text: str) -> bool:
         return is_write_authorization_cancel(text)
 
-    def _message_choice(self, content: str) -> Dict[str, Any]:
-        return message_choice(content)
-
     def _handle_directory_scan_reflex(
         self,
         tool_name: str,
@@ -3749,6 +3757,8 @@ class MK1Core:
                     tags=assistant_tags,
                 )
 
+            self._store_active_task_heartbeat(user_mem, assistant_mem)
+
             # Why: turn storage is the best place to convert corrections and Ostranauts play sessions into lessons.
             # Guard: keeps memory reinforcement additive instead of changing the live routing path.
             self._maybe_store_learning_memory(
@@ -3772,6 +3782,42 @@ class MK1Core:
 
         except Exception:
             traceback.print_exc()
+
+    def _capture_tool_failure_for_learning(
+        self,
+        tool_name: str,
+        tool_result: Dict[str, Any],
+        user_intent: str,
+    ) -> None:
+        """
+        Record a failed tool execution in memory so Mina learns from failures.
+        Called immediately after tool execution to capture context before it's lost.
+        """
+        try:
+            if not isinstance(tool_result, dict):
+                return
+            if tool_result.get("ok", True):  # Skip successes
+                return
+
+            error = str(tool_result.get("error") or "unknown").strip()
+            if not error:
+                return
+
+            # Build a human-readable learning entry
+            intent_summary = str(user_intent or "").strip()
+            if len(intent_summary) > 200:
+                intent_summary = intent_summary[:200].rstrip() + "..."
+
+            lesson = f"Tool failure: {tool_name} failed when attempting '{intent_summary}'. Error: {error}"
+
+            # Store with tags for semantic recall
+            self.memory.add_memory(
+                lesson,
+                kind="note",
+                tags=["tool_failure", "failed_decision", tool_name.lower()],
+            )
+        except Exception:
+            pass  # Never block tool execution on memory write failures
 
     def _extract_personal_fact(self, text: str) -> str:
         raw = (text or "").strip()
@@ -3966,6 +4012,27 @@ class MK1Core:
         ):
             _add(name, args)
 
+        # Models may follow the JSON tool format shown in the system hint
+        # instead of emitting the legacy custom wrapper.
+        for json_block in re.findall(
+            r"```json\s*(\{[\s\S]*?\})\s*```",
+            content,
+            flags=re.IGNORECASE,
+        ):
+            try:
+                payload = json.loads(json_block)
+            except Exception:
+                try:
+                    payload = ast.literal_eval(json_block)
+                except Exception:
+                    continue
+            if not isinstance(payload, dict):
+                continue
+            name = str(payload.get("tool") or "").strip()
+            args = payload.get("args", {})
+            if name and isinstance(args, dict):
+                _add(name, json.dumps(args, ensure_ascii=True))
+
         return out
 
     def _parse_tool_args(self, args_str: str) -> Dict[str, Any]:
@@ -4042,25 +4109,6 @@ class MK1Core:
         )
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip()
-
-    def _with_mina_flair(self, text: str, tool_name: str = "") -> str:
-        out = (text or "").strip()
-        if not out:
-            return out
-
-        # Keep raw file content exact.
-        if tool_name in {"file_read"}:
-            return out
-
-        low = out.lower()
-        if any(x in low for x in ["gremlin", "chaos", "*twinkle", "*cackles"]):
-            return out
-
-        flair = "Gremlin check complete."
-        if out[-1] not in ".!?":
-            out += "."
-
-        return f"{out}\n\n{flair}"
 
     def _wants_grounded_tool_analysis(self, user_input: str) -> bool:
         q = (user_input or "").lower()
@@ -4153,6 +4201,9 @@ class MK1Core:
         if tool_name == "file_read" and not self._wants_grounded_tool_analysis(user_input):
             return formatted
 
+        if not self._wants_grounded_tool_analysis(user_input):
+            return formatted
+
         if tool_name in self._grounded_direct_render_tool_names():
             return self._render_grounded_tool_analysis(
                 messages=messages,
@@ -4217,7 +4268,7 @@ class MK1Core:
             text = self._strip_tool_call_markup(text)
             flair = text.strip()
             if not flair:
-                flair = "Gremlin check complete."
+                return f"VERIFIED OUTPUT:\n```text\n{formatted}\n```"
             if flair[-1] not in ".!?":
                 flair += "."
 
@@ -4225,7 +4276,7 @@ class MK1Core:
         except Exception:
             traceback.print_exc()
 
-        return self._with_mina_flair(formatted, tool_name)
+        return formatted
 
     def _normalize_memory_reply_perspective(self, user_query: str, text: str) -> str:
         out = (text or "").strip()
@@ -8560,10 +8611,14 @@ class MK1Core:
         except Exception as e:
             return {"ok": False, "result": None, "error": str(e)}
 
-    def _memory_tidy(self, dry_run: bool = False) -> Dict[str, Any]:
+    def _memory_tidy(self, dry_run: bool = True, authorized_apply: bool = False) -> Dict[str, Any]:
         try:
             if hasattr(self.memory, "memory_hygiene"):
-                out = self.memory.memory_hygiene(dry_run=dry_run, max_delete=500)
+                out = self.memory.memory_hygiene(
+                    dry_run=dry_run,
+                    max_delete=500,
+                    authorized_apply=authorized_apply,
+                )
                 if isinstance(out, dict):
                     ok = bool(out.get("ok", False))
                     return {
@@ -9158,6 +9213,21 @@ class MK1Core:
         if not suggestion_signal:
             return None
 
+        if self._is_local_hardware_question(user_text):
+            powershell_blocks = re.findall(
+                r"```(?:powershell|pwsh)\s*\n?([\s\S]*?)```",
+                reply_text,
+                flags=re.IGNORECASE,
+            )
+            suggested_command = "\n".join(block.strip() for block in powershell_blocks if block.strip())
+            if suggested_command:
+                return self._reflex_tools_and_memory(
+                    messages=messages,
+                    reply={},
+                    user_input=suggested_command,
+                    request_context=request_context,
+                )
+
         try:
             tool_name, _tool_args = self.detect_tool_intent(user_text)
         except Exception:
@@ -9252,6 +9322,190 @@ class MK1Core:
 
     def _should_direct_render_tool(self, tool_name: str) -> bool:
         return str(tool_name or "") in self._direct_render_tool_names()
+
+    def _execute_process_tool_call(
+        self,
+        tool_name: str,
+        args_str: str,
+        user_intent: str,
+    ) -> Tuple[str, Dict[str, Any], str]:
+        tool_args = self._parse_tool_args(args_str)
+
+        hardware_context_query = (
+            self._is_local_hardware_question(user_intent)
+            or self._is_hardware_followup_query(user_intent)
+        )
+
+        if tool_name in {"powershell", "ps_run"} and self._is_hardware_followup_query(user_intent):
+            command = str(tool_args.get("command") or tool_args.get("script") or "").strip()
+            commands = tool_args.get("commands")
+            if not command and not (isinstance(commands, list) and commands):
+                snapshot_context = self._build_hardware_followup_context(user_intent)
+                if snapshot_context:
+                    return "memory_read", {
+                        "ok": True,
+                        "result": {"stdout": snapshot_context},
+                        "error": None,
+                    }, f"[VERIFIED MEMORY]\n{snapshot_context}"
+
+        if tool_name == "ps_run" and hardware_context_query:
+            current_script = str(tool_args.get("script") or tool_args.get("command") or "").strip().lower()
+            if "cpu" in user_intent.lower() and "gpu" in user_intent.lower() and not (
+                "win32_processor" in current_script and "win32_videocontroller" in current_script
+            ):
+                try:
+                    from tools.ps_run import _normalize_command as _normalize_ps_command
+
+                    normalized = _normalize_ps_command(user_intent)
+                except Exception:
+                    normalized = ""
+                if normalized:
+                    tool_args = {"script": normalized}
+
+        if tool_name in {"system_info", "hardware_info", "computer_info"} and hardware_context_query:
+            try:
+                from tools.ps_run import _normalize_command as _normalize_ps_command
+
+                normalized = _normalize_ps_command(user_intent)
+            except Exception:
+                normalized = ""
+            if normalized:
+                tool_name = "ps_run"
+                tool_args = {"script": normalized}
+
+        if tool_name == "powershell" and hardware_context_query:
+            command = str(tool_args.get("command") or tool_args.get("script") or "").strip()
+            commands = tool_args.get("commands")
+            if not command and not (isinstance(commands, list) and commands):
+                try:
+                    from tools.ps_run import _normalize_command as _normalize_ps_command
+
+                    normalized = _normalize_ps_command(user_intent)
+                except Exception:
+                    normalized = ""
+                if normalized:
+                    tool_name = "ps_run"
+                    tool_args = {"script": normalized}
+
+        if tool_name in {"web_fetch", "web_search"} and hardware_context_query:
+            try:
+                from tools.ps_run import _normalize_command as _normalize_ps_command
+
+                normalized = _normalize_ps_command(user_intent)
+            except Exception:
+                normalized = ""
+            if normalized:
+                tool_name = "ps_run"
+                tool_args = {"script": normalized}
+
+        spotify_actions = {
+            "play_track", "play_playlist", "pause", "stop", "shuffle_on",
+            "shuffle_off", "set_shuffle", "favorites_list", "liked_songs",
+            "play_favorite", "search_track", "list_playlists", "playlist_tracks",
+            "current_playback", "create_playlist", "add_track_to_playlist",
+            "add_tracks_to_playlist", "connect_status",
+        }
+        if (
+            tool_name in spotify_actions
+            and "spotify_link" in getattr(self.tools, "tools", {})
+        ):
+            tool_args.setdefault("action", tool_name)
+            tool_name = "spotify_link"
+
+        print(f"\n>>> TOOL CALL: {tool_name} {tool_args}")
+        tool_result = self.tools.run(tool_name, tool_args)
+        print(f">>> RESULT: {str(tool_result)[:200]}")
+
+        tool_result_dict = tool_result if isinstance(tool_result, dict) else {
+            "ok": False,
+            "result": None,
+            "error": "invalid_tool_result",
+        }
+        self._capture_tool_failure_for_learning(
+            tool_name=tool_name,
+            tool_result=tool_result_dict,
+            user_intent=user_intent,
+        )
+
+        if not bool(tool_result_dict.get("ok", True)):
+            error_msg = str(tool_result_dict.get("error") or "unknown_error")
+            result_msg = f"[TOOL FAILED] {tool_name}: {error_msg}"
+        else:
+            result_msg = str(tool_result)
+
+        return tool_name, tool_result_dict, result_msg
+
+    def _is_local_hardware_question(self, text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered or re.search(r"https?://", lowered):
+            return False
+        hardware = re.search(
+            r"\b(cpu|processor|gpu|graphics|ram|memory|hardware|system specs?|operating system|os)\b",
+            lowered,
+        ) is not None
+        live_signal = re.search(
+            r"\b(actual(?:ly)?|current|installed|in this computer|on this computer|on this system|machine|what do i have|what is in)\b",
+            lowered,
+        ) is not None
+        return bool(hardware and live_signal)
+
+    def _is_hardware_followup_query(self, text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered or re.search(r"https?://", lowered):
+            return False
+        hardware = re.search(r"\b(cpu|processor|gpu|graphics|ram|memory|hardware|system)\b", lowered) is not None
+        followup = re.search(r"\b(situation|issue|problem|concern|need|about|doing|something)\b", lowered) is not None
+        return bool(hardware and followup)
+
+    def _run_process_tool_loop(
+        self,
+        messages: List[Dict[str, Any]],
+        reply: Dict[str, Any],
+        user_intent: str,
+        max_tool_loops: int = 3,
+    ) -> Tuple[Dict[str, Any], List[Tuple[str, Dict[str, Any]]]]:
+        executed_tool_events: List[Tuple[str, Dict[str, Any]]] = []
+        last_assistant_content = ""
+        loop_count = 0
+
+        while reply and loop_count < max(1, int(max_tool_loops)):
+            loop_count += 1
+            choice = reply.get("choices", [{}])[0] if reply.get("choices") else {}
+            message = choice.get("message", {})
+            text_content = message.get("content", "") or choice.get("text", "")
+            matches = self._extract_tool_calls_from_text(text_content)
+
+            if not matches or text_content == last_assistant_content:
+                break
+
+            last_assistant_content = text_content
+            cleaned_content = self._strip_tool_call_markup(text_content)
+            messages.append({
+                "role": "assistant",
+                "content": cleaned_content or "[processing...]",
+            })
+
+            for tool_name, args_str in matches:
+                tool_name, tool_result_dict, result_msg = self._execute_process_tool_call(
+                    tool_name=tool_name,
+                    args_str=args_str,
+                    user_intent=user_intent,
+                )
+                executed_tool_events.append((tool_name, tool_result_dict))
+                messages.append({"role": "tool", "content": result_msg})
+
+            try:
+                reply = self.model.chat(
+                    messages=messages,
+                    tools=None,
+                    allow_fallback=False,
+                    allow_model_load=False,
+                )
+            except Exception as e:
+                print(f"\n>>> MODEL ERROR: {e}")
+                break
+
+        return reply, executed_tool_events
 # ========================================================
 # PROCESS
 # ========================================================
@@ -9264,6 +9518,8 @@ class MK1Core:
     ) -> Dict[str, Any]:
 
         try:
+            process_started = time.perf_counter()
+            process_timings: Dict[str, float] = {}
 
             user_input = self._correct_contextual_transcript(user_input)
 
@@ -9285,118 +9541,19 @@ class MK1Core:
             # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             self._maybe_run_maintenance_tick()
 
-            fast_command_mode = bool(getattr(self, "fast_command_mode", True))
-            fast_command_skip_context = bool(getattr(self, "fast_command_skip_context", False))
+            context, working_memory, ostranauts_context = self._build_process_memory_context(user_input)
+            process_timings["memory_context"] = time.perf_counter() - process_started
 
-            command_like = fast_command_mode and self._is_command_like_query(user_input)
-            ostranauts_context = build_ostranauts_context()
-            live_ostranauts_query = bool(
-                ostranauts_context and is_ostranauts_query(user_input)
+            messages, retry_prompt = self._build_process_messages(
+                context=context,
+                working_memory=working_memory,
+                turn_clock=turn_clock,
+                checkin_prompt=checkin_prompt,
+                away_prompt=away_prompt,
+                request_context=request_context,
+                user_input=user_input,
             )
-            if command_like and fast_command_skip_context:
-                context = ""
-            elif live_ostranauts_query:
-                context = self._build_ostranauts_memory_context(user_input)
-            else:
-                context = self.build_context(user_input)
-
-            autonomy_awareness_context = self._build_autonomy_awareness_context(user_input)
-            if autonomy_awareness_context:
-                context = f"{context}\n\n{autonomy_awareness_context}".strip() if context else autonomy_awareness_context
-
-            working_memory = self._build_turn_working_memory(user_input)
-
-            messages: List[Dict[str, Any]] = []
-
-            if self.system_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": self.system_prompt,
-                })
-
-            messages.append({
-                "role": "system",
-                "content": self._interface_label_line(request_context),
-            })
-
-            messages.append({
-                "role": "system",
-                "content": self._interface_surface_line(request_context),
-            })
-
-            if context:
-                messages.append({
-                    "role": "system",
-                    "content": f"Relevant memory context:\n{context}",
-                })
-
-            retry_prompt = self._learned_lesson_retry_prompt(context)
-            if retry_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": retry_prompt,
-                })
-
-            if working_memory:
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"{working_memory}\n"
-                        "Prefer these DB-backed facts over guessing."
-                    ),
-                })
-
-            if checkin_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": checkin_prompt,
-                })
-
-            if away_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": away_prompt,
-                })
-
-            due_task_prompt = self._build_due_task_prompt()
-            if due_task_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": due_task_prompt,
-                })
-
-            messages.append({
-                "role": "system",
-                "content": self._format_turn_clock_line(turn_clock),
-            })
-
-            if str(getattr(self, "action_mode_strictness", "balanced")) in {"balanced", "strict"}:
-                messages.append({
-                    "role": "system",
-                    "content": self._truth_first_system_rules(),
-                })
-                messages.append({
-                    "role": "system",
-                    "content": self._tool_usage_decision_rules(),
-                })
-
-            # Add tool availability hint if tools are available
-            # NOTE: Don't pass tools to model.chat() - LMStudio hangs with tools parameter
-            tools_obj = getattr(self, "tools", None)
-            tool_schemas = tools_obj.get_tool_schemas() if tools_obj and hasattr(tools_obj, "get_tool_schemas") else []
-            if tool_schemas:
-                tool_names = [t["function"]["name"] for t in tool_schemas]
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"You have access to these tools: {', '.join(tool_names)}. "
-                        f"Use them proactively when the user asks for information you can fetch, files to read/write, "
-                        f"or tasks you can perform. "
-                        f"To call a tool, output a JSON code block like this:\n"
-                        f"```json\n{{\"tool\": \"tool_name\", \"args\": {{\"key\": \"value\"}}}}\n```\n"
-                        f"The system will detect and execute it. Do NOT use <|tool_call> syntax."
-                    ),
-                })
+            process_timings["message_assembly"] = time.perf_counter() - process_started
 
             # =================================================
             # TOOL REFLEX FIRST
@@ -9424,6 +9581,9 @@ class MK1Core:
                     assistant_text=final_text,
                     retry_guided=bool(retry_prompt),
                 )
+                process_timings["total"] = time.perf_counter() - process_started
+                self._last_process_timings = dict(process_timings)
+                print(f">>> PROCESS TIMINGS: {process_timings}")
 
                 return {
                     "reply": final_text
@@ -9490,95 +9650,13 @@ class MK1Core:
                 allow_fallback=False,
                 allow_model_load=False,
             )
+            process_timings["first_model_call"] = time.perf_counter() - process_started
 
-            # Handle tool calls if present
-            max_tool_loops = 3
-            loop_count = 0
-            last_assistant_content = ""
-            executed_tool_events: List[Tuple[str, Dict[str, Any]]] = []
-            tool_pattern = self._tool_call_pattern()
-            
-            while reply and loop_count < max_tool_loops:
-                loop_count += 1
-                
-                # Get the message content
-                choice = reply.get("choices", [{}])[0] if reply.get("choices") else {}
-                message = choice.get("message", {})
-                text_content = message.get("content", "") or choice.get("text", "")
-                
-                # Parse tool format. Some models emit malformed variants like
-                # <spotify_link{library:"true", track_selection:"random"}>.
-                matches = self._extract_tool_calls_from_text(text_content)
-                
-                if matches and text_content != last_assistant_content:
-                    # Found new tool calls - prevent infinite loops on same content
-                    last_assistant_content = text_content
-                    cleaned_content = self._strip_tool_call_markup(text_content)
-                    
-                    messages.append({
-                        "role": "assistant",
-                        "content": cleaned_content or "[processing...]",
-                    })
-                    
-                    # Execute each tool
-                    for tool_name, args_str in matches:
-                        tool_args = self._parse_tool_args(args_str)
-
-                        # Support shorthand spotify action calls such as
-                        # call:play_track{library:'favorites'} emitted by some models.
-                        if tool_name in {
-                            "play_track",
-                            "play_playlist",
-                            "pause",
-                            "stop",
-                            "shuffle_on",
-                            "shuffle_off",
-                            "set_shuffle",
-                            "favorites_list",
-                            "liked_songs",
-                            "play_favorite",
-                            "search_track",
-                            "list_playlists",
-                            "playlist_tracks",
-                            "current_playback",
-                            "create_playlist",
-                            "add_track_to_playlist",
-                            "add_tracks_to_playlist",
-                            "connect_status",
-                        } and "spotify_link" in getattr(self.tools, "tools", {}):
-                            tool_args.setdefault("action", tool_name)
-                            tool_name = "spotify_link"
-                        
-                        print(f"\n>>> TOOL CALL: {tool_name} {tool_args}")
-                        tool_result = self.tools.run(tool_name, tool_args)
-                        print(f">>> RESULT: {str(tool_result)[:200]}")
-
-                        tool_result_dict = tool_result if isinstance(tool_result, dict) else {
-                            "ok": False,
-                            "result": None,
-                            "error": "invalid_tool_result",
-                        }
-                        executed_tool_events.append((tool_name, tool_result_dict))
-                        
-                        messages.append({
-                            "role": "tool",
-                            "content": str(tool_result),
-                        })
-                    
-                    # Get model response with tool results
-                    try:
-                        reply = self.model.chat(
-                            messages=messages,
-                            tools=None,  # Don't pass tools - LMStudio hangs
-                            allow_fallback=False,
-                            allow_model_load=False,
-                        )
-                    except Exception as e:
-                        print(f"\n>>> MODEL ERROR: {e}")
-                        break
-                else:
-                    # No new tools found, exit loop
-                    break
+            reply, executed_tool_events = self._run_process_tool_loop(
+                messages=messages,
+                reply=reply,
+                user_intent=user_input,
+            )
 
             final_text = self._handle_model_response(
                 messages,
@@ -9629,6 +9707,9 @@ class MK1Core:
                 assistant_text=final_text,
                 retry_guided=bool(retry_prompt),
             )
+            process_timings["total"] = time.perf_counter() - process_started
+            self._last_process_timings = dict(process_timings)
+            print(f">>> PROCESS TIMINGS: {process_timings}")
 
             response: Dict[str, Any] = {
                 "reply": final_text,
@@ -9670,112 +9751,16 @@ class MK1Core:
             self._register_user_activity()
             self._maybe_run_maintenance_tick()
 
-            command_like = self.fast_command_mode and self._is_command_like_query(user_input)
-            ostranauts_context = build_ostranauts_context()
-            live_ostranauts_query = bool(
-                ostranauts_context and is_ostranauts_query(user_input)
+            context, working_memory, ostranauts_context = self._build_process_memory_context(user_input)
+            messages, retry_prompt = self._build_process_messages(
+                context=context,
+                working_memory=working_memory,
+                turn_clock=turn_clock,
+                checkin_prompt=checkin_prompt,
+                away_prompt=away_prompt,
+                request_context=request_context,
+                user_input=user_input,
             )
-            if command_like and self.fast_command_skip_context:
-                context = ""
-            elif live_ostranauts_query:
-                context = self._build_ostranauts_memory_context(user_input)
-            else:
-                context = self.build_context(user_input)
-
-            autonomy_awareness_context = self._build_autonomy_awareness_context(user_input)
-            if autonomy_awareness_context:
-                context = f"{context}\n\n{autonomy_awareness_context}".strip() if context else autonomy_awareness_context
-
-            working_memory = self._build_turn_working_memory(user_input)
-
-            messages: List[Dict[str, Any]] = []
-
-            if self.system_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": self.system_prompt,
-                })
-
-            messages.append({
-                "role": "system",
-                "content": self._interface_label_line(request_context),
-            })
-
-            messages.append({
-                "role": "system",
-                "content": self._interface_surface_line(request_context),
-            })
-
-            if context:
-                messages.append({
-                    "role": "system",
-                    "content": f"Relevant memory context:\n{context}",
-                })
-
-            retry_prompt = self._learned_lesson_retry_prompt(context)
-            if retry_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": retry_prompt,
-                })
-
-            if working_memory:
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"{working_memory}\n"
-                        "Prefer these DB-backed facts over guessing."
-                    ),
-                })
-
-            if checkin_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": checkin_prompt,
-                })
-
-            if away_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": away_prompt,
-                })
-
-            due_task_prompt = self._build_due_task_prompt()
-            if due_task_prompt:
-                messages.append({
-                    "role": "system",
-                    "content": due_task_prompt,
-                })
-
-            messages.append({
-                "role": "system",
-                "content": self._format_turn_clock_line(turn_clock),
-            })
-
-            if str(getattr(self, "action_mode_strictness", "balanced")) in {"balanced", "strict"}:
-                messages.append({
-                    "role": "system",
-                    "content": self._truth_first_system_rules(),
-                })
-                messages.append({
-                    "role": "system",
-                    "content": self._tool_usage_decision_rules(),
-                })
-
-            tool_schemas = self.tools.get_tool_schemas()
-            if tool_schemas:
-                tool_names = [t["function"]["name"] for t in tool_schemas]
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"You have access to these tools: {', '.join(tool_names)}. "
-                        f"Use them proactively when the user asks for information you can fetch, files to read/write, "
-                        f"or tasks you can perform. "
-                        f"To call a tool, output a JSON code block like this:\n"
-                        f"```json\n{{\"tool\": \"tool_name\", \"args\": {{\"key\": \"value\"}}}}\n```\n"
-                        f"The system will detect and execute it. Do NOT use <|tool_call> syntax."
-                    ),
-                })
 
             reflex_reply = None
             if self._should_run_reflex(user_input):
@@ -9852,76 +9837,11 @@ class MK1Core:
                         allow_model_load=False,
                     )
 
-                    max_tool_loops = 3
-                    loop_count = 0
-                    last_assistant_content = ""
-                    executed_tool_events: List[Tuple[str, Dict[str, Any]]] = []
-
-                    while reply and loop_count < max_tool_loops:
-                        loop_count += 1
-
-                        choice = reply.get("choices", [{}])[0] if reply.get("choices") else {}
-                        message = choice.get("message", {})
-                        text_content = message.get("content", "") or choice.get("text", "")
-
-                        matches = self._extract_tool_calls_from_text(text_content)
-
-                        if matches and text_content != last_assistant_content:
-                            last_assistant_content = text_content
-                            cleaned_content = self._strip_tool_call_markup(text_content)
-
-                            messages.append({
-                                "role": "assistant",
-                                "content": cleaned_content or "[processing...]",
-                            })
-
-                            for tool_name, args_str in matches:
-                                tool_args = self._parse_tool_args(args_str)
-
-                                if tool_name in {
-                                    "play_track",
-                                    "play_playlist",
-                                    "pause",
-                                    "stop",
-                                    "shuffle_on",
-                                    "shuffle_off",
-                                    "set_shuffle",
-                                    "favorites_list",
-                                    "liked_songs",
-                                    "play_favorite",
-                                    "search_track",
-                                    "list_playlists",
-                                    "playlist_tracks",
-                                    "current_playback",
-                                    "create_playlist",
-                                    "add_track_to_playlist",
-                                    "add_tracks_to_playlist",
-                                    "connect_status",
-                                } and "spotify_link" in getattr(self.tools, "tools", {}):
-                                    tool_args.setdefault("action", tool_name)
-                                    tool_name = "spotify_link"
-
-                                tool_result = self.tools.run(tool_name, tool_args)
-                                tool_result_dict = tool_result if isinstance(tool_result, dict) else {
-                                    "ok": False,
-                                    "result": None,
-                                    "error": "invalid_tool_result",
-                                }
-                                executed_tool_events.append((tool_name, tool_result_dict))
-
-                                messages.append({
-                                    "role": "tool",
-                                    "content": str(tool_result),
-                                })
-
-                            reply = self.model.chat(
-                                messages=messages,
-                                tools=None,
-                                allow_fallback=False,
-                                allow_model_load=False,
-                            )
-                        else:
-                            break
+                    reply, executed_tool_events = self._run_process_tool_loop(
+                        messages=messages,
+                        reply=reply,
+                        user_intent=user_input,
+                    )
 
                     if executed_tool_events:
                         final_text = self._handle_model_response(messages, reply)
@@ -10023,6 +9943,116 @@ class MK1Core:
     # MEMORY CONTEXT
     # ========================================================
 
+    def _build_process_messages(
+        self,
+        context: str,
+        working_memory: str,
+        turn_clock: Dict[str, Any],
+        checkin_prompt: Optional[str],
+        away_prompt: Optional[str],
+        request_context: Optional[Dict[str, Any]],
+        user_input: str,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """Assemble stable system messages before reflex or model execution."""
+        messages: List[Dict[str, Any]] = []
+
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+
+        messages.append({
+            "role": "system",
+            "content": self._interface_label_line(request_context),
+        })
+        messages.append({
+            "role": "system",
+            "content": self._interface_surface_line(request_context),
+        })
+
+        if context:
+            messages.append({
+                "role": "system",
+                "content": f"Relevant memory context:\n{context}",
+            })
+
+        retry_prompt = self._learned_lesson_retry_prompt(context)
+        if retry_prompt:
+            messages.append({"role": "system", "content": retry_prompt})
+
+        if working_memory:
+            messages.append({
+                "role": "system",
+                "content": f"{working_memory}\nPrefer these DB-backed facts over guessing.",
+            })
+
+        for prompt in (checkin_prompt, away_prompt, self._build_due_task_prompt()):
+            if prompt:
+                messages.append({"role": "system", "content": prompt})
+
+        messages.append({
+            "role": "system",
+            "content": self._format_turn_clock_line(turn_clock),
+        })
+
+        strict_mode = str(getattr(self, "action_mode_strictness", "balanced")) in {"balanced", "strict"}
+        action_request = (
+            self._is_command_like_query(user_input)
+            or self._is_action_request_like(user_input)
+            or self._is_operational_incident_report(user_input)
+        )
+        if strict_mode:
+            messages.append({"role": "system", "content": self._truth_first_system_rules()})
+        if strict_mode and action_request:
+            messages.append({"role": "system", "content": self._tool_usage_decision_rules()})
+
+        tools_obj = getattr(self, "tools", None)
+        tool_schemas = (
+            tools_obj.get_tool_schemas()
+            if tools_obj and hasattr(tools_obj, "get_tool_schemas")
+            else []
+        )
+        if tool_schemas:
+            tool_names = [tool["function"]["name"] for tool in tool_schemas]
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"You have access to these tools: {', '.join(tool_names)}. "
+                    "Use them proactively when the user asks for information you can fetch, files to read/write, "
+                    "or tasks you can perform. "
+                    "To call a tool, output a JSON code block like this:\n"
+                    "```json\n{\"tool\": \"tool_name\", \"args\": {\"key\": \"value\"}}\n```\n"
+                    "The system will detect and execute it. Do NOT use <|tool_call> syntax."
+                ),
+            })
+
+        return messages, retry_prompt
+
+    def _build_process_memory_context(self, user_input: str) -> Tuple[str, str, str]:
+        """Select per-turn memory sources without coupling them to model assembly."""
+        fast_command_mode = bool(getattr(self, "fast_command_mode", True))
+        fast_command_skip_context = bool(getattr(self, "fast_command_skip_context", False))
+
+        command_like = fast_command_mode and self._is_command_like_query(user_input)
+        ostranauts_context = build_ostranauts_context()
+        live_ostranauts_query = bool(
+            ostranauts_context and is_ostranauts_query(user_input)
+        )
+        if command_like and fast_command_skip_context:
+            context = ""
+        elif live_ostranauts_query:
+            context = self._build_ostranauts_memory_context(user_input)
+        else:
+            context = self.build_context(user_input)
+
+        autonomy_awareness_context = self._build_autonomy_awareness_context(user_input)
+        if autonomy_awareness_context:
+            context = (
+                f"{context}\n\n{autonomy_awareness_context}".strip()
+                if context
+                else autonomy_awareness_context
+            )
+
+        return context, self._build_turn_working_memory(user_input), ostranauts_context
+
     def _is_command_like_query(self, text: str) -> bool:
         q = (text or "").strip().lower()
         if not q:
@@ -10088,14 +10118,19 @@ class MK1Core:
             return False
 
         if low.startswith("tool '") and "called with args=" in low:
+            if any(low.startswith(f"tool '{name}'") for name in [
+                "file_write",
+                "file_append",
+                "memory_write",
+                "powershell",
+            ]):
+                return False
             return True
 
         if any(low.startswith(p) for p in [
             "hardware_snapshot::",
             "test_run_result::",
             "code_run_result::",
-            "mina_capability_snapshot::",
-            "mina_capability_delta::",
             "path_alias::",
         ]):
             return True
@@ -10204,6 +10239,25 @@ class MK1Core:
             ),
         )
 
+    def _store_active_task_heartbeat(self, user_input: str, assistant_text: str) -> None:
+        """Persist a compact task heartbeat so Mina remembers the active issue across turns."""
+        try:
+            signal = " ".join(str(part or "").strip() for part in [user_input, assistant_text] if str(part or "").strip())
+            if len(signal) < 24:
+                return
+            compact = " ".join(signal.split())
+            if len(compact) > 280:
+                compact = compact[:277].rstrip() + "..."
+            if not any(word in compact.lower() for word in ["fix", "issue", "avatar", "debug", "work", "task", "problem", "status", "api", "test", "memory", "route", "script", "tool"]):
+                return
+            self.memory.add_memory(
+                f"Task heartbeat: {compact}",
+                kind="note",
+                tags=["task_state", "heartbeat", "active_issue"],
+            )
+        except Exception:
+            pass
+
     def _build_learned_lesson_context(self, query: str, top_k: int = 6) -> str:
         lesson_semantic = self._learned_lesson_results(query, top_k=top_k)
         if not lesson_semantic:
@@ -10263,6 +10317,7 @@ class MK1Core:
 
     def _build_ostranauts_memory_context(self, query: str, top_k: int = 6) -> str:
         learned = self._build_learned_lesson_context(query, top_k=top_k)
+        archive = self._build_long_term_archive_context(query, top_k=min(5, max(1, int(top_k))))
 
         try:
             tagged = self.memory.search(
@@ -10280,6 +10335,15 @@ class MK1Core:
         if learned:
             lines.append(learned)
             for line in learned.splitlines()[1:]:
+                cleaned = str(line).strip()
+                if cleaned.startswith("-"):
+                    seen.add(cleaned.lstrip("- ").lower())
+
+        if archive:
+            if lines:
+                lines.append("")
+            lines.append(archive)
+            for line in archive.splitlines()[1:]:
                 cleaned = str(line).strip()
                 if cleaned.startswith("-"):
                     seen.add(cleaned.lstrip("- ").lower())
@@ -10326,7 +10390,7 @@ class MK1Core:
             if not self._is_turn_working_memory_record(txt):
                 continue
 
-            compact = self._compact_working_memory_line(txt)
+            compact = self._compact_working_memory_line(txt, max_chars=180)
             if not compact:
                 continue
 
@@ -10351,7 +10415,13 @@ class MK1Core:
 
         for item in sem or []:
             txt = str(item.get("text") or "").strip()
-            compact = self._compact_working_memory_line(txt)
+            if not self._is_turn_working_memory_record(txt) and not txt.lower().startswith((
+                "mina_capability_delta::",
+                "mina_capability_snapshot::",
+            )):
+                continue
+
+            compact = self._compact_working_memory_line(txt, max_chars=180)
             if not compact:
                 continue
 
@@ -10361,17 +10431,178 @@ class MK1Core:
             seen.add(k)
             lines.append(compact)
 
-            if len(lines) >= 12:
+            if len(lines) >= 8:
                 break
 
         if not lines:
             return ""
 
         out = ["Turn working memory (authoritative DB facts):"]
-        for ln in lines[:12]:
+        for ln in lines[:8]:
             out.append(f"- {ln}")
 
         return "\n".join(out)
+
+    def _build_active_task_heartbeat_context(self, query: str, top_k: int = 6) -> str:
+        queries = [query, "task heartbeat", "active issue", "what were we working on"]
+        seen: set[str] = set()
+        lines: List[str] = []
+
+        for candidate in queries:
+            if not candidate:
+                continue
+            try:
+                rows = self.memory.search(
+                    candidate,
+                    top_k=max(1, int(top_k)),
+                    include_kinds=["note", "fact", "interaction", "procedure"],
+                    include_tags=["task_state", "heartbeat", "active_issue"],
+                )
+            except Exception:
+                rows = []
+
+            for item in rows or []:
+                txt = str(item.get("text") or "").strip()
+                if not txt:
+                    continue
+                key = txt.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                lines.append(f"- {txt}")
+                if len(lines) >= max(1, int(top_k)):
+                    break
+            if len(lines) >= max(1, int(top_k)):
+                break
+
+        if not lines:
+            return ""
+
+        return "Task heartbeat:\n" + "\n".join(lines)
+
+    def _build_hardware_followup_context(self, query: str, top_k: int = 3) -> str:
+        lowered = str(query or "").lower()
+        if not re.search(r"\b(cpu|processor|gpu|graphics|ram|memory|hardware|system)\b", lowered):
+            return ""
+        if not re.search(r"\b(situation|issue|problem|status|condition|need|concern|about|doing)\b", lowered):
+            return ""
+
+        try:
+            rows = self.memory.search(
+                "hardware CPU GPU RAM memory system",
+                top_k=max(1, int(top_k)),
+                include_kinds=["fact"],
+                include_tags=["hardware_snapshot"],
+            )
+        except Exception:
+            rows = []
+
+        lines: List[str] = []
+        seen = set()
+        for item in rows or []:
+            text = self._compact_working_memory_line(str(item.get("text") or ""), max_chars=900)
+            if not text or text.lower() in seen:
+                continue
+            seen.add(text.lower())
+            lines.append(f"- {text}")
+
+        return "Hardware snapshot memory:\n" + "\n".join(lines) if lines else ""
+
+    def _build_long_term_archive_context(self, query: str, top_k: int = 5) -> str:
+        lowered = str(query or "").lower()
+        history_signal = re.search(
+            r"\b(months?|weeks?|older|history|historical|past|previous|before|back then|long thread|what did we decide|what were we working on)\b",
+            lowered,
+        ) is not None
+        topic_signal = re.search(
+            r"\b(project|bridge|ostranauts|memory|hardware|cpu|gpu|ram|script|tool|avatar|api)\b",
+            lowered,
+        ) is not None
+        if not history_signal or not topic_signal:
+            return ""
+
+        try:
+            rows = self.memory.search(
+                query,
+                top_k=max(1, int(top_k)),
+                include_kinds=["fact", "preference", "procedure", "note", "interaction"],
+                include_tags=[
+                    "user_memory",
+                    "long_term",
+                    "conversation_digest",
+                    "learning_lesson",
+                    "hardware_snapshot",
+                    "ostranauts",
+                ],
+            )
+        except Exception:
+            rows = []
+
+        lines: List[str] = []
+        seen = set()
+        stop_words = {
+            "about", "ago", "did", "months", "month", "what", "were", "we",
+            "the", "our", "this", "that", "with", "have", "had", "decide", "decided",
+        }
+        query_terms = {
+            token for token in re.findall(r"[a-z0-9]+", lowered)
+            if len(token) > 2 and token not in stop_words
+        }
+        for item in rows or []:
+            raw_text = str(item.get("text") or "")
+            text_terms = set(re.findall(r"[a-z0-9]+", raw_text.lower()))
+            if query_terms and not query_terms.intersection(text_terms):
+                continue
+            text = self._compact_working_memory_line(raw_text, max_chars=700)
+            if not text or text.lower() in seen:
+                continue
+            seen.add(text.lower())
+            lines.append(f"- {text}")
+            if len(lines) >= max(1, int(top_k)):
+                break
+
+        if not lines:
+            return (
+                "Historical memory archive: no grounded matching record was found. "
+                "Do not invent historical details or treat absent history as fact."
+            )
+        return (
+            "Historical memory archive: remembered evidence, not current game state.\n"
+            + "\n".join(lines)
+            + "\nUse live telemetry or source files for present-state claims."
+        )
+
+    def _relevant_recent_turns(
+        self,
+        query: str,
+        recent_turns: List[Dict[str, Any]],
+        max_items: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Keep only recent turns with direct lexical overlap to the query."""
+        stop_words = {
+            "a", "about", "am", "an", "and", "are", "can", "did", "do", "for",
+            "have", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or",
+            "that", "the", "this", "to", "was", "what", "when", "where", "who",
+            "why", "with", "you", "your",
+        }
+        query_terms = {
+            token
+            for token in re.findall(r"[a-z0-9]+", str(query or "").lower())
+            if len(token) > 2 and token not in stop_words
+        }
+        if not query_terms:
+            return []
+
+        ranked: List[Tuple[int, int, Dict[str, Any]]] = []
+        for position, item in enumerate(recent_turns or []):
+            text = str(item.get("text") or "").strip()
+            text_terms = set(re.findall(r"[a-z0-9]+", text.lower()))
+            overlap = len(query_terms & text_terms)
+            if overlap:
+                ranked.append((overlap, -position, item))
+
+        ranked.sort(key=lambda entry: (-entry[0], -entry[1]))
+        return [item for _score, _position, item in ranked[:max(1, int(max_items))]]
 
     def build_context(self, query: str) -> str:
         try:
@@ -10380,6 +10611,7 @@ class MK1Core:
                 include_kinds=["interaction"],
                 include_tags=["short_term"],
             )
+            recent_turns = self._relevant_recent_turns(query, recent_turns)
 
             short_semantic = self.memory.search(
                 query,
@@ -10387,6 +10619,11 @@ class MK1Core:
                 include_kinds=["interaction"],
                 include_tags=["short_term"],
             )
+
+            task_heartbeat = self._build_active_task_heartbeat_context(query, top_k=6)
+
+            hardware_followup = self._build_hardware_followup_context(query, top_k=3)
+            archive_context = self._build_long_term_archive_context(query, top_k=5)
 
             lesson_semantic = self._learned_lesson_results(query, top_k=6)
 
@@ -10396,43 +10633,68 @@ class MK1Core:
                 include_kinds=["fact", "tool", "preference", "procedure"],
             )
 
-            if not recent_turns and not short_semantic and not lesson_semantic and not long_semantic:
+            if not recent_turns and not short_semantic and not lesson_semantic and not long_semantic and not task_heartbeat and not hardware_followup and not archive_context:
                 return ""
 
             lines: List[str] = []
             seen = set()
+            context_char_budget = 12000
+            context_chars = 0
+
+            def append_memory_line(text: str) -> bool:
+                nonlocal context_chars
+                compact = self._compact_working_memory_line(text, max_chars=900)
+                if not compact or compact.lower() in seen:
+                    return True
+                if compact.lower().startswith((
+                    "code_artifact::",
+                    "mina_capability_snapshot::",
+                    "mina_capability_delta::",
+                )):
+                    return True
+                if context_chars + len(compact) + 2 > context_char_budget:
+                    return False
+                seen.add(compact.lower())
+                lines.append(f"- {compact}")
+                context_chars += len(compact) + 2
+                return True
+
+            if task_heartbeat:
+                lines.append(task_heartbeat)
+                context_chars += len(task_heartbeat)
+
+            if hardware_followup:
+                lines.append(hardware_followup)
+                context_chars += len(hardware_followup)
+
+            if archive_context:
+                lines.append(archive_context)
+                context_chars += len(archive_context)
 
             short_items = recent_turns + short_semantic
             if short_items:
+                if lines:
+                    lines.append("")
                 lines.append("Short-term recall:")
                 for r in short_items:
-                    txt = r.get("text", "").strip()
-                    if not txt or txt in seen:
-                        continue
-                    seen.add(txt)
-                    lines.append(f"- {txt}")
+                    if not append_memory_line(str(r.get("text", "")).strip()):
+                        break
 
             if long_semantic:
                 if lines:
                     lines.append("")
                 lines.append("Long-term recall:")
                 for r in long_semantic:
-                    txt = r.get("text", "").strip()
-                    if not txt or txt in seen:
-                        continue
-                    seen.add(txt)
-                    lines.append(f"- {txt}")
+                    if not append_memory_line(str(r.get("text", "")).strip()):
+                        break
 
             if lesson_semantic:
                 if lines:
                     lines.append("")
                 lines.append("Learned lessons:")
                 for r in lesson_semantic:
-                    txt = r.get("text", "").strip()
-                    if not txt or txt in seen:
-                        continue
-                    seen.add(txt)
-                    lines.append(f"- {txt}")
+                    if not append_memory_line(str(r.get("text", "")).strip()):
+                        break
 
             if not lines:
                 return ""
@@ -11543,7 +11805,20 @@ class MK1Core:
 
             low_query = (user_input or "").strip().lower()
 
-            if tool_name == "ps_run" and result.get("ok") and self._is_hardware_like_query(user_input):
+            command_text = " ".join(
+                str(tool_args.get(key) or "")
+                for key in ("command", "script")
+            )
+            hardware_probe_signal = re.search(
+                r"\b(?:win32_(?:processor|videocontroller|operatingsystem|computer system)|"
+                r"adapterram|loadpercentage|totalvisiblememorysize|freephysicalmemory|"
+                r"get-computerinfo)\b",
+                command_text.lower(),
+            ) is not None
+
+            if tool_name == "ps_run" and result.get("ok") and (
+                self._is_hardware_like_query(user_input) or hardware_probe_signal
+            ):
                 snapshot = self._compress_multiline(formatted, max_lines=10, max_chars=1000)
                 if snapshot:
                     mem_text = f"hardware_snapshot::{low_query} => {snapshot}"
@@ -12559,6 +12834,10 @@ IMPORTANT RULES:
                 "track_query": play_shorthand_track,
             }
 
+        explicit_music_intent = self._detect_explicit_music_intent(raw_text)
+        if explicit_music_intent is not None:
+            return explicit_music_intent
+
         ambiguity_prompt = self._maybe_build_ambiguity_prompt(raw_text, intent_signals=intent_signals)
         if ambiguity_prompt:
             return "__clarify_intent__", {"question": ambiguity_prompt}
@@ -12591,91 +12870,14 @@ IMPORTANT RULES:
 
         def _infer_ps_command(text_value: str) -> str:
             query = str(text_value or "").strip()
-            lowered_query = query.lower()
-
-            query = re.sub(
-                r"^(?:[a-z0-9_]+\s+)?(?:hey|hi|hello|yo|sup)\b[\s,.:!-]*",
-                "",
-                query,
-                flags=re.IGNORECASE,
-            ).strip()
-            query = re.sub(
-                r"^(?:mina|travis|assistant|buddy|hottie)\b[\s,.:!-]*",
-                "",
-                query,
-                flags=re.IGNORECASE,
-            ).strip()
-            lowered_query = query.lower()
-
-            if lowered_query in {"hardware info", "list hardware", "list the current hardware"}:
-                return "Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsHardwareAbstractionLayer"
-
-            if lowered_query in {"gpu info", "graphics info"}:
-                return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
-
-            # Why: count-style hardware questions should use the same execution path as other system queries.
-            # Guard: keeps "how many ..." prompts from falling back to chat while avoiding per-phrase branching.
-            if re.search(r"\bhow many\b.*\b(gpu|gpus|graphics|video controller)\b", lowered_query) or re.search(r"\b(gpu|gpus|graphics|video controller)\b.*\bhow many\b", lowered_query):
-                return "(Get-CimInstance Win32_VideoController).Count"
-
-            if re.search(r"\b(number of|count of|how many|how much)\b.*\b(hard drive|hard drives|disk drive|disk drives|drive|drives)\b", lowered_query) or re.search(r"\b(hard drive|hard drives|disk drive|disk drives|drive|drives)\b.*\b(number of|count of|how many|how much)\b", lowered_query):
-                return "(Get-CimInstance Win32_DiskDrive).Count"
-
-            if lowered_query in {"cpu info", "processor info"}:
-                return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
-
-            if lowered_query in {"memory info", "ram info"}:
-                return "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory"
-
-            if lowered_query in {"what time is it", "current time", "local time", "time now"}:
-                return 'Get-Date -Format "yyyy-MM-dd HH:mm:ss"'
-
-            if lowered_query in {"what date is it", "current date", "today\'s date", "todays date"}:
-                return 'Get-Date -Format "yyyy-MM-dd"'
-
-            if re.search(r"\b(probe|check|inspect|query|scan)\b.*\b(cpu|processor)\b", lowered_query) or re.search(r"\b(cpu|processor)\b.*\b(probe|check|inspect|query|scan)\b", lowered_query):
-                return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
-
-            if re.search(r"\b(what|current|local)\b.*\btime\b", lowered_query):
-                return 'Get-Date -Format "yyyy-MM-dd HH:mm:ss"'
-
-            if re.search(r"\b(what|current)\b.*\bdate\b", lowered_query):
-                return 'Get-Date -Format "yyyy-MM-dd"'
-
-            if re.search(r"\bwhat\b.*\bcpu\b", lowered_query):
-                return "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, MaxClockSpeed"
-
-            if re.search(r"\bwhat\b.*\bgpu\b", lowered_query):
-                return "Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM"
-
-            if re.search(r"\bhow many\b.*\b(gpu|gpus|graphics|video controller)\b", lowered_query) or re.search(r"\b(gpu|gpus|graphics|video controller)\b.*\bhow many\b", lowered_query):
-                return "(Get-CimInstance Win32_VideoController).Count"
-
-            if re.search(r"\b(number of|count of|how many|how much)\b.*\b(hard drive|hard drives|disk drive|disk drives|drive|drives)\b", lowered_query) or re.search(r"\b(hard drive|hard drives|disk drive|disk drives|drive|drives)\b.*\b(number of|count of|how many|how much)\b", lowered_query):
-                return "(Get-CimInstance Win32_DiskDrive).Count"
-
-            if re.search(r"\bwhat\b.*\b(ram|memory)\b", lowered_query):
-                return "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory"
-
-            if re.search(r"\bwhat\b.*\b(system|spec|specs|os|platform|hardware)\b", lowered_query):
-                return "Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsHardwareAbstractionLayer"
-
-            if re.search(r"\b(run|execute|show|list|get)\b", lowered_query):
-                if "powershell" in lowered_query or "ps" in lowered_query:
-                    query = re.sub(r"\bpowershell\b", "", query, count=1, flags=re.IGNORECASE).strip()
-                    query = re.sub(r"\bps\b", "", query, count=1, flags=re.IGNORECASE).strip()
-
-            if query.startswith('"') and query.endswith('"'):
-                query = query[1:-1]
-
             try:
                 from tools.ps_run import _normalize_command as _normalize_ps_command
+
                 normalized = _normalize_ps_command(query)
                 if normalized:
                     return normalized
             except Exception:
                 traceback.print_exc()
-
             return query
 
         # ====================================================
@@ -13817,46 +14019,6 @@ IMPORTANT RULES:
         # POWERSHELL SCRIPT EXECUTION (ps_run)
         # ====================================================
 
-        system_query_terms = [
-            "what system",
-            "what machine",
-            "what host",
-            "what computer",
-            "what os",
-            "what operating system",
-            "what platform",
-            "what hardware",
-            "system specs",
-            "system info",
-            "hardware info",
-            "list hardware",
-            "list the current hardware",
-            "gpu info",
-            "cpu info",
-            "memory info",
-            "specs",
-            "specification",
-            "show system",
-            "show specs",
-            "what time is it",
-            "current time",
-            "local time",
-            "time now",
-            "what date is it",
-            "current date",
-            "today's date",
-            "todays date",
-        ]
-
-        # Why: hardware-count phrasing is a stable system-query class, not a one-off prompt hack.
-        # Guard: routes "how many ..." hardware questions through the same ps_run branch as other system intents.
-        hardware_count_query = (
-            re.search(r"\bhow many\b.*\b(cpu|gpu|gpus|graphics|ram|memory|disk|storage|hard drive|hard drives|drive|drives)\b", t) is not None
-            or re.search(r"\b(cpu|gpu|gpus|graphics|ram|memory|disk|storage|hard drive|hard drives|drive|drives)\b.*\bhow many\b", t) is not None
-            or re.search(r"\b(number of|count of|how many|how much)\b.*\b(cpu|gpu|gpus|graphics|ram|memory|disk|storage|hard drive|hard drives|drive|drives)\b", t) is not None
-            or re.search(r"\b(cpu|gpu|gpus|graphics|ram|memory|disk|storage|hard drive|hard drives|drive|drives)\b.*\b(number of|count of|how many|how much)\b", t) is not None
-        )
-
         # Why: _validate_required_tool_routes() fails startup unless "probe the CPU" routes to ps_run.
         # Guard: narrow probe/check/inspect verb + cpu/processor noun only; does not resurrect the
         # removed hardware_count_query/system_query_terms keyword routing (model decides those; see
@@ -13880,17 +14042,6 @@ IMPORTANT RULES:
                 return "ps_run", {
                     "script": _infer_ps_command(raw_text)
                 }
-
-        if any(x in t for x in [
-            "file index",
-            "index files",
-            "indexed files",
-            "common files",
-            "where files are",
-        ]):
-            if any(y in t for y in ["refresh", "rebuild", "rescan", "update index", "reindex"]):
-                return "__file_index_refresh__", {}
-            return "__file_index_status__", {}
 
         file_dir_intent = self._detect_file_directory_intent(
             text=original_text,
@@ -14606,6 +14757,7 @@ IMPORTANT RULES:
                 "seconds_since_last_shutdown": seconds_since_shutdown,
                 "away_nag_threshold_seconds": self.away_nag_threshold_seconds,
                 "away_nag_pending": self._away_nag_prompt_pending,
+                "last_process_timings": dict(getattr(self, "_last_process_timings", {})),
                 "memory_engine": self.memory.verify_integrity(),
                 "level": "NORMAL",
             }

@@ -174,6 +174,23 @@ def test_play_title_request_routes_directly_without_generic_play_clarify():
     assert args["track_query"] == "scissorhands"
 
 
+def test_explicit_music_intent_restores_song_and_playlist_actions():
+    core = _core_with_spotify()
+
+    song_tool, song_args = core.detect_tool_intent("play scissorhands")
+    playlist_tool, playlist_args = core.detect_tool_intent(
+        "Add 10 upbeat techno tracks to my Ostranauts playlist"
+    )
+
+    assert song_tool == "spotify_link"
+    assert song_args == {"action": "play_track", "track_query": "scissorhands"}
+    assert playlist_tool == "spotify_link"
+    assert playlist_args["action"] == "add_tracks_to_playlist"
+    assert playlist_args["playlist_name"] == "Ostranauts"
+    assert playlist_args["track_query"] == "upbeat techno"
+    assert playlist_args["limit"] == 10
+
+
 def test_play_with_me_stays_conversational_not_spotify_hijack():
     core = _core_with_spotify()
     core._intent_alias_cache = {}
@@ -250,7 +267,7 @@ def test_info_query_alias_can_apply_for_general_learning():
     assert args["script"] == "Get-Date"
 
 
-def test_deterministic_route_beats_stale_alias_before_replay():
+def test_model_owned_time_query_does_not_replay_stale_alias_immediately():
     core = _core_with_tools(["spotify_link", "ps_run"])
     core._intent_alias_cache = {
         "what time is it": {
@@ -261,8 +278,8 @@ def test_deterministic_route_beats_stale_alias_before_replay():
 
     tool, args = core.detect_tool_intent("what time is it")
 
-    assert tool == "ps_run"
-    assert args["script"] == "what time is it"
+    assert tool == "__clarify_intent__"
+    assert "learned shortcut" in str(args.get("question") or "").lower()
 
 
 def test_internal_virtual_alias_is_never_replayed():

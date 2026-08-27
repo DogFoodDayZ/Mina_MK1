@@ -62,7 +62,10 @@ class HybridEmbedder:
         return (x - mean) / np.sqrt(var + eps)
 
     def embed(self, text: str) -> List[float]:
-        token_ids = self.tokenizer.encode(text)
+        # Keep the token sequence within the positional embedding table. The
+        # memory client caps characters, but whitespace-heavy tool output can
+        # still exceed the model's maximum token length.
+        token_ids = self.tokenizer.encode(text)[: self.pos_emb.shape[0]]
         if not token_ids:
             return [0.0] * self.dim_out
 

@@ -2552,6 +2552,40 @@ def memory_flush_buffer(max_items: int = 200):
         return {"ok": False, "error": str(e), "result": None}
 
 
+@app.get("/memory/hygiene")
+def memory_hygiene_audit(max_delete: int = 500):
+    mem = getattr(core, "memory", None)
+    if mem is None or not hasattr(mem, "memory_hygiene"):
+        return {"ok": False, "error": "memory_hygiene_not_supported", "result": None}
+    try:
+        safe_max = max(1, min(2000, int(max_delete)))
+        return mem.memory_hygiene(dry_run=True, max_delete=safe_max)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "result": None}
+
+
+@app.post("/memory/hygiene/apply")
+def memory_hygiene_apply(max_delete: int = 500, authorized_apply: bool = False):
+    mem = getattr(core, "memory", None)
+    if mem is None or not hasattr(mem, "memory_hygiene"):
+        return {"ok": False, "error": "memory_hygiene_not_supported", "result": None}
+    if not authorized_apply:
+        return {
+            "ok": False,
+            "error": "memory_mutation_requires_explicit_authorization",
+            "result": None,
+        }
+    try:
+        safe_max = max(1, min(2000, int(max_delete)))
+        return mem.memory_hygiene(
+            dry_run=False,
+            max_delete=safe_max,
+            authorized_apply=True,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e), "result": None}
+
+
 @app.post("/memory/retention")
 def memory_retention(dry_run: bool = True, max_delete: int = 1000):
     mem = getattr(core, "memory", None)

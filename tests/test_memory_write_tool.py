@@ -58,4 +58,43 @@ def test_memory_write_deduplicates_existing_user_memory_fact():
     assert out['id'] == 777
     assert out['stored'] == 'my eyes are blue'
     assert out['deduplicated'] is True
-    assert fake.add_called is False
+
+
+class _FakeMemoryCapture:
+    def __init__(self):
+        self.captured = None
+
+    def find_memory_id_by_text(self, *args, **kwargs):
+        return None
+
+    def add_memory(self, text, *args, **kwargs):
+        self.captured = text
+        return 555
+
+
+def test_memory_write_preserves_mid_clause_remember_that():
+    # Transcript 2026-09-16: "...you may want to remember that." was truncated to
+    # "...you may want to" by a blind endswith("remember that") strip.
+    fake = _FakeMemoryCapture()
+    with patch('memory.mk1_memory.MK1Memory', return_value=fake):
+        out = memory_write.tool_entry({
+            'text': 'We live in Spokane Washington you may want to remember that.',
+            'kind': 'fact',
+            'tags': ['user_memory'],
+        })
+
+    assert out['ok'] is True
+    assert out['stored'].lower().endswith('remember that')
+
+
+def test_memory_write_strips_standalone_trailing_remember_that():
+    fake = _FakeMemoryCapture()
+    with patch('memory.mk1_memory.MK1Memory', return_value=fake):
+        out = memory_write.tool_entry({
+            'text': 'We live in Spokane Washington, remember that.',
+            'kind': 'fact',
+            'tags': ['user_memory'],
+        })
+
+    assert out['ok'] is True
+    assert out['stored'].lower() == 'we live in spokane washington'

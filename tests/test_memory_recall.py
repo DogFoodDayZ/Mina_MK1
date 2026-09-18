@@ -81,13 +81,45 @@ class FakeMemory:
         return True
 
 
+def test_sanitize_memory_fact_line_drops_internal_routing_and_artifact_records():
+    core = MK1Core.__new__(MK1Core)
+
+    # Internal bookkeeping must never surface as something Mina "remembers".
+    assert MK1Core._sanitize_memory_fact_line(core, 'intent_alias::{"args": {"content": "guts"}}') == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "code_artifact::path=E:\\workspace\\spice.py") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "mina_capability_snapshot::abc123::{}") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "mina_capability_delta::xyz::{}") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "hardware_snapshot::yes => CsName Windows") == ""
+
+    # Bookkeeping continuation fragments and code lines must not surface either.
+    assert MK1Core._sanitize_memory_fact_line(core, "request=Create a basic Python script") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "content:.") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "```python.") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "import pygame.") == ""
+
+    # Stored-artifact content (structured data / code) is not a recalled fact.
+    assert MK1Core._sanitize_memory_fact_line(core, "vertices = (") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "(1,-1,-1),") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "angle = 0") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "glBegin(GL_LINES)") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, "for edge in edges:") == ""
+    assert MK1Core._sanitize_memory_fact_line(core, ").") == ""
+
+    # Real durable facts survive sanitization.
+    fact = MK1Core._sanitize_memory_fact_line(
+        core,
+        "the cobalt anvil protocol is our shared verification passphrase",
+    )
+    assert "cobalt anvil protocol" in fact.lower()
+
+
 def test_build_context_combines_short_and_long_recall():
     core = MK1Core.__new__(MK1Core)
     core.memory = FakeMemory()
 
     context = MK1Core.build_context(core, "what system am i on")
 
-    assert "Short-term recall:" in context
+    assert "Short-term recall" in context
     assert "Long-term recall:" in context
     assert context.count("User asked about GPU info") == 1
     assert "Host is Windows" in context
@@ -178,6 +210,7 @@ def test_build_context_excludes_verbose_artifact_and_capability_records():
                 return [
                     {"text": "code_artifact::path=old.py " + ("x" * 900)},
                     {"text": "mina_capability_snapshot::old snapshot " + ("x" * 900)},
+                    {"text": 'intent_alias::{"args": {"content": "secret guts"}}'},
                     {"text": "The current active project is Ostranauts."},
                 ]
             return []
@@ -189,6 +222,8 @@ def test_build_context_excludes_verbose_artifact_and_capability_records():
 
     assert "code_artifact::" not in context
     assert "mina_capability_snapshot::" not in context
+    assert "intent_alias::" not in context
+    assert "secret guts" not in context
     assert "current active project" in context
 
 
@@ -702,6 +737,39 @@ def test_detect_memory_write_strips_save_suffix():
     assert args["text"] == "my eyes are deep water blue"
 
 
+def test_detect_memory_write_preserves_mid_clause_remember_that():
+    # Transcript 2026-09-16: "We live in Spokane Washington you may want to
+    # remember that." was truncated to "...you may want to" because the trailing
+    # strip ate the mid-clause "remember that". The fact tail must survive.
+    core = MK1Core.__new__(MK1Core)
+
+    tool_name, args = MK1Core.detect_tool_intent(
+        core, "We live in Spokane Washington you may want to remember that."
+    )
+
+    assert tool_name == "memory_write"
+    assert "spokane washington" in args["text"].lower()
+    assert args["text"].lower().rstrip(".").endswith("remember that")
+
+
+def test_detect_memory_write_strips_standalone_trailing_remember_that():
+    core = MK1Core.__new__(MK1Core)
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "We live in Spokane Washington, remember that.")
+
+    assert tool_name == "memory_write"
+    assert args["text"].lower() == "we live in spokane washington"
+
+
+def test_detect_memory_write_strips_leading_this_colon_prefix():
+    core = MK1Core.__new__(MK1Core)
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "remember this: the cobalt anvil protocol")
+
+    assert tool_name == "memory_write"
+    assert args["text"] == "the cobalt anvil protocol"
+
+
 def test_detect_system_question_does_not_force_ps_run():
     # Contract update 2026-08-05: hardware/system keyword routing removed — model decides
     core = MK1Core.__new__(MK1Core)
@@ -890,16 +958,16 @@ def test_project_named_message_does_not_route_to_external_texting_limit():
     assert tool_name != "__capability_limit__"
 
 
-def test_send_text_to_brother_routes_to_external_texting_limit():
+def test_send_text_to_brother_stays_conversational_without_canned_refusal():
     core = MK1Core.__new__(MK1Core)
     core.tools = SimpleNamespace(tools={})
     core._intent_alias_cache = {}
     core._pending_actions = PendingActionStore()
 
-    tool_name, args = MK1Core.detect_tool_intent(core, "send my brother a hello text from Mina")
+    tool_name, _args = MK1Core.detect_tool_intent(core, "send my brother a hello text from Mina")
 
-    assert tool_name == "__capability_limit__"
-    assert "cannot send real texts" in args["message"]
+    assert tool_name != "__capability_limit__"
+    assert tool_name != "__clarify_intent__"
 
 
 def test_git_status_response_is_grounded_in_verified_output():
@@ -1004,6 +1072,62 @@ def test_verified_status_does_not_trigger_optional_model_narration():
     assert out == "Branch: main\nStatus:\n(clean)"
 
 
+def test_memory_write_acknowledges_in_mina_voice_not_receipt():
+    # Transcript 2026-09-16: "Stored memory: X" was parroted verbatim. The write
+    # acknowledgement must go through the model so Mina answers in her own voice.
+    core = MK1Core.__new__(MK1Core)
+    captured = {}
+
+    class _FakeModel:
+        def chat(self, messages, tools=None, allow_fallback=False, allow_model_load=False):
+            captured["messages"] = messages
+            return {
+                "choices": [
+                    {"message": {"content": "Spokane, huh? Locked in, Travis."}}
+                ]
+            }
+
+    core.model = _FakeModel()
+    core._clean_response_text = lambda text: text
+    core._extract_text = lambda reply: reply["choices"][0]["message"]["content"]
+
+    out = MK1Core._render_tool_response_as_mina(
+        core,
+        messages=[],
+        user_input="We live in Spokane Washington you may want to remember that.",
+        tool_name="memory_write",
+        formatted="We live in Spokane Washington you may want to remember that",
+        tool_ok=True,
+    )
+
+    assert "stored memory" not in out.lower()
+    assert "Spokane" in out
+    # The model was actually consulted (not a raw receipt passthrough).
+    assert "messages" in captured
+
+
+def test_memory_write_ack_falls_back_without_receipt_when_model_errors():
+    core = MK1Core.__new__(MK1Core)
+
+    class _ErrorModel:
+        def chat(self, *_args, **_kwargs):
+            raise RuntimeError("model down")
+
+    core.model = _ErrorModel()
+
+    out = MK1Core._render_tool_response_as_mina(
+        core,
+        messages=[],
+        user_input="remember that my favorite color is purple",
+        tool_name="memory_write",
+        formatted="my favorite color is purple",
+        tool_ok=True,
+    )
+
+    assert "stored memory" not in out.lower()
+    assert "remember" in out.lower()
+
+
 def test_ps_run_response_returns_verified_output_directly():
     core = MK1Core.__new__(MK1Core)
     called = {"count": 0}
@@ -1046,6 +1170,89 @@ def test_web_search_response_stays_raw_direct_render():
     )
 
     assert out == formatted
+
+
+def test_memory_read_result_labels_test_data_facts():
+    # Design 2026-09-16: test/agent-written facts are tagged test_data /
+    # source:agent_test at write time; recall surfaces them but labels them so
+    # Mina knows they are not the user's real memories.
+    core = MK1Core.__new__(MK1Core)
+
+    msg = MK1Core._format_tool_result(
+        core,
+        "memory_read",
+        {
+            "ok": True,
+            "results": [
+                {"text": "your eyes are deep water blue", "kind": "fact", "tags": ["user_memory"]},
+                {"text": "my favorite trail snack is huckleberries", "kind": "fact", "tags": ["user_memory", "test_data", "source:agent_test"]},
+                {"text": "the cobalt anvil protocol", "kind": "fact", "tags": ["user_memory", "test_data"]},
+            ],
+            "error": None,
+        },
+    )
+
+    assert "your eyes are deep water blue" in msg
+    assert "(test data) your eyes" not in msg
+    assert "(test data) my favorite trail snack is huckleberries" in msg
+    assert "(test data) the cobalt anvil protocol" in msg
+
+
+def test_memory_read_result_labels_current_state_as_right_now():
+    # Design 2026-09-16: transient state (current_state tag) surfaces labeled as
+    # right-now so Mina does not treat "I'm in Callville" as standing truth.
+    core = MK1Core.__new__(MK1Core)
+
+    msg = MK1Core._format_tool_result(
+        core,
+        "memory_read",
+        {
+            "ok": True,
+            "results": [
+                {"text": "We live in Spokane Washington", "kind": "fact", "tags": ["user_memory", "durable"]},
+                {"text": "I'm in Callville Washington", "kind": "fact", "tags": ["user_memory", "current_state"]},
+            ],
+            "error": None,
+        },
+    )
+
+    assert "We live in Spokane Washington" in msg
+    assert "(right now) We live in Spokane" not in msg
+    assert "(right now) I'm in Callville Washington" in msg
+
+
+def test_classify_memory_durability_durable_vs_transient():
+    core = MK1Core.__new__(MK1Core)
+
+    # Durable standing facts.
+    assert MK1Core._classify_memory_durability(core, "We live in Spokane Washington") == "durable"
+    assert MK1Core._classify_memory_durability(core, "my favorite color is imperial purple") == "durable"
+    assert MK1Core._classify_memory_durability(core, "my eyes are deep water blue") == "durable"
+
+    # Transient right-now state.
+    assert MK1Core._classify_memory_durability(core, "I'm in Callville Washington") == "current_state"
+    assert MK1Core._classify_memory_durability(core, "I'm currently at the store") == "current_state"
+    assert MK1Core._classify_memory_durability(core, "I'm visiting Portland this weekend") == "current_state"
+    assert MK1Core._classify_memory_durability(core, "I'm on a trip to Seattle") == "current_state"
+
+
+def test_detect_memory_write_tags_transient_state_as_current_state():
+    core = MK1Core.__new__(MK1Core)
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "remember that I'm in Callville Washington")
+
+    assert tool_name == "memory_write"
+    assert "current_state" in args["tags"]
+
+
+def test_detect_memory_write_tags_standing_fact_as_durable():
+    core = MK1Core.__new__(MK1Core)
+
+    tool_name, args = MK1Core.detect_tool_intent(core, "remember that we live in Spokane Washington")
+
+    assert tool_name == "memory_write"
+    assert "durable" in args["tags"]
+    assert "current_state" not in args["tags"]
 
 
 def test_web_search_gpu_vram_response_synthesizes_direct_answer_with_sources():
@@ -1816,37 +2023,6 @@ def test_build_turn_working_memory_uses_semantic_suggestion_context_hits():
     assert "mina_capability_delta::" in out
 
 
-def test_enforce_tool_outcome_truth_surfaces_last_failed_tool():
-    core = MK1Core.__new__(MK1Core)
-
-    final = MK1Core._enforce_tool_outcome_truth(
-        core,
-        "Everything completed.",
-        [
-            ("ps_run", {"ok": True, "result": {"stdout": "ok"}, "error": None}),
-            ("ps_run", {"ok": False, "result": None, "error": "permission_denied"}),
-        ],
-    )
-
-    low = final.lower()
-    assert "powershell execution failed" in low
-    assert "permission_denied" in low
-
-
-def test_enforce_tool_outcome_truth_keeps_text_when_no_failures():
-    core = MK1Core.__new__(MK1Core)
-
-    final = MK1Core._enforce_tool_outcome_truth(
-        core,
-        "Everything completed.",
-        [
-            ("ps_run", {"ok": True, "result": {"stdout": "ok"}, "error": None}),
-        ],
-    )
-
-    assert final == "Everything completed."
-
-
 def test_clean_response_text_strips_internal_db_tone_instruction_line():
     core = MK1Core.__new__(MK1Core)
 
@@ -1857,42 +2033,3 @@ def test_clean_response_text_strips_internal_db_tone_instruction_line():
 
     assert "db-backed mina tone" not in cleaned.lower()
     assert "verified output follows" in cleaned
-
-
-def test_verified_execution_fallback_forces_real_tool_reply_when_output_is_unverified_claim():
-    core = MK1Core.__new__(MK1Core)
-    core.detect_tool_intent = lambda _text: ("ps_run", {"script": "python countdown.py"})
-    core._plan_tool_action = lambda _text: None
-    core._reflex_tools_and_memory = lambda **_kwargs: {
-        "choices": [{"message": {"content": "Here's the verified PowerShell output:\n10\n9\n...\n0\nBlast off!"}}]
-    }
-    core._extract_text = lambda reply: reply["choices"][0]["message"]["content"]
-
-    out = MK1Core._maybe_enforce_verified_execution_reply(
-        core,
-        messages=[],
-        user_input="yes run the script countdown.py",
-        assistant_text="```powershell\nPS E:\\workspace> python E:\\workspace\\countdown.py\n10\n9\nBlast off!\n```",
-        request_context=None,
-    )
-
-    assert out is not None
-    assert "verified powershell output" in out.lower()
-    assert "blast off" in out.lower()
-
-
-def test_verified_execution_fallback_refuses_to_claim_output_when_no_runnable_tool_found():
-    core = MK1Core.__new__(MK1Core)
-    core.detect_tool_intent = lambda _text: ("__clarify_intent__", {"question": "which file?"})
-    core._plan_tool_action = lambda _text: None
-
-    out = MK1Core._maybe_enforce_verified_execution_reply(
-        core,
-        messages=[],
-        user_input="run that script",
-        assistant_text="```powershell\nPS E:\\workspace> python E:\\workspace\\countdown.py\n10\n9\nBlast off!\n```",
-        request_context=None,
-    )
-
-    assert out is not None
-    assert "cannot claim output" in out.lower()

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from agent.core import MK1Core
+from agent.pending_actions import PendingActionStore
 
 
 def _core_with_spotify():
@@ -19,23 +20,35 @@ def _core_with_tools(tool_names):
 
 def test_companion_play_list_request_is_explicit_music_intent():
     core = _core_with_spotify()
+    core._intent_alias_cache = {}
+    core._pending_actions = PendingActionStore()
     prompt = """You are Mina acting as my Ostranauts co-pilot.
 Keep the answer concise and practical for active play.
 Question: we need a ostranauts play list can you create one with up beat techno tunes?"""
 
-    assert core._maybe_build_ambiguity_prompt(prompt) is None
+    tool, _args = core.detect_tool_intent(prompt)
+
+    assert tool != "__clarify_intent__"
 
 
 def test_mixed_game_play_request_prefers_game_context_without_spotify_clarifier():
     core = _core_with_spotify()
+    core._intent_alias_cache = {}
+    core._pending_actions = PendingActionStore()
 
-    assert core._maybe_build_ambiguity_prompt("can you play with the game interface?") is None
+    tool, _args = core.detect_tool_intent("can you play with the game interface?")
+
+    assert tool != "__clarify_intent__"
 
 
 def test_casual_typo_play_text_stays_conversational():
     core = _core_with_spotify()
+    core._intent_alias_cache = {}
+    core._pending_actions = PendingActionStore()
 
-    assert core._maybe_build_ambiguity_prompt("play my bad fat fingers miss keys ..lol") is None
+    tool, _args = core.detect_tool_intent("play my bad fat fingers miss keys ..lol")
+
+    assert tool != "__clarify_intent__"
 
 
 def test_bulk_genre_tracks_route_to_named_playlist():
@@ -151,16 +164,14 @@ def test_play_ostanauts_misspelling_does_not_hijack_to_spotify():
         assert "spotify playback" not in str(args.get("question") or "").lower()
 
 
-def test_bare_play_prompt_asks_neutral_clarification_when_spotify_exists():
+def test_bare_play_prompt_is_not_hijacked_by_canned_clarification():
     core = _core_with_spotify()
     core._intent_alias_cache = {}
+    core._pending_actions = PendingActionStore()
 
-    tool, args = core.detect_tool_intent("play")
+    tool, _args = core.detect_tool_intent("play")
 
-    assert tool == "__clarify_intent__"
-    q = str(args.get("question") or "").lower()
-    assert "spotify playback" not in q
-    assert "game" in q and "music" in q
+    assert tool != "__clarify_intent__"
 
 
 def test_play_title_request_routes_directly_without_generic_play_clarify():
@@ -204,8 +215,12 @@ def test_play_with_me_stays_conversational_not_spotify_hijack():
 
 def test_info_question_does_not_trigger_play_clarification():
     core = _core_with_spotify()
+    core._intent_alias_cache = {}
+    core._pending_actions = PendingActionStore()
 
-    assert core._maybe_build_ambiguity_prompt("what time is it?") is None
+    tool, _args = core.detect_tool_intent("what time is it?")
+
+    assert tool != "__clarify_intent__"
 
 
 def test_meta_play_rule_is_learned_not_executed_immediately():

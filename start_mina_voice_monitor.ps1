@@ -4,7 +4,10 @@ param(
     [string]$VoiceHint = 'en-US-AnaNeural',
     [double]$SpeechThreshold = 0.002,
     [int]$MinSpeechMs = 120,
-    [int]$SilenceMs = 700
+    # 1500ms: 700ms cut users off mid-sentence on any natural pause.
+    [int]$SilenceMs = 1500,
+    [double]$SnrRatio = 3.0,
+    [double]$NoiseFloorAlpha = 0.98
 )
 
 Set-StrictMode -Version Latest
@@ -17,6 +20,9 @@ $voiceScript = Join-Path $PSScriptRoot 'mina_windows_voice_loop.py'
 $logPath = Join-Path $PSScriptRoot 'logs\voice_monitor.log'
 $logDir = Split-Path -Parent $logPath
 $privacyFile = Join-Path $env:TEMP 'mina_voice_monitor.mute'
+# Stop flag: the GUI sets this when the user intentionally stops voice-in, so
+# the monitor does NOT treat that exit as a crash and restart the loop.
+$stopFlagFile = Join-Path $PSScriptRoot '.mk1_voice_stop.flag'
 
 if (-not (Test-Path $logDir)) {
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -137,6 +143,25 @@ function Test-ApiUp {
 }
 
 try {
+    # A device explicitly chosen in the GUI (config/.voice_device.json) wins over
+    # the auto-detected first-input fallback, so Mina listens on the intended mic
+    # instead of grabbing whatever happens to enumerate first.
+    if ($VoiceDevice -lt 0) {
+        $deviceCfg = Join-Path $PSScriptRoot 'config\.voice_device.json'
+        if (Test-Path $deviceCfg) {
+            try {
+                $cfgDev = (Get-Content $deviceCfg -Raw | ConvertFrom-Json).device
+                if ($null -ne $cfgDev -and [int]$cfgDev -ge 0) {
+                    $VoiceDevice = [int]$cfgDev
+                    Write-MonitorLog "Using configured input device index from GUI: $VoiceDevice"
+                }
+            }
+            catch {
+                Write-MonitorLog "Could not read device config; falling back to auto-detect."
+            }
+        }
+    }
+
     if ($VoiceDevice -lt 0) {
         $detectedDevice = Get-DefaultVoiceDevice -PythonExe $pythonExe
         if ($null -ne $detectedDevice) {
@@ -164,6 +189,8 @@ try {
             '--voice-hint', $VoiceHint,
             '--continuous',
             '--speech-threshold', [string]$SpeechThreshold,
+            '--snr-ratio', [string]$SnrRatio,
+            '--noise-floor-alpha', [string]$NoiseFloorAlpha,
             '--silence-ms', [string]$SilenceMs,
             '--min-speech-ms', [string]$MinSpeechMs
         )
@@ -174,6 +201,14 @@ try {
         Write-MonitorLog "Launching voice loop..."
         & $pythonExe @args
         $exitCode = $LASTEXITCODE
+
+        # If the GUI intentionally stopped voice-in, honor it and exit instead of
+        # restarting. Otherwise (crash) restart as the watchdog.
+        if (Test-Path $stopFlagFile) {
+            Write-MonitorLog "Stop flag set; voice-in stopped intentionally. Monitor exiting."
+            Remove-Item -Path $stopFlagFile -Force -ErrorAction SilentlyContinue
+            break
+        }
 
         Write-MonitorLog "Voice loop exited with code $exitCode. Restarting in 2 seconds..."
         Start-Sleep -Seconds 2

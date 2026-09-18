@@ -649,15 +649,14 @@ fn set_tracked_pid(pid: Option<u32>) {
 }
 
 fn find_windows_voice_pid() -> Result<Option<u32>, String> {
-    let script_name = voice_helper_script_name();
-    let probe = format!(
-        "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{}*' }} | Select-Object -First 1 -ExpandProperty ProcessId",
-        script_name
-    );
+    // The standalone monitor runs mina_windows_voice_loop.py. Match that directly
+    // (the helper-script name was the old Tauri-native path, now gated off).
+    let probe = "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*mina_windows_voice_loop.py*' } | Select-Object -First 1 -ExpandProperty ProcessId".to_string();
     let out = run_powershell(&probe)?;
     if !out.status.success() {
         return Ok(None);
     }
+
     let raw = String::from_utf8_lossy(&out.stdout).to_string();
     let pid = raw
         .lines()
@@ -711,6 +710,17 @@ fn wait_for_voice_monitor_running(timeout: Duration) -> Result<Option<u32>, Stri
 }
 
 fn ensure_voice_helper() -> Result<(), String> {
+    // The standalone voice monitor (start_mina_voice_monitor.ps1 +
+    // mina_windows_voice_loop.py) is the single owner of voice input. The
+    // Tauri-native helper spawned a second python loop that fought the monitor
+    // for the mic and caused the restart cycling. Gate it off so the GUI's
+    // voice buttons drive ONLY the standalone monitor.
+    #[allow(unreachable_code)]
+    {
+        return Err("voice_helper_disabled: voice input is owned by the standalone monitor (start_mina_voice_monitor.ps1)".to_string());
+    }
+
+    #[allow(unreachable_code)]
     let mut guard = VOICE_CHILD.lock().map_err(|_| "voice child mutex poisoned")?;
 
     if let Some(child) = guard.as_mut() {
@@ -904,43 +914,34 @@ exit $ec
 
 #[tauri::command]
 fn voice_get_input_device() -> Result<VoiceDeviceConfig, String> {
-    let script_path = ps_single_quote(&voice_helper_script_path());
-    let script = format!(
-        "$p='{path}'; $in=Select-String -Path $p -Pattern '^INPUT_DEVICE\\s*=\\s*(\\d+)' | Select-Object -First 1; $out=Select-String -Path $p -Pattern '^OUTPUT_DEVICE\\s*=\\s*(\\d+)' | Select-Object -First 1; $i=if($in){{$in.Matches[0].Groups[1].Value}}else{{'1'}}; $o=if($out){{$out.Matches[0].Groups[1].Value}}else{{'3'}}; Write-Output \"$i,$o\"",
-        path = script_path,
-    );
-    let out = run_powershell(&script)?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).to_string();
-        return Err(format!("read input/output device failed: {err}"));
+    // Single shared config: config/.voice_device.json (the monitor reads this).
+    let cfg_path = Path::new(&mk1_root_dir()).join("config").join(".voice_device.json");
+    let mut input_device = 1; // default front-panel jack
+    if let Ok(raw) = fs::read_to_string(&cfg_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(d) = v.get("device").and_then(|x| x.as_i64()) {
+                input_device = d as i32;
+            }
+        }
     }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let mut parts = text.split(',');
-    let input_device = parts.next().unwrap_or("1").trim().parse::<i32>().unwrap_or(1);
-    let output_device = parts.next().unwrap_or("3").trim().parse::<i32>().unwrap_or(3);
     Ok(VoiceDeviceConfig {
         input_device,
-        output_device,
+        output_device: 3,
     })
 }
 
 #[tauri::command]
 fn voice_set_input_device(input_device: i32, output_device: Option<i32>) -> Result<VoiceDeviceConfig, String> {
     let out_dev = output_device.unwrap_or(3);
-    let script_path = ps_single_quote(&voice_helper_script_path());
-    let script = format!(
-        "$p='{path}'; $c=Get-Content $p -Raw; $c=$c -replace 'INPUT_DEVICE\\s*=\\s*\\d+', 'INPUT_DEVICE = {}'; if($c -match 'OUTPUT_DEVICE\\s*=\\s*\\d+'){{$c=$c -replace 'OUTPUT_DEVICE\\s*=\\s*\\d+', 'OUTPUT_DEVICE = {}'}} else {{$c=$c + \"`nOUTPUT_DEVICE = {}\"}}; Set-Content $p $c",
-        input_device,
-        out_dev,
-        out_dev,
-        path = script_path,
-    );
-    let out = run_powershell(&script)?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).to_string();
-        return Err(format!("set input/output device failed: {err}"));
+    // Single shared config: config/.voice_device.json (the monitor reads this).
+    let cfg_path = Path::new(&mk1_root_dir()).join("config").join(".voice_device.json");
+    if let Some(parent) = cfg_path.parent() {
+        let _ = fs::create_dir_all(parent);
     }
-    push_voice_log(format!("[system] input/output set to {}/{}", input_device, out_dev));
+    let body = serde_json::json!({ "device": input_device });
+    fs::write(&cfg_path, serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
+        .map_err(|e| format!("write voice device config failed: {e}"))?;
+    push_voice_log(format!("[system] input device set to {} (shared config)", input_device));
     Ok(VoiceDeviceConfig {
         input_device,
         output_device: out_dev,
@@ -1282,6 +1283,8 @@ fn service_start_voice_loop_local() -> Result<serde_json::Value, String> {
     }
 
     let cwd = mk1_root_dir();
+    // Clear any stale stop flag so a fresh start doesn't immediately exit.
+    let _ = fs::remove_file(Path::new(&cwd).join(".mk1_voice_stop.flag"));
     let pid = spawn_visible_powershell_file(&script, &cwd)?;
     let verified_pid = wait_for_voice_monitor_running(Duration::from_secs(12))?;
 
@@ -1308,6 +1311,10 @@ fn service_start_voice_loop_local() -> Result<serde_json::Value, String> {
 fn service_stop_voice_loop_local() -> Result<serde_json::Value, String> {
         let root = mk1_root_dir();
         let pid_file = Path::new(&root).join(".mk1_voice_monitor.pid");
+        let stop_flag = Path::new(&root).join(".mk1_voice_stop.flag");
+
+        // Signal an intentional stop so the monitor does NOT restart the loop.
+        let _ = fs::write(&stop_flag, b"stop");
 
         let mut stopped_pid: Option<u32> = None;
         if let Some(pid) = read_pid_from_file(&pid_file) {
@@ -1348,29 +1355,23 @@ Get-CimInstance Win32_Process |
 
 #[tauri::command]
 fn service_voice_loop_status() -> Result<VoiceStatus, String> {
-    let pid_file = Path::new(&mk1_root_dir()).join(".mk1_voice_monitor.pid");
-    if !pid_file.exists() {
+    // Authoritative check: a voice loop process is actually running. The pid file
+    // can go stale (monitor died, pid reused), which made the toggle show the
+    // wrong state and start a second loop instead of stopping the first.
+    let loop_running = find_windows_voice_pid().ok().flatten().is_some();
+
+    if loop_running {
         return Ok(VoiceStatus {
-            running: false,
-            detail: "voice loop not running".into(),
+            running: true,
+            detail: "voice loop running".into(),
         });
     }
 
-    let Some(pid) = read_pid_from_file(&pid_file) else {
-        return Ok(VoiceStatus {
-            running: false,
-            detail: "voice loop pid file unreadable".into(),
-        });
-    };
-
-    let running = is_pid_running(pid);
+    // Fallback: the monitor pid file exists but no loop process — monitor may be
+    // mid-restart. Report not-running so the toggle doesn't lie.
     Ok(VoiceStatus {
-        running,
-        detail: if running {
-            format!("voice loop running (pid: {pid})")
-        } else {
-            "voice loop pid exists but process is down".into()
-        },
+        running: false,
+        detail: "voice loop not running".into(),
     })
 }
 

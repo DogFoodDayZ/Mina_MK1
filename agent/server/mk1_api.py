@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 import uvicorn
 import requests
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -740,8 +740,27 @@ def _write_pid_file(path: Path, pid: int) -> None:
 def _pid_is_running(pid: int) -> bool:
     if pid is None or int(pid) <= 0:
         return False
+    if os.name == "nt":
+        # os.kill(pid, 0) is NOT a valid liveness check on Windows (raises
+        # WinError 87: signal 0 cannot be mapped). Use OpenProcess instead.
+        try:
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
     try:
-        # os.kill(pid, 0) is a non-destructive existence check.
+        # os.kill(pid, 0) is a non-destructive existence check on POSIX.
         os.kill(int(pid), 0)
         return True
     except Exception:
@@ -1845,13 +1864,13 @@ def process(req: ProcessRequest):
             _process_dedupe_cache["response"] = dict(out) if isinstance(out, dict) else {"reply": str(out)}
             _process_dedupe_cache["ts"] = time.time()
 
-    env_auto = os.getenv("MK1_PROCESS_AUTO_SPEAK", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    speak = env_auto if req.speak_response is None else bool(req.speak_response)
+    # The shared speak flag (set by the GUI toggle) is the single source of truth.
+    # An explicit speak_response in the request wins for one-off overrides; otherwise
+    # the shared flag decides, so the GUI toggle actually controls whether Mina speaks.
+    if req.speak_response is not None:
+        speak = bool(req.speak_response)
+    else:
+        speak = _get_speak_enabled()
 
     if speak:
         reply_text = str((out or {}).get("reply") or "").strip()
@@ -1888,19 +1907,14 @@ def process_stream(req: ProcessRequest):
       data: {"type":"done"}
     """
 
-    def _iter_reply_chunks(text: str, chunk_size: int = 120):
-        s = str(text or "")
-        if not s:
-            return
-        for i in range(0, len(s), max(1, int(chunk_size))):
-            yield s[i:i + max(1, int(chunk_size))]
-
     def event_stream():
         full_parts: list[str] = []
         try:
-            # Route streaming through core.process so tool-calling behavior is
-            # consistent with /process and raw tool markup is not leaked.
-            out = core.process(
+            # Why: the GUI was waiting for the full reply because this endpoint
+            # called blocking core.process() and then re-chunked it. Stream live
+            # tokens from core.process_stream so the client renders as text is
+            # generated, not after LM Studio finishes.
+            for piece in core.process_stream(
                 req.input,
                 image_attachment=req.image_attachment,
                 request_context={
@@ -1908,13 +1922,13 @@ def process_stream(req: ProcessRequest):
                     "client_id": req.client_id,
                     "client_token": req.client_token,
                 },
-            )
-            reply_text = str((out or {}).get("reply") or "") if isinstance(out, dict) else str(out)
-
-            for part in _iter_reply_chunks(reply_text):
-                full_parts.append(part)
+            ):
+                if not piece:
+                    continue
+                piece_text = str(piece)
+                full_parts.append(piece_text)
                 payload = json.dumps(
-                    {"type": "chunk", "content": part},
+                    {"type": "chunk", "content": piece_text},
                     ensure_ascii=False,
                 )
                 yield f"data: {payload}\n\n"
@@ -2043,7 +2057,7 @@ if MULTIPART_AVAILABLE:
                 "stt_engine": stt.get("engine"),
             }
 
-            if speak_response and reply_text:
+            if _get_speak_enabled() and reply_text:
                 tts = _synthesize_tts(text=reply_text, voice_hint=voice_hint, output_path=None)
                 response["tts"] = tts
 
@@ -2118,6 +2132,214 @@ def voice_status():
         "ok": True,
         "voice_monitor": _voice_monitor_status(),
     }
+
+
+# Single source of truth for "is Mina speaking" is the file-backed flag defined
+# below (VOICE_SPEAK_FLAG). The GUI toggle writes it; every speak path reads it.
+# Live VAD metrics pushed by the voice loop for the GUI audio tab.
+_voice_metrics_lock = threading.Lock()
+_voice_metrics_latest: dict[str, Any] = {}
+_voice_metrics_history: deque[dict[str, Any]] = deque(maxlen=120)  # ~24s at 5Hz
+
+
+@app.post("/voice/metrics")
+def voice_metrics_push(payload: dict = Body(...)):
+    """Voice loop POSTs a live VAD snapshot here (best-effort, ~5Hz)."""
+    global _voice_metrics_latest
+    snap = {
+        "ts": float(payload.get("ts") or time.time()),
+        "rms": float(payload.get("rms") or 0.0),
+        "noise_floor": float(payload.get("noise_floor") or 0.0),
+        "threshold": float(payload.get("threshold") or 0.0),
+        "capturing": bool(payload.get("capturing", False)),
+        "voiced_chunks": int(payload.get("voiced_chunks") or 0),
+        "muted": bool(payload.get("muted", False)),
+        "device": payload.get("device"),
+        "speech_threshold": payload.get("speech_threshold"),
+        "snr_ratio": payload.get("snr_ratio"),
+        "noise_floor_alpha": payload.get("noise_floor_alpha"),
+    }
+    with _voice_metrics_lock:
+        _voice_metrics_latest = snap
+        _voice_metrics_history.append(snap)
+    return {"ok": True}
+
+
+@app.get("/voice/metrics")
+def voice_metrics(history: int = 0):
+    """GUI polls the latest VAD snapshot (+ optional recent history for sparkline)."""
+    with _voice_metrics_lock:
+        latest = dict(_voice_metrics_latest) if _voice_metrics_latest else None
+        hist = list(_voice_metrics_history) if history else []
+    out = {
+        "ok": True,
+        "monitor": _voice_monitor_status(),
+        "latest": latest,
+        "live": bool(latest and (time.time() - float(latest.get("ts") or 0.0)) < 5.0),
+    }
+    if history:
+        safe = max(1, min(120, int(history)))
+        out["history"] = hist[-safe:]
+    return out
+
+
+# ------------------------------------------------------------
+# Audio device control for the GUI audio tab
+# ------------------------------------------------------------
+
+VOICE_DEVICE_CONFIG = PROJECT_ROOT / "config" / ".voice_device.json"
+
+
+def _voice_list_input_devices() -> dict:
+    """Enumerate input-capable audio devices via sounddevice (best-effort)."""
+    try:
+        import sounddevice as sd  # type: ignore
+    except Exception as e:
+        return {"ok": False, "error": "sounddevice_unavailable", "detail": str(e), "devices": []}
+
+    try:
+        raw = sd.query_devices()
+        devices = []
+        for i, d in enumerate(raw):
+            try:
+                in_ch = int(d.get("max_input_channels", 0) or 0)
+            except Exception:
+                in_ch = 0
+            if in_ch <= 0:
+                continue
+            devices.append({
+                "index": i,
+                "name": str(d.get("name") or f"device_{i}"),
+                "input_channels": in_ch,
+            })
+        return {"ok": True, "devices": devices}
+    except Exception as e:
+        return {"ok": False, "error": "query_failed", "detail": str(e), "devices": []}
+
+
+def _voice_read_config_device() -> Optional[int]:
+    try:
+        if VOICE_DEVICE_CONFIG.exists():
+            data = json.loads(VOICE_DEVICE_CONFIG.read_text(encoding="utf-8"))
+            idx = data.get("device")
+            if idx is not None:
+                return int(idx)
+    except Exception:
+        pass
+    return None
+
+
+def _voice_write_config_device(device_index: int) -> bool:
+    try:
+        VOICE_DEVICE_CONFIG.write_text(json.dumps({"device": int(device_index)}), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+@app.get("/voice/devices")
+def voice_devices():
+    """List input-capable audio devices + the currently configured one."""
+    listed = _voice_list_input_devices()
+    current = _voice_read_config_device()
+    listed["current_device"] = current
+    listed["monitor"] = _voice_monitor_status()
+    return listed
+
+
+@app.post("/voice/device")
+def voice_set_device(payload: dict = Body(...)):
+    """Set the voice input device index. Persisted; the monitor applies it on the
+    next voice-loop (re)start."""
+    idx = payload.get("device")
+    try:
+        idx = int(idx)
+    except Exception:
+        return {"ok": False, "error": "device_must_be_int"}
+
+    # Validate the device exists and is input-capable.
+    listed = _voice_list_input_devices()
+    valid = {d["index"] for d in listed.get("devices", [])}
+    if idx not in valid:
+        return {"ok": False, "error": "device_not_input_capable", "device": idx, "valid": sorted(valid)}
+
+    if not _voice_write_config_device(idx):
+        return {"ok": False, "error": "config_write_failed"}
+
+    return {"ok": True, "device": idx, "note": "applies on next voice-loop start/restart"}
+
+
+@app.get("/voice/probe")
+def voice_probe(device: int = -1, seconds: float = 1.0):
+    """Measure RMS for one input device (or all, when device=-1) so the GUI can
+    show a live level per device for the picker. Read-only; no memory writes."""
+    try:
+        import numpy as np  # type: ignore
+        import sounddevice as sd  # type: ignore
+    except Exception as e:
+        return {"ok": False, "error": "audio_deps_unavailable", "detail": str(e)}
+
+    secs = max(0.3, min(3.0, float(seconds)))
+    sr = 16000
+
+    listed = _voice_list_input_devices()
+    devs = listed.get("devices", [])
+    if not devs:
+        return {"ok": False, "error": "no_input_devices", "levels": []}
+
+    targets = [d["index"] for d in devs] if device < 0 else [int(device)]
+    levels = []
+    for i in targets:
+        try:
+            rec = sd.rec(int(secs * sr), samplerate=sr, channels=1, dtype="float32", device=i)
+            sd.wait()
+            rms = float(np.sqrt((rec * rec).mean()))
+            name = next((d["name"] for d in devs if d["index"] == i), f"device_{i}")
+            levels.append({"index": i, "name": name, "rms": round(rms, 5)})
+        except Exception as e:
+            levels.append({"index": i, "name": f"device_{i}", "rms": None, "error": f"{type(e).__name__}"})
+
+    return {"ok": True, "levels": levels, "seconds": secs}
+
+
+VOICE_DEVICE_CONFIG = PROJECT_ROOT / "config" / ".voice_device.json"
+VOICE_SPEAK_FLAG = PROJECT_ROOT / "config" / ".voice_speak.json"
+
+
+def _get_speak_enabled() -> bool:
+    """Single source of truth for whether Mina speaks replies. The GUI toggle
+    writes this; every speak path (GUI /process, voice loop) reads it."""
+    try:
+        if VOICE_SPEAK_FLAG.exists():
+            data = json.loads(VOICE_SPEAK_FLAG.read_text(encoding="utf-8"))
+            return bool(data.get("speak", False))
+    except Exception:
+        pass
+    # Default OFF unless the GUI has set it. The tray's MK1_PROCESS_AUTO_SPEAK
+    # only applies when no shared flag file exists yet (first-run behavior).
+    return os.getenv("MK1_PROCESS_AUTO_SPEAK", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _set_speak_enabled(enabled: bool) -> bool:
+    try:
+        VOICE_SPEAK_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        VOICE_SPEAK_FLAG.write_text(json.dumps({"speak": bool(enabled)}), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+@app.get("/voice/speak")
+def voice_get_speak():
+    return {"ok": True, "speak": _get_speak_enabled()}
+
+
+@app.post("/voice/speak")
+def voice_set_speak(payload: dict = Body(...)):
+    enabled = bool(payload.get("speak", False))
+    if not _set_speak_enabled(enabled):
+        return {"ok": False, "error": "speak_flag_write_failed"}
+    return {"ok": True, "speak": enabled}
 
 
 @app.get("/games/ostranauts/status")

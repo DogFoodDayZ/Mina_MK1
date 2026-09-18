@@ -2861,57 +2861,6 @@ class MK1Core:
             "ostranauts_query": ostranauts_query,
         }
 
-    def _maybe_build_ambiguity_prompt(self, raw_text: str, intent_signals: Optional[Dict[str, bool]] = None) -> Optional[str]:
-        if not bool(getattr(self, "ambiguity_ask_on_medium_low", True)):
-            return None
-
-        t = str(raw_text or "").lower()
-        if re.search(r"^\s*(what|who|where|when|why|how)\b", t) and not re.search(r"\b(play|game|music|spotify)\b", t):
-            return None
-        if any(phrase in t for phrase in [
-            "what is my name",
-            "what's my name",
-            "who am i",
-            "what time is it",
-            "current time",
-            "local time",
-            "what date is it",
-            "current date",
-            "today's date",
-            "todays date",
-        ]):
-            return None
-        signals = intent_signals or self._intent_signal_profile(raw_text)
-        play_signal = bool(signals.get("play_signal"))
-        play_with_target = bool(signals.get("play_with_target"))
-        game_signals = bool(signals.get("game_signals"))
-        music_signals = bool(signals.get("music_signals"))
-        spotify_available = "spotify_link" in self._tool_registry()
-
-        casual_typo_markers = re.search(r"\b(my\s+bad|fat\s+fingers|miss\s+keys|oops|lol|haha|typo)\b", t) is not None
-        if casual_typo_markers and not (game_signals or music_signals):
-            return None
-
-        # Game-targeted "play" should stay in game context and avoid music hijack.
-        if play_signal and game_signals and not music_signals:
-            return None
-
-        # Explicit play requests with a concrete target should execute routing
-        # directly instead of falling into generic play clarification.
-        if play_signal and play_with_target and not game_signals:
-            return None
-
-        # Unqualified "play" with Spotify available is ambiguous by default.
-        if play_signal and spotify_available and not game_signals and not music_signals:
-            return (
-                "When you say 'play', what do you want to play right now: a game, music, or something else?"
-            )
-
-        if re.search(r"\bplay\s+with\s+me\b", t) and (game_signals or not music_signals):
-            return None
-
-        return None
-
     def _detect_explicit_music_intent(self, text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         if "spotify_link" not in self._tool_registry():
             return None
@@ -3824,6 +3773,32 @@ class MK1Core:
         except Exception:
             pass  # Never block tool execution on memory write failures
 
+    def _classify_memory_durability(self, fact_text: str) -> str:
+        """Classify a memory fact as 'durable' (standing truth) or 'current_state'
+        (right-now, transient). Conservative: anything not clearly transient is
+        durable, so we never demote a standing fact by accident."""
+        low = " " + " ".join(str(fact_text or "").strip().lower().split()) + " "
+        if not low.strip():
+            return "durable"
+
+        # Transient markers: present-tense location/state that is expected to change.
+        transient_patterns = [
+            r"\b(i'm|i am|im)\s+(?:currently\s+|right\s+now\s+|just\s+)?(?:in|at|visiting|heading to|on my way to)\b",
+            r"\bcurrently\s+(?:in|at|visiting|working on|doing)\b",
+            r"\bright\s+now\b",
+            r"\b(?:just|only)\s+(?:for|till|until)\b",
+            r"\bvisiting\b",
+            r"\bon\s+(?:a\s+)?trip\b",
+            r"\bthis\s+(?:week|weekend|month)\b",
+            r"\btoday\b",
+            r"\btonight\b",
+        ]
+        for p in transient_patterns:
+            if re.search(p, low):
+                return "current_state"
+
+        return "durable"
+
     def _extract_personal_fact(self, text: str) -> str:
         raw = (text or "").strip()
         if not raw:
@@ -4136,6 +4111,53 @@ class MK1Core:
         ]
         return any(re.search(p, q) is not None for p in patterns)
 
+    def _render_memory_write_ack(
+        self,
+        messages: List[Dict[str, Any]],
+        user_input: str,
+        stored_fact: str,
+    ) -> str:
+        """Acknowledge a stored memory in Mina's voice instead of echoing the
+        storage receipt. The fact is already persisted; this only shapes the reply."""
+        fact = str(stored_fact or "").strip()
+        convo = [
+            {
+                "role": "system",
+                "content": (
+                    "The user just told you something to remember, and it is now stored. "
+                    "Acknowledge it in Mina's own voice: brief, in character, a little warmth or snark is welcome. "
+                    "Show that you understood the fact itself. "
+                    "Do NOT say 'Stored memory:' or repeat any storage receipt. "
+                    "Keep it concise."
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_input,
+            },
+            {
+                "role": "assistant",
+                "content": f"[remembered fact: {fact}]",
+            },
+        ]
+
+        try:
+            reply = self.model.chat(convo)
+            text = self._clean_response_text(self._extract_text(reply)).strip()
+            low_text = text.lower()
+            if (
+                text
+                and not low_text.startswith("(lm studio error:")
+                and "httpconnectionpool(" not in low_text
+                and "stored memory:" not in low_text
+            ):
+                return text
+        except Exception:
+            traceback.print_exc()
+
+        # Fallback: plain, honest acknowledgement without the storage receipt.
+        return f"Got it — I'll remember that {fact}."
+
     def _render_grounded_tool_analysis(
         self,
         messages: List[Dict[str, Any]],
@@ -4239,6 +4261,16 @@ class MK1Core:
             if tool_ok:
                 return f"Here's the verified PowerShell output:\n\n```text\n{formatted}\n```"
             return f"PowerShell execution failed.\n\n```text\n{formatted}\n```"
+
+        if tool_name == "memory_write":
+            # Why: memory_write is direct-rendered, and the raw receipt
+            # ("Stored memory: X") was being parroted verbatim. Render the
+            # acknowledgement through the model so Mina answers in her own voice.
+            return self._render_memory_write_ack(
+                messages=messages,
+                user_input=user_input,
+                stored_fact=formatted,
+            )
 
         if tool_name in self._raw_direct_render_tool_names():
             return formatted
@@ -4690,6 +4722,45 @@ class MK1Core:
             return ""
 
         if txt.lower().startswith("no matching memories found"):
+            return ""
+
+        # Internal routing/artifact bookkeeping is not a conversational fact and
+        # must never be surfaced as something Mina "remembers". These records are
+        # stored for tooling; they are not her voice.
+        if txt.lower().startswith((
+            "intent_alias::",
+            "code_artifact::",
+            "mina_capability_snapshot::",
+            "mina_capability_delta::",
+            "hardware_snapshot::",
+        )):
+            return ""
+
+        # Multi-line bookkeeping bodies spill continuation fragments ("request=",
+        # "content:", code fences, code lines). Drop those too so they never read
+        # as recalled facts.
+        _low_txt = txt.lower()
+        if re.match(r"^(request=|content\s*:)", _low_txt):
+            return ""
+        if _low_txt.startswith("```"):
+            return ""
+        if re.match(r"^(import|from|def|class|print)\s", _low_txt):
+            return ""
+
+        # Stored-artifact content lines are structured data / code, not a
+        # conversational fact. Drop assignment/data lines so a saved file's body
+        # never reads back as something Mina "remembers".
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=\s*[(\"'\d\[\{]", txt):
+            return ""
+        if re.match(r"^[(][\s\-0-9.,()]+[)],?$", txt):
+            return ""
+        # Bare bracket/quote fragments from code bodies are not facts.
+        if re.match(r"^[)\]}'\";,]+$", txt.rstrip(".")):
+            return ""
+        # Function/method call lines and loop/branch headers are code, not facts.
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*\s*\(.*\)\s*[:.]?$", txt):
+            return ""
+        if re.match(r"^(for|while|if|elif|else|try|except|return|with)\b.*[:.]?$", _low_txt):
             return ""
 
         txt = re.sub(r"^\s*(store|save|remember|note|add|keep)\s+", "", txt, flags=re.IGNORECASE)
@@ -10004,8 +10075,6 @@ class MK1Core:
                 except Exception:
                     pass
 
-            final_text = self._enforce_tool_outcome_truth(final_text, executed_tool_events)
-
             if not executed_tool_events:
                 rescued = self._maybe_rescue_chat_suggested_action(
                     messages=messages,
@@ -10015,18 +10084,6 @@ class MK1Core:
                 )
                 if rescued is not None:
                     final_text = self._extract_text(rescued)
-
-            if not executed_tool_events:
-                # Why: command-like prompts occasionally produced model-only terminal roleplay.
-                # Guard: require a real execution path or explicit non-claim fallback.
-                verified_fallback = self._maybe_enforce_verified_execution_reply(
-                    messages=messages,
-                    user_input=user_input,
-                    assistant_text=final_text,
-                    request_context=request_context,
-                )
-                if verified_fallback is not None:
-                    final_text = verified_fallback
 
             self._store_turn_memory(
                 user_input=user_input,
@@ -10171,7 +10228,6 @@ class MK1Core:
 
                     if executed_tool_events:
                         final_text = self._handle_model_response(messages, reply)
-                        final_text = self._enforce_tool_outcome_truth(final_text, executed_tool_events)
                         self._store_turn_memory(
                             user_input=user_input,
                             assistant_text=final_text,
@@ -10189,16 +10245,6 @@ class MK1Core:
                     )
                     if rescued is not None:
                         preflight_text = self._extract_text(rescued)
-                    # Why: preflight can still return unverified transcript-like text with no tool events.
-                    # Guard: force verified execution fallback before returning preflight response.
-                    verified_fallback = self._maybe_enforce_verified_execution_reply(
-                        messages=messages,
-                        user_input=user_input,
-                        assistant_text=preflight_text,
-                        request_context=request_context,
-                    )
-                    if verified_fallback is not None:
-                        preflight_text = verified_fallback
                     if preflight_text:
                         self._store_turn_memory(
                             user_input=user_input,
@@ -10245,17 +10291,6 @@ class MK1Core:
             )
             if rescued is not None:
                 final_text = self._extract_text(rescued)
-
-            # Why: streamed replies can emit pseudo terminal blocks without tool execution.
-            # Guard: enforce proof-backed execution or explicit non-claim fallback.
-            verified_fallback = self._maybe_enforce_verified_execution_reply(
-                messages=messages,
-                user_input=user_input,
-                assistant_text=final_text,
-                request_context=request_context,
-            )
-            if verified_fallback is not None:
-                final_text = verified_fallback
 
             self._store_turn_memory(
                 user_input=user_input,
@@ -10904,7 +10939,13 @@ class MK1Core:
         recent_turns: List[Dict[str, Any]],
         max_items: int = 3,
     ) -> List[Dict[str, Any]]:
-        """Keep only recent turns with direct lexical overlap to the query."""
+        """Rank recent turns by lexical overlap, but never return empty when
+        history exists: short/ambiguous turns (e.g. voice "oh.", "you there?")
+        still need recency context or the model treats every turn as a fresh
+        greeting and repeats itself."""
+        if not recent_turns:
+            return []
+
         stop_words = {
             "a", "about", "am", "an", "and", "are", "can", "did", "do", "for",
             "have", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or",
@@ -10916,11 +10957,13 @@ class MK1Core:
             for token in re.findall(r"[a-z0-9]+", str(query or "").lower())
             if len(token) > 2 and token not in stop_words
         }
+        cap = max(1, int(max_items))
+
         if not query_terms:
-            return []
+            return recent_turns[:cap]
 
         ranked: List[Tuple[int, int, Dict[str, Any]]] = []
-        for position, item in enumerate(recent_turns or []):
+        for position, item in enumerate(recent_turns):
             text = str(item.get("text") or "").strip()
             text_terms = set(re.findall(r"[a-z0-9]+", text.lower()))
             overlap = len(query_terms & text_terms)
@@ -10928,7 +10971,11 @@ class MK1Core:
                 ranked.append((overlap, -position, item))
 
         ranked.sort(key=lambda entry: (-entry[0], -entry[1]))
-        return [item for _score, _position, item in ranked[:max(1, int(max_items))]]
+        matched = [item for _score, _position, item in ranked[:cap]]
+        if matched:
+            return matched
+        # No lexical overlap: fall back to raw recency rather than nothing.
+        return recent_turns[:cap]
 
     def build_context(self, query: str) -> str:
         try:
@@ -10976,6 +11023,7 @@ class MK1Core:
                     "code_artifact::",
                     "mina_capability_snapshot::",
                     "mina_capability_delta::",
+                    "intent_alias::",
                 )):
                     return True
                 if context_chars + len(compact) + 2 > context_char_budget:
@@ -10997,11 +11045,22 @@ class MK1Core:
                 lines.append(archive_context)
                 context_chars += len(archive_context)
 
-            short_items = recent_turns + short_semantic
+            # Exclude Mina's own prior replies from short-term recall: feeding
+            # them back as unlabeled context creates a mimicry loop where
+            # Dolphin continues its last message instead of answering the user.
+            def _is_user_turn(item: Dict[str, Any]) -> bool:
+                tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+                return "assistant_turn" not in tags
+
+            short_items = [
+                item
+                for item in (recent_turns + short_semantic)
+                if _is_user_turn(item)
+            ]
             if short_items:
                 if lines:
                     lines.append("")
-                lines.append("Short-term recall:")
+                lines.append("Short-term recall (what the user said recently):")
                 for r in short_items:
                     if not append_memory_line(str(r.get("text", "")).strip()):
                         break
@@ -11551,6 +11610,16 @@ class MK1Core:
                 if norm in seen:
                     continue
                 seen.add(norm)
+                # Label test/agent-written facts so Mina knows they are not the
+                # user's real memories. They still surface (per design), but marked.
+                tags = item.get("tags") or []
+                tag_set = {str(t).strip().lower() for t in tags if str(t).strip()}
+                if "test_data" in tag_set or "source:agent_test" in tag_set:
+                    text = f"(test data) {text}"
+                elif "current_state" in tag_set:
+                    # Transient state is right-now, not standing truth — mark it so
+                    # Mina does not confuse "I'm in Callville" with "we live in Spokane".
+                    text = f"(right now) {text}"
                 lines.append(text)
             return "\n".join(lines) if lines else "No matching memories found."
 
@@ -13196,27 +13265,6 @@ IMPORTANT RULES:
         if explicit_music_intent is not None:
             return explicit_music_intent
 
-        ambiguity_prompt = self._maybe_build_ambiguity_prompt(raw_text, intent_signals=intent_signals)
-        if ambiguity_prompt:
-            return "__clarify_intent__", {"question": ambiguity_prompt}
-
-        recipient_pattern = r"(?:him|her|them|my\s+(?:brother|sister|mom|dad|friend|contact)|(?:brother|sister|mom|dad|friend|contact))"
-        external_message_intent = (
-            re.search(rf"\b(?:text|sms|call|phone|message)\s+(?:to\s+)?{recipient_pattern}\b", t) is not None
-            or re.search(rf"\bsend\b[^.?!\n]{{0,100}}\b(?:text|sms|message)\b[^.?!\n]{{0,100}}\b(?:to\s+)?{recipient_pattern}\b", t) is not None
-            or re.search(rf"\bsend\s+{recipient_pattern}\b[^.?!\n]{{0,100}}\b(?:text|sms|message)\b", t) is not None
-        )
-        if external_message_intent:
-            tool_names = set(self._tool_registry().keys())
-            has_messaging_tool = any(name in tool_names for name in ["sms_send", "send_text", "phone_text", "twilio_sms"])
-            if not has_messaging_tool:
-                return "__capability_limit__", {
-                    "message": (
-                        "I cannot send real texts or calls directly from this setup yet. "
-                        "I can draft the exact message for you and keep a follow-up reminder."
-                    )
-                }
-
         bulk_read_match = re.search(r"\bread\s+all\s+files\s+in\b", raw_text, re.IGNORECASE)
         if bulk_read_match:
             folder = self._extract_explicit_windows_path(raw_text)
@@ -13360,21 +13408,28 @@ IMPORTANT RULES:
                     lowered = cleaned.lower()
                     break
 
+            # A leading "remember this: ..." leaves a stray "this:"/"that:" prefix.
+            cleaned = re.sub(r"^(?:this|that)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+
+            # Trailing "save/store/remember/keep this|that" is a standalone
+            # instruction when set off as its own clause (comma/semicolon/colon/
+            # dash or "and"/"so"), OR as a bare trailing command. A mid-clause
+            # use such as "you may want to remember that" is part of the fact and
+            # must NOT be stripped — otherwise the fact's tail gets eaten.
             cleaned = re.sub(
-                r"\b(?:please\s+)?(?:save|store|remember|keep)\s+(?:this|that)\b[.!?]*$",
+                r"(?:[,;:\-]|\band\b|\bso\b)\s*(?:please\s+)?(?:save|store|remember|keep)\s+(?:this|that)\b[.!?]*$",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip()
+            cleaned = re.sub(
+                r"(?<!\bto)\s+(?:please\s+)?(?:save|store|remember|keep)\s+(?:this|that)\b[.!?]*$",
                 "",
                 cleaned,
                 flags=re.IGNORECASE,
             ).strip()
 
-            cleaned = re.sub(
-                r"[,;:\-]?\s*(?:save|store|remember|keep)(?:\s+(?:this|that))?(?:\s+please)?[.!?]*$",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            ).strip()
-
-            cleaned = re.sub(r"^[\s\-:]+|[\s\-:]+$", "", cleaned)
+            cleaned = re.sub(r"^[\s\-:,.]+|[\s\-:,.]+$", "", cleaned)
 
             return cleaned or raw_text.strip()
 
@@ -13555,8 +13610,10 @@ IMPORTANT RULES:
                 ]
 
                 alarm_absolute_patterns = [
-                    r"^(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)\s+(?:for|at)\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?(?:\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun))?(?:\s*(?:for|about|to)\s+(?P<task>.+))?$",
-                    r"^(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun)\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?(?:\s*(?:for|about|to)\s+(?P<task>.+))?$",
+                    # Optional trailing day-part words ("morning", "tonight") so
+                    # "alarm for 5 a.m. tomorrow morning" still parses.
+                    r"^(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)\s+(?:for|at)\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?(?:\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun))?(?:\s+(?:in\s+the\s+)?(?:morning|afternoon|evening|tonight|night))?(?:\s*(?:for|about|to|called|named)\s+(?P<task>.+))?$",
+                    r"^(?:please\s+)?(?:set|create|start|schedule)\s+(?:an?\s+)?(?:alarm|timer)\s+(?:on\s+)?(?P<day>tomorrow|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun)\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>(?:a|p)\.?m\.?)?(?:\s+(?:in\s+the\s+)?(?:morning|afternoon|evening|tonight|night))?(?:\s*(?:for|about|to|called|named)\s+(?P<task>.+))?$",
                 ]
 
                 for parse_text in parse_inputs:
@@ -14124,10 +14181,19 @@ IMPORTANT RULES:
             }
 
         if intent == "memory_write":
+            fact_text = extract_memory_write_text(raw_text)
+            write_tags = ["user_memory"]
+            # Durable facts ("we live in Spokane", "my X is Y") are standing truth.
+            # Transient state ("I'm in Callville", "currently at", "right now") is
+            # right-now, not forever — tag it so recall does not treat it as home.
+            if self._classify_memory_durability(fact_text) == "current_state":
+                write_tags.append("current_state")
+            else:
+                write_tags.append("durable")
             return "memory_write", {
-                "text": extract_memory_write_text(raw_text),
+                "text": fact_text,
                 "kind": "fact",
-                "tags": ["user_memory"],
+                "tags": write_tags,
             }
 
         if intent == "__task_memory_write__":
@@ -14894,115 +14960,6 @@ IMPORTANT RULES:
         text = self._execute_inline_tool_calls(text)
 
         return text or ""
-
-    def _enforce_tool_outcome_truth(
-        self,
-        assistant_text: str,
-        tool_events: List[Tuple[str, Dict[str, Any]]],
-    ) -> str:
-        text = str(assistant_text or "").strip()
-        if not isinstance(tool_events, list) or not tool_events:
-            return text
-
-        last_failed: Optional[Tuple[str, Dict[str, Any]]] = None
-        for event in reversed(tool_events):
-            if not isinstance(event, tuple) or len(event) != 2:
-                continue
-            tool_name, tool_result = event
-            if isinstance(tool_result, dict) and not bool(tool_result.get("ok", True)):
-                last_failed = (str(tool_name or "").strip(), tool_result)
-                break
-
-        if last_failed is None:
-            return text
-
-        failed_tool, failed_result = last_failed
-        failure_summary = self._format_tool_result(failed_tool, failed_result).strip()
-        if not failure_summary:
-            failure_summary = f"Tool '{failed_tool}' failed: {failed_result.get('error') or 'unknown_error'}"
-
-        if not text:
-            return failure_summary
-        if failure_summary.lower() in text.lower():
-            return text
-
-        return f"{failure_summary}\n\n{text}"
-
-    def _is_execution_request_like(self, text: str) -> bool:
-        q = str(text or "").strip().lower()
-        if not q:
-            return False
-
-        if re.search(r"\b(run|execute|start|launch)\b", q) is None:
-            return False
-
-        if re.search(r"\b(script|command|powershell|python|pytest|test|tests|api|service|server)\b", q):
-            return True
-
-        if re.search(r"([a-z]:\\|[.]{1,2}[\\/]|\.(ps1|py|bat|cmd)\b)", q, re.IGNORECASE):
-            return True
-
-        return False
-
-    def _looks_like_unverified_execution_claim(self, text: str) -> bool:
-        body = str(text or "")
-        if not body.strip():
-            return False
-
-        if re.search(r"```(?:powershell|pwsh|cmd|bash|sh|python)?", body, re.IGNORECASE):
-            return True
-
-        if re.search(r"^\s*PS\s+[^\r\n>]+>\s*", body, re.MULTILINE):
-            return True
-
-        if re.search(r"\b(exited with code|exit code|stdout:|stderr:)\b", body, re.IGNORECASE):
-            return True
-
-        return False
-
-    def _maybe_enforce_verified_execution_reply(
-        self,
-        messages: List[Dict[str, Any]],
-        user_input: str,
-        assistant_text: str,
-        request_context: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
-        if not self._is_execution_request_like(user_input):
-            return None
-
-        if not self._looks_like_unverified_execution_claim(assistant_text):
-            return None
-
-        try:
-            tool_name, _tool_args = self.detect_tool_intent(user_input)
-        except Exception:
-            traceback.print_exc()
-            tool_name = None
-
-        if not tool_name:
-            planned = self._plan_tool_action(user_input)
-            if planned is not None:
-                tool_name = planned[0]
-
-        if not tool_name or tool_name == "__clarify_intent__":
-            return (
-                "I did not run that command yet, so I cannot claim output. "
-                "Give me the exact command or file path and I will run it for real."
-            )
-
-        rescued = self._reflex_tools_and_memory(
-            messages=messages,
-            reply={},
-            user_input=user_input,
-            request_context=request_context,
-        )
-        if rescued is None:
-            return (
-                "I did not run that command yet, so I cannot claim output. "
-                "Give me the exact command or file path and I will run it for real."
-            )
-
-        return self._extract_text(rescued)
 
     # ========================================================
     # EXTRACT TEXT

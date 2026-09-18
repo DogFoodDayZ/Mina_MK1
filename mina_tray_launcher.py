@@ -26,6 +26,17 @@ MK1_PS1 = ROOT / "mk1_api.ps1"
 GUI_DIR = ROOT / "apps" / "mina-gui"
 CONFIG_DIR = Path(os.getenv("APPDATA", str(ROOT))) / "Mina_MK1"
 CONFIG_PATH = CONFIG_DIR / "tray_launcher_config.json"
+VOICE_SPEAK_FLAG = ROOT / "config" / ".voice_speak.json"
+
+
+def _write_speak_flag(enabled: bool) -> None:
+	"""Write the shared speak flag the API reads, so the tray's GUI-speak toggle
+	actually reaches the running API (env vars do not survive the detached child)."""
+	try:
+		VOICE_SPEAK_FLAG.parent.mkdir(parents=True, exist_ok=True)
+		VOICE_SPEAK_FLAG.write_text(json.dumps({"speak": bool(enabled)}), encoding="utf-8")
+	except Exception:
+		pass
 
 
 @dataclass
@@ -223,6 +234,9 @@ class MinaTrayLauncher:
 
 	def _on_launch(self, *_args) -> None:
 		try:
+			# Write the shared speak flag before launch so the API boots with the
+			# tray's GUI-speak toggle applied (env vars don't survive the detached child).
+			_write_speak_flag(self.config.gui_speak)
 			cmd = self._build_start_command()
 			self._run_detached(cmd)
 			if self.config.load_fancy_gui:
@@ -240,8 +254,56 @@ class MinaTrayLauncher:
 		except Exception as exc:
 			self._set_status(f"launch error: {exc}", "Mina Tray Launcher (launch error)")
 
+	def _stop_voice_monitor(self) -> None:
+		"""Stop the voice monitor + its loop so a launcher stop also silences the mic."""
+		try:
+			pid_file = ROOT / ".mk1_voice_monitor.pid"
+			ps = (
+				"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ("
+				"$_.CommandLine -like '*start_mina_voice_monitor.ps1*' -or "
+				"$_.CommandLine -like '*mina_windows_voice_loop.py*'"
+				") } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }"
+			)
+			subprocess.run(
+				["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+				cwd=str(ROOT),
+				creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+				timeout=15,
+			)
+			if pid_file.exists():
+				try:
+					pid_file.unlink()
+				except Exception:
+					pass
+		except Exception:
+			pass
+
+	def _stop_gui_dev(self) -> None:
+		"""Stop the Tauri/Vite GUI dev process so a launcher stop also closes the GUI."""
+		try:
+			ps = (
+				"Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'mina_gui' } "
+				"| ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }; "
+				"$c = Get-NetTCPConnection -LocalPort 1420 -State Listen -ErrorAction SilentlyContinue; "
+				"if ($c) { $c | ForEach-Object { try { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } catch {} } }"
+			)
+			subprocess.run(
+				["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+				cwd=str(ROOT),
+				creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+				timeout=15,
+			)
+		except Exception:
+			pass
+
 	def _on_stop(self, *_args) -> None:
 		try:
+			# Stop the voice monitor and the GUI dev process too, not just the API.
+			# The API shutdown (mk1_api.ps1 shutdown) covers core+memory, but the
+			# voice monitor/loop and the Tauri/Vite GUI are outside that barrier.
+			self._stop_voice_monitor()
+			self._stop_gui_dev()
+
 			cmd = [
 				"powershell",
 				"-NoProfile",
@@ -281,5 +343,26 @@ def main() -> int:
 	return 0
 
 
+def _acquire_single_instance_mutex() -> bool:
+	"""Ensure only one logical tray launcher owns the stack. A second launch
+	(boot startup + manual, or a double-click) becomes a no-op instead of
+	doubling the API, embed server, and voice monitor."""
+	try:
+		import ctypes
+		mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "MinaMK1TrayLauncherSingleton")
+		# ERROR_ALREADY_EXISTS = 183
+		if ctypes.windll.kernel32.GetLastError() == 183:
+			return False
+		# Keep the handle alive for the process lifetime.
+		_acquire_single_instance_mutex._handle = mutex
+		return True
+	except Exception:
+		# If the mutex cannot be created, do not block startup.
+		return True
+
+
 if __name__ == "__main__":
+	if not _acquire_single_instance_mutex():
+		print("Mina Tray Launcher is already running; second instance ignored.")
+		raise SystemExit(0)
 	raise SystemExit(main())

@@ -12,6 +12,58 @@ const API_BASE = "http://127.0.0.1:8000";
 const GUI_VOICE_HINT = "en-US-AnaNeural";
 const USER_DISPLAY_NAME = "TRAVIS";
 
+// Live VAD waveform for the audio tab. Draws input RMS over time with the
+// adaptive threshold as a reference line, so you can see speech spikes vs the
+// ambient floor in real time.
+function WaveformCanvas({ history, threshold }) {
+    const canvasRef = useRef(null);
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx.clearRect(0, 0, w, h);
+
+        const pts = Array.isArray(history) ? history : [];
+        if (!pts.length) {
+            ctx.fillStyle = "#2a4a44";
+            ctx.font = "11px monospace";
+            ctx.fillText("no signal — start voice-in", 8, h / 2);
+            return;
+        }
+
+        const maxVal = Math.max(threshold * 2, ...pts.map((p) => Number(p.rms) || 0), 0.001);
+        const n = pts.length;
+        const step = w / Math.max(1, n - 1);
+
+        // Threshold reference line.
+        const ty = h - (Math.min(threshold, maxVal) / maxVal) * h;
+        ctx.strokeStyle = "#ff4a5e";
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(0, ty);
+        ctx.lineTo(w, ty);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // RMS waveform.
+        ctx.strokeStyle = "#2cfaa2";
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        pts.forEach((p, i) => {
+            const x = i * step;
+            const y = h - (Math.min(Number(p.rms) || 0, maxVal) / maxVal) * h;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+    }, [history, threshold]);
+
+    return <canvas ref={canvasRef} className="mk1-waveform" width={560} height={90} />;
+}
+
 const COMMANDS = [
     "/help",
     "/diag",
@@ -118,6 +170,12 @@ export default function App() {
     const [avatarMood, setAvatarMood] = useState("idle");
     const [apiServiceUp, setApiServiceUp] = useState(true);
     const [voiceServiceUp, setVoiceServiceUp] = useState(false);
+    const [voiceMetrics, setVoiceMetrics] = useState(null);
+    const [voiceMetricsHistory, setVoiceMetricsHistory] = useState([]);
+    const [voiceDevices, setVoiceDevices] = useState([]);
+    const [voiceCurrentDevice, setVoiceCurrentDevice] = useState(null);
+    const [voiceDeviceLevels, setVoiceDeviceLevels] = useState({});
+    const [isProbingDevices, setIsProbingDevices] = useState(false);
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [isAskingSummary, setIsAskingSummary] = useState(false);
     const [isStartingApi, setIsStartingApi] = useState(false);
@@ -152,6 +210,7 @@ export default function App() {
     const attachmentsRef = useRef([]);
     const dueTaskPrimedRef = useRef(false);
     const seenDueTaskIdsRef = useRef(new Set());
+    const coreStreamMsgIdRef = useRef(null);
 
     useEffect(() => {
         attachmentsRef.current = imageAttachments;
@@ -568,6 +627,10 @@ export default function App() {
                 });
                 setCorePullout(mapCorePullout(data));
                 setApiServiceUp(true);
+
+                // Sync the voice-output toggle from the API's shared speak flag so
+                // the indicator always reflects reality (tray auto-speak, etc.).
+                syncVoiceOutputFromApi();
             } catch {
                 if (cancelled) return;
 
@@ -902,6 +965,36 @@ export default function App() {
         };
     }, []);
 
+    // Live VAD metrics polling for the Audio tab (only while the tab is open).
+    useEffect(() => {
+        if (activeTab !== "audio") return undefined;
+        let cancelled = false;
+        loadVoiceDevices();
+
+        async function pollVoiceMetrics() {
+            try {
+                const data = await requestJson("/voice/metrics?history=60", { timeoutMs: 4000 });
+                if (cancelled) return;
+                if (data?.ok) {
+                    setVoiceMetrics(data.latest || null);
+                    setVoiceMetricsHistory(Array.isArray(data.history) ? data.history : []);
+                    if (data?.monitor && typeof data.monitor.running === "boolean") {
+                        setVoiceServiceUp(data.monitor.running);
+                    }
+                }
+            } catch {
+                // Best-effort; leave meters unchanged on a missed poll.
+            }
+        }
+
+        const stopPolling = startSerialPoll(pollVoiceMetrics, 400);
+
+        return () => {
+            cancelled = true;
+            stopPolling();
+        };
+    }, [activeTab]);
+
     useEffect(() => {
         let cancelled = false;
 
@@ -1117,34 +1210,81 @@ export default function App() {
                 };
             }
 
-            const reply = await requestJson("/process", {
-                method: "POST",
-                timeoutMs: 180000,
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify(payload),
-            });
+            // Why: the GUI used blocking /process and only rendered after LM
+            // Studio finished. Stream from /process-stream so Mina's text renders
+            // token-by-token as it is generated.
+            const onChunk = typeof options.onChunk === "function" ? options.onChunk : null;
 
-            let replyText = "(no reply)";
+            const controller = new AbortController();
+            const timeoutMs = 180000;
+            let timedOut = false;
+            const timeoutId = setTimeout(() => {
+                timedOut = true;
+                controller.abort();
+            }, timeoutMs);
 
-            if (reply) {
-                if (typeof reply.reply === "string") {
-                    replyText = reply.reply;
-                } else if (typeof reply.reply === "object") {
-                    replyText = JSON.stringify(reply.reply, null, 2);
-                } else if (typeof reply.output === "string") {
-                    replyText = reply.output;
-                } else if (reply.choices?.[0]?.message?.content) {
-                    replyText = reply.choices[0].message.content;
+            try {
+                const res = await fetch(`${API_BASE}/process-stream`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal,
+                });
+
+                if (!res.ok || !res.body) {
+                    const errText = await res.text().catch(() => "");
+                    throw new Error(errText || `HTTP ${res.status}`);
                 }
-            }
 
-            return {
-                text: replyText,
-                image: reply?.image ?? null,
-                raw: reply,
-            };
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+                let replyText = "";
+                let streamError = null;
+
+                for (; ;) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+
+                    // SSE frames are separated by a blank line.
+                    const frames = buffer.split("\n\n");
+                    buffer = frames.pop() ?? "";
+
+                    for (const frame of frames) {
+                        const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+                        if (!dataLine) continue;
+                        const dataStr = dataLine.slice(5).trim();
+                        if (!dataStr) continue;
+                        let evt = null;
+                        try {
+                            evt = JSON.parse(dataStr);
+                        } catch {
+                            continue;
+                        }
+                        if (evt?.type === "chunk" && typeof evt.content === "string") {
+                            replyText += evt.content;
+                            if (onChunk) onChunk(replyText);
+                        } else if (evt?.type === "error") {
+                            streamError = evt.error || "stream error";
+                        }
+                    }
+                }
+
+                if (streamError) {
+                    throw new Error(streamError);
+                }
+
+                replyText = replyText.trim() || "(no reply)";
+
+                return {
+                    text: replyText,
+                    image: null,
+                    raw: null,
+                };
+            } finally {
+                clearTimeout(timeoutId);
+            }
         } catch (err) {
             console.error(err);
             return {
@@ -1155,19 +1295,28 @@ export default function App() {
         }
     }
 
-    function streamCoreReply(text) {
-        const streamId = `core-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    function streamCoreReply(text, opts = {}) {
+        const streamId = opts.id ?? `core-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const replace = Boolean(opts.replace);
 
         setAvatarMood("talk");
         setIsCoreSpeaking(true);
 
-        setMessages((prev) => [...prev, { id: streamId, from: "MINA", text: String(text ?? "") }]);
+        if (replace) {
+            setMessages((prev) => prev.map((m) => (m.id === streamId ? { ...m, text: String(text ?? "") } : m)));
+        } else {
+            setMessages((prev) => [...prev, { id: streamId, from: "MINA", text: String(text ?? "") }]);
+        }
 
-        setTimeout(() => {
-            setIsCoreSpeaking(false);
-            setAvatarMood("smirk");
-            setTimeout(() => setAvatarMood("idle"), 900);
-        }, 80);
+        if (opts.done !== false) {
+            setTimeout(() => {
+                setIsCoreSpeaking(false);
+                setAvatarMood("smirk");
+                setTimeout(() => setAvatarMood("idle"), 900);
+            }, 80);
+        }
+
+        return streamId;
     }
 
     function handleCommand(cmd) {
@@ -1385,17 +1534,87 @@ export default function App() {
         setIsStartingVoice(false);
     }
 
-    function toggleVoiceOutput() {
-        if (voiceOutputOn) {
-            setVoiceOutputOn(false);
+    async function syncVoiceOutputFromApi() {
+        try {
+            const data = await requestJson("/voice/speak", { timeoutMs: 5000 });
+            if (data && typeof data.speak !== "undefined") {
+                setVoiceOutputOn(Boolean(data.speak));
+            }
+        } catch {
+            // best-effort; leave the toggle as-is if the API is unreachable
+        }
+    }
+
+    async function toggleVoiceOutput() {
+        const next = !voiceOutputOn;
+        setVoiceOutputOn(next);
+        try {
+            await requestJson("/voice/speak", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ speak: next }),
+                timeoutMs: 5000,
+            });
+        } catch {
+            // the toggle state still applies locally; the API write is best-effort
+        }
+        if (next) {
+            appendMessage("SYSTEM", "Voice output enabled for desktop replies.");
+            setActivity("Voice output ON.");
+        } else {
             appendMessage("SYSTEM", "Voice output disabled for desktop replies.");
             setActivity("Voice output OFF.");
-            return;
         }
+    }
 
-        setVoiceOutputOn(true);
-        appendMessage("SYSTEM", "Voice output enabled for desktop replies.");
-        setActivity("Voice output ON.");
+    async function loadVoiceDevices() {
+        try {
+            const data = await requestJson("/voice/devices", { timeoutMs: 6000 });
+            if (data?.ok) {
+                setVoiceDevices(Array.isArray(data.devices) ? data.devices : []);
+                setVoiceCurrentDevice(data.current_device ?? null);
+            }
+        } catch {
+            // best-effort
+        }
+    }
+
+    async function probeVoiceDevices() {
+        if (isProbingDevices) return;
+        setIsProbingDevices(true);
+        setActivity("Probing input devices (1s each)...");
+        try {
+            const data = await requestJson("/voice/probe?device=-1&seconds=1.0", { timeoutMs: 30000 });
+            if (data?.ok && Array.isArray(data.levels)) {
+                const map = {};
+                for (const l of data.levels) {
+                    map[l.index] = l.rms;
+                }
+                setVoiceDeviceLevels(map);
+                setActivity("Device probe complete. Speak into your headset to see which one lights up.");
+            }
+        } catch (err) {
+            setActivity(`Device probe failed: ${err.message}`);
+        } finally {
+            setIsProbingDevices(false);
+        }
+    }
+
+    async function selectVoiceDevice(idx) {
+        try {
+            // Single write path: the Tauri voice_set_input_device writes the
+            // shared config/.voice_device.json that the monitor reads.
+            const data = await invokeTauri("voice_set_input_device", { inputDevice: idx });
+            if (data && typeof data.input_device !== "undefined") {
+                setVoiceCurrentDevice(Number(data.input_device));
+                appendMessage("SYSTEM", `Voice input device set to ${data.input_device}. Restart voice-in to apply.`);
+                setActivity(`Voice device set to ${data.input_device}.`);
+            } else {
+                appendMessage("SYSTEM", "Voice device change failed: no confirmation from device config.");
+            }
+        } catch (err) {
+            appendMessage("SYSTEM", `Voice device change failed: ${err.message}`);
+        }
     }
 
     function compactModelName(name) {
@@ -1559,9 +1778,33 @@ export default function App() {
             return;
         }
 
-        const coreReply = await sendToCore(payload);
+        const coreReply = await sendToCore(payload, {
+            onChunk: (partial) => {
+                // Stream Mina's reply into a single live message as tokens arrive.
+                if (!coreStreamMsgIdRef.current) {
+                    coreStreamMsgIdRef.current = `core-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                    setAvatarMood("talk");
+                    setIsCoreSpeaking(true);
+                    setMessages((prev) => [...prev, { id: coreStreamMsgIdRef.current, from: "MINA", text: partial }]);
+                } else {
+                    const id = coreStreamMsgIdRef.current;
+                    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, text: partial } : m)));
+                }
+            },
+        });
 
-        streamCoreReply(coreReply.text);
+        // Finalize the streamed message state.
+        if (coreStreamMsgIdRef.current) {
+            coreStreamMsgIdRef.current = null;
+            setTimeout(() => {
+                setIsCoreSpeaking(false);
+                setAvatarMood("smirk");
+                setTimeout(() => setAvatarMood("idle"), 900);
+            }, 80);
+        } else {
+            // No chunks arrived (error path); fall back to the returned text.
+            streamCoreReply(coreReply.text);
+        }
 
         if (imageAttachments.length) {
             const activeAttachment = imageAttachments[activeImageIndex] || imageAttachments[0];
@@ -1831,6 +2074,7 @@ export default function App() {
         ["chat", "CHAT"],
         ["images", "IMAGES"],
         ["status", "STATUS"],
+        ["audio", "AUDIO"],
         ["autonomy", "AUTONOMY"],
         ["tasks", "TASKS"],
         ["system", "SYSTEM"],
@@ -2168,22 +2412,6 @@ export default function App() {
                                     </button>
                                 </div>
 
-                                <div className="mk1-service-row">
-                                    <span className={voiceServiceClass}>{voiceServiceUp ? "VOICE INPUT ON" : "VOICE INPUT OFF"}</span>
-                                    <button className="mk1-mini-action" type="button" onClick={toggleVoiceLoopService} disabled={isStartingVoice}>
-                                        {isStartingVoice ? (voiceServiceUp ? "STOPPING..." : "STARTING...") : (voiceServiceUp ? "STOP VOICE IN" : "START VOICE IN")}
-                                    </button>
-                                </div>
-
-                                <div className="mk1-service-row">
-                                    <span className={voiceOutputOn ? "mk1-service-badge mk1-service-up" : "mk1-service-badge mk1-service-down"}>
-                                        {voiceOutputOn ? "VOICE OUTPUT ON" : "VOICE OUTPUT OFF"}
-                                    </span>
-                                    <button className="mk1-mini-action" type="button" onClick={toggleVoiceOutput}>
-                                        {voiceOutputOn ? "STOP VOICE OUT" : "START VOICE OUT"}
-                                    </button>
-                                </div>
-
                                 <button className="mk1-btn" onClick={() => triggerCommand("/time")}>
                                     SHOW LOCAL TIME
                                 </button>
@@ -2236,6 +2464,113 @@ export default function App() {
                                 </div>
 
                                 {statusNote && <div className="mk1-panel-note">{statusNote}</div>}
+                            </div>
+                        </div>
+
+                        <div className="mk1-panel mk1-crt-green mk1-view-audio">
+                            <div className="mk1-panel-title">AUDIO INPUT</div>
+                            <div className="mk1-panel-body mk1-system-body">
+                                <div className="mk1-service-row">
+                                    <span className={voiceServiceClass}>{voiceServiceUp ? "VOICE INPUT ON" : "VOICE INPUT OFF"}</span>
+                                    <button className="mk1-mini-action" type="button" onClick={toggleVoiceLoopService} disabled={isStartingVoice}>
+                                        {isStartingVoice ? (voiceServiceUp ? "STOPPING..." : "STARTING...") : (voiceServiceUp ? "STOP VOICE IN" : "START VOICE IN")}
+                                    </button>
+                                </div>
+
+                                <div className="mk1-service-row">
+                                    <span className={voiceOutputOn ? "mk1-service-badge mk1-service-up" : "mk1-service-badge mk1-service-down"}>
+                                        {voiceOutputOn ? "VOICE OUTPUT ON" : "VOICE OUTPUT OFF"}
+                                    </span>
+                                    <button className="mk1-mini-action" type="button" onClick={toggleVoiceOutput}>
+                                        {voiceOutputOn ? "STOP VOICE OUT" : "START VOICE OUT"}
+                                    </button>
+                                </div>
+
+                                {/* Live waveform drawn from the VAD metrics ring buffer */}
+                                <div className="mk1-mini-field">
+                                    <div className="mk1-mini-label">Waveform (input over time)</div>
+                                    <WaveformCanvas history={voiceMetricsHistory} threshold={Number(voiceMetrics?.threshold ?? 0)} />
+                                </div>
+
+                                {/* Input device picker with live per-device level bars */}
+                                <div className="mk1-mini-field">
+                                    <div className="mk1-mini-label">Input device</div>
+                                    <div className="mk1-device-actions">
+                                        <button className="mk1-mini-action" type="button" onClick={loadVoiceDevices}>
+                                            REFRESH DEVICES
+                                        </button>
+                                        <button className="mk1-mini-action" type="button" onClick={probeVoiceDevices} disabled={isProbingDevices}>
+                                            {isProbingDevices ? "PROBING..." : "PROBE LEVELS"}
+                                        </button>
+                                    </div>
+                                    <div className="mk1-device-list">
+                                        {voiceDevices.length === 0 && <div className="mk1-panel-note">No devices loaded — hit REFRESH DEVICES.</div>}
+                                        {voiceDevices.map((d) => {
+                                            const lvl = voiceDeviceLevels[d.index];
+                                            const active = Number(voiceCurrentDevice) === Number(d.index);
+                                            const lvlPct = lvl == null ? 0 : Math.min(100, Math.round((lvl / 0.05) * 100));
+                                            return (
+                                                <button
+                                                    key={d.index}
+                                                    type="button"
+                                                    className={`mk1-device-row ${active ? "is-active" : ""}`}
+                                                    onClick={() => selectVoiceDevice(d.index)}
+                                                    title={d.name}
+                                                >
+                                                    <span className="mk1-device-name">[{d.index}] {d.name}</span>
+                                                    <span className="mk1-device-meter"><span className="mk1-device-meter-fill" style={{ width: `${lvlPct}%` }} /></span>
+                                                    <span className="mk1-device-rms">{lvl == null ? "--" : lvl.toFixed(4)}</span>
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                    <div className="mk1-panel-note">Pick your headset by watching which device lights up when you talk. Change applies on next voice-in restart.</div>
+                                </div>
+
+                                {(() => {
+                                    const m = voiceMetrics;
+                                    const live = Boolean(m) && voiceServiceUp;
+                                    const rms = Number(m?.rms ?? 0);
+                                    const floor = Number(m?.noise_floor ?? 0);
+                                    const thresh = Number(m?.threshold ?? 0);
+                                    const capturing = Boolean(m?.capturing);
+                                    const muted = Boolean(m?.muted);
+                                    const maxLevel = Math.max(thresh * 2, rms, floor, 0.001);
+                                    const pct = (v) => `${Math.min(100, Math.round((v / maxLevel) * 100))}%`;
+                                    return (
+                                        <>
+                                            <div className="mk1-panel-note">
+                                                {muted
+                                                    ? "CAPTURE MUTED (privacy gate)"
+                                                    : live
+                                                        ? (capturing ? "LISTENING — speech detected" : "LISTENING — ambient")
+                                                        : "NO LIVE METER (voice loop off or not streaming)"}
+                                            </div>
+
+                                            <div className="mk1-mini-field">
+                                                <div className="mk1-mini-label">Input level (RMS)</div>
+                                                <div className="mk1-meter"><div className="mk1-meter-fill mk1-meter-rms" style={{ width: pct(rms) }} /></div>
+                                                <div className="mk1-kv">rms={rms.toFixed(4)}</div>
+                                            </div>
+
+                                            <div className="mk1-mini-field">
+                                                <div className="mk1-mini-label">Noise floor (ambient — Spotify/room)</div>
+                                                <div className="mk1-meter"><div className="mk1-meter-fill mk1-meter-floor" style={{ width: pct(floor) }} /></div>
+                                                <div className="mk1-kv">floor={floor.toFixed(4)}</div>
+                                            </div>
+
+                                            <div className="mk1-mini-field">
+                                                <div className="mk1-mini-label">Trigger threshold (adaptive)</div>
+                                                <div className="mk1-meter"><div className="mk1-meter-fill mk1-meter-thresh" style={{ width: pct(thresh) }} /></div>
+                                                <div className="mk1-kv">thresh={thresh.toFixed(4)} | snr×{m?.snr_ratio ?? "--"} | floor α={m?.noise_floor_alpha ?? "--"}</div>
+                                            </div>
+
+                                            <div className="mk1-panel-note">
+                                                When input sits at the noise floor (music), threshold rides above it and nothing triggers. Speech spikes over the floor and trips. If music still triggers, raise the trigger gap (snr-ratio) or lower mic gain.
+                                            </div>
+                                        </>
+                                    );
+                                })()}
                             </div>
                         </div>
 

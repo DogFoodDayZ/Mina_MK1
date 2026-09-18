@@ -21,6 +21,7 @@ import argparse
 import ctypes
 import os
 import re
+import threading
 import time
 import subprocess
 import sys
@@ -155,6 +156,37 @@ def _remove_privacy_file(privacy_file: str | None) -> None:
         pass
 
 
+def _post_vad_metrics(args, rms: float, floor: float, thresh: float, capturing: bool, voiced_count: int) -> None:
+    """Push a live VAD snapshot to the API for the GUI audio tab. Best-effort,
+    fully non-blocking: never let a metrics post stall or crash the audio loop."""
+    if not getattr(args, "metrics_enabled", True):
+        return
+    payload = {
+        "ts": time.time(),
+        "rms": round(float(rms), 5),
+        "noise_floor": round(float(floor or 0.0), 5),
+        "threshold": round(float(thresh), 5),
+        "capturing": bool(capturing),
+        "voiced_chunks": int(voiced_count),
+        "device": getattr(args, "device", -1),
+        "speech_threshold": getattr(args, "speech_threshold", None),
+        "snr_ratio": getattr(args, "snr_ratio", None),
+        "noise_floor_alpha": getattr(args, "noise_floor_alpha", None),
+        "muted": _is_privacy_enabled(
+            getattr(args, "privacy_file", None) or os.path.join(tempfile.gettempdir(), "mina_voice_monitor.mute"),
+            getattr(args, "privacy_env", ""),
+        ),
+    }
+
+    def _send():
+        try:
+            requests.post(f"{args.api}/voice/metrics", json=payload, timeout=1.0)
+        except Exception:
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 def _handle_voice_result(out: dict, privacy_file: str | None = None) -> None:
     if not out.get("ok"):
         print("Voice request failed:")
@@ -252,6 +284,15 @@ def run_continuous_loop(args) -> int:
         max_rms_recent = 0.0
         last_heartbeat = time.monotonic()
 
+        # Adaptive noise floor: track ambient RMS (e.g. Spotify bleed, room tone)
+        # with a slow exponential average. A frame is only "voiced" when it is
+        # clearly ABOVE the moving floor, so steady background music stops
+        # false-triggering while speech (a sharp rise over the floor) still trips.
+        noise_floor = None
+        floor_alpha = args.noise_floor_alpha  # slow follower
+        snr_ratio = args.snr_ratio            # required rise above floor
+        last_metrics_post = 0.0
+
         while True:
             muted = _is_privacy_enabled(effective_privacy_file, args.privacy_env)
             if muted:
@@ -273,16 +314,36 @@ def run_continuous_loop(args) -> int:
                 continue
 
             rms = float(np.sqrt((chunk * chunk).mean()))
+
+            # Update the adaptive noise floor ONLY when we are not in an utterance,
+            # so speech does not inflate the floor and lock itself out.
+            if noise_floor is None:
+                noise_floor = rms
+            elif not capturing:
+                noise_floor = (floor_alpha * noise_floor) + ((1.0 - floor_alpha) * rms)
+
+            # Effective threshold: the higher of the absolute floor or the
+            # SNR-scaled adaptive floor.
+            adaptive_thresh = max(args.speech_threshold, noise_floor * snr_ratio)
+
             if rms > max_rms_recent:
                 max_rms_recent = rms
 
             now = time.monotonic()
             if now - last_heartbeat >= 3.0:
-                print(f"[listen] rms_max={max_rms_recent:.4f} threshold={args.speech_threshold:.4f}")
+                print(
+                    f"[listen] rms_max={max_rms_recent:.4f} floor={noise_floor:.4f} "
+                    f"thresh={adaptive_thresh:.4f} capturing={capturing}"
+                )
                 max_rms_recent = 0.0
                 last_heartbeat = now
 
-            voiced = rms >= args.speech_threshold
+            voiced = rms >= adaptive_thresh
+
+            # Throttled live metrics for the GUI audio tab (~5 Hz max).
+            if now - last_metrics_post >= 0.2:
+                _post_vad_metrics(args, rms, noise_floor, adaptive_thresh, capturing, voiced_count)
+                last_metrics_post = now
 
             if voiced:
                 if not capturing:
@@ -315,7 +376,9 @@ def main() -> int:
     parser.add_argument("--device", type=int, default=-1, help="Input device index (-1 = default)")
     parser.add_argument("--voice-hint", default="en-US-AnaNeural", help="Preferred TTS voice")
     parser.add_argument("--continuous", action="store_true", help="Real-time VAD monitoring mode")
-    parser.add_argument("--speech-threshold", type=float, default=0.002, help="RMS threshold for VAD")
+    parser.add_argument("--speech-threshold", type=float, default=0.002, help="Absolute RMS floor for VAD")
+    parser.add_argument("--snr-ratio", type=float, default=3.0, help="VAD: frame must be this many times the adaptive noise floor to count as speech")
+    parser.add_argument("--noise-floor-alpha", type=float, default=0.98, help="VAD: noise-floor follower speed (higher = slower, 0-1)")
     parser.add_argument("--frame-ms", type=int, default=100, help="Frame duration for VAD")
     parser.add_argument("--silence-ms", type=int, default=700, help="Silence duration to end utterance")
     parser.add_argument("--min-speech-ms", type=int, default=120, help="Minimum voiced duration to send")

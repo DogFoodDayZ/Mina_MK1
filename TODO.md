@@ -1,4 +1,93 @@
 
+### Issue: Alarm intent with "a.m." + "morning" phrasing fell into clarify fallback
+
+- Date: 2026-09-17
+- Reporter: Travis, live voice transcript
+- Priority: High
+- Status: Fix committed, pending live verification
+
+#### What Travis asked Mina to do
+- "set an alarm for 5 a.m. tomorrow morning"
+
+#### What Mina actually did
+- Dropped into `__clarify_intent__`, then the model free-styled "Sure thing! I'll create a little script..." — no task was ever written.
+
+#### What should have happened
+- Parse the absolute alarm and write a scheduled task with alarm tags.
+
+#### Evidence
+- Offline detect_tool_intent: 'set an alarm for 5 a.m. tomorrow morning' -> __clarify_intent__; 'set an alarm for 5 am tomorrow' -> __task_memory_write__ correctly.
+- Root: alarm_absolute_patterns required the task connector (for/about/to) immediately after the optional day; trailing "morning" left unconsumed text, so no match.
+
+#### Failure class
+- Intent parser gap on natural phrasing
+
+#### Root cause
+- Regex didn't allow day-part words (morning/afternoon/evening/tonight) after the day token, and connector list lacked called/named.
+
+#### Minimal fix
+- Both alarm absolute patterns now accept an optional "in the morning/tonight/etc." tail and called/named task connectors.
+
+#### Regression prompt
+- Transcript-grounded: `set an alarm for 5 a.m. tomorrow morning` must produce __task_memory_write__ with alarm_task+beep tags.
+
+#### Implementation choice
+- Chosen approach: hardcoded parser pattern (deterministic routing rule).
+- Why this fits: time parsing is a deterministic contract, not learned behavior.
+- Risk if wrong: memory-learned phrasing would be nondeterministic for a safety-adjacent function (alarms).
+
+#### Verification status
+- Offline: 5/5 alarm phrasings parse including the transcript one.
+- pytest -k "alarm or reminder or schedule or task": 17 passed.
+- Live verification pending next safe API restart.
+
+---
+
+### Issue: Mina repeats herself and ignores conversation on short voice turns
+
+- Date: 2026-09-17
+- Reporter: Travis, live voice transcript
+- Priority: High
+- Status: Fix committed, pending live verification
+
+#### What Travis asked Mina to do
+- Hold a normal back-and-forth voice conversation.
+
+#### What Mina actually did
+- Repeated an identical greeting block word-for-word ("symphony of stars... new script ready for ya!") and pushed scripts regardless of what Travis said ("Quit lying to me.", "Oh.").
+
+#### What should have happened
+- Short voice turns should see the recent conversation so replies build on it instead of restarting a greeting.
+
+#### Evidence
+- Live transcript 2026-09-17: two identical reply blocks within 4 turns.
+- Raw model call (bypassing Mina) was coherent and non-repetitive — model is healthy.
+- `agent/core.py` `_relevant_recent_turns`: "Oh." yields no tokens over 2 chars after stop-word filtering, returns `[]`; "Quit lying to me." yields {quit, lying} with no overlap in recent turns, returns `[]`. Both turns sent to the model with zero conversation history.
+
+#### Failure class
+- Recall/context gating too aggressive
+
+#### Root cause
+- `_relevant_recent_turns` used lexical overlap as a hard gate; short or non-overlapping turns got no short-term history. Surfaced after the Step-1 reply-shaping trim removed layers that had masked the behavior.
+
+#### Minimal fix
+- `_relevant_recent_turns` now ranks by overlap but falls back to raw recency when overlap is empty or the query has no usable terms; never returns empty when history exists.
+
+#### Regression prompt
+- Transcript-grounded: `Oh.` and `Quit lying to me.` mid-conversation should not produce a fresh greeting repeat.
+
+#### Implementation choice
+- Chosen approach: memory-driven (recency fallback uses stored short-term turns).
+- Why this fits: conversation continuity is learned session context, not a fixed rule.
+- Risk if wrong approach chosen: hardcoding specific phrase handling would just move the failure to other short phrasings.
+
+#### Verification status
+- `tests/test_memory_recall.py`: 99 passed (MK1_REQUIRE_EMBED=0).
+- `agent/core.py` syntax OK; core_reference refreshed.
+- Live verification pending next safe API restart.
+
+---
+
 ### Issue: Dolphin3 conversation used an unnecessary isolated memory lane
 
 - Date: 2026-08-27
@@ -238,6 +327,522 @@ Copy this block for each new problem and fill it in.
 - [ ] Action verified with proof
 - [ ] No regression on prompts above
 - [ ] Mina tone/conciseness still correct
+
+---
+
+### Issue: Reply-override layers second-guessed Mina's voice after every model turn
+
+- Date: 2026-09-16
+- Reporter: Travis, step-1 chat-stabilization session
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompts: "the core.py is riddled with forced answers and redirects that are not nessisary if Mina is the chat agent primarily." / "option one" (conservative trim: keep tool execution, strip reply overrides).
+
+#### 2) What Mina actually did
+- Actual response: Model replies were mechanically rewritten or replaced after generation.
+- Actual action taken: `_enforce_tool_outcome_truth` prepended raw failure text over her words; `_maybe_enforce_verified_execution_reply` swapped her reply for a canned "I did not run that command yet" script or force-re-ran tools; `_maybe_build_ambiguity_prompt` hijacked prompts like bare "play" into a scripted game/music question; the external-messaging detector hard-refused texting prompts with a canned capability script.
+
+#### 3) What should have happened
+- Expected response: Dolphin (chat half) speaks from verified tool output already in context, in Mina's voice, without mechanical prepends, swaps, or canned derails.
+- Expected action/result: Tool execution stays reflex-driven; reply text stays model-owned.
+
+#### 4) Evidence
+- Transcript snippet: "send my brother a hello text from Mina" previously returned the canned "I cannot send real texts..." refusal; bare "play" returned "When you say 'play', what do you want to play right now..."
+- File path(s) affected: `agent/core.py`, `tests/test_intent_ambiguity.py`, `tests/test_memory_recall.py`
+- Error text (exact): n/a (behavioral)
+
+#### 5) Failure class (pick one)
+- Persona/response contract broken
+
+#### 6) Root cause (after investigation)
+- ~3,000 lines of deterministic post-hoc reply enforcement existed because older chat models could not be trusted with truthful tool-outcome reporting. Under the ARCHITECTURE.md split (Dolphin = conversational half, coder = execution half), the chat model is the voice of record and the overrides actively fight it.
+
+#### 7) Minimal fix
+- Removed both `_enforce_tool_outcome_truth` call sites (process + process_stream preflight), all three `_maybe_enforce_verified_execution_reply` call sites, the ambiguity-prompt block and the external-messaging `__capability_limit__` block in `detect_tool_intent`; deleted the four dead functions plus `_maybe_build_ambiguity_prompt`. Updated 6 tests to the new no-hijack contract; deleted 4 tests that pinned the removed functions. Tool execution, rescue path, VERIFIED OUTPUT context injection, and the startup route guard are unchanged.
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: "play" (bare) — must not return scripted clarification; covered by `test_bare_play_prompt_is_not_hijacked_by_canned_clarification`.
+- Prompt 2: "send my brother a hello text from Mina" — must stay conversational, no canned refusal; covered by `test_send_text_to_brother_stays_conversational_without_canned_refusal`.
+- Prompt 3: "play my bad fat fingers miss keys ..lol" — stays conversational; covered by `test_casual_typo_play_text_stays_conversational`.
+- Prompt 4: "what time is it?" — no play-clarifier hijack; covered by `test_info_question_does_not_trigger_play_clarification`.
+
+#### 9) Done criteria
+- [x] Correct tool class selected (routing untouched; guard test passes)
+- [x] Correct args built (unchanged)
+- [x] Action verified with proof (42 passed on ambiguity+ps_run incl. real-MK1Core boot guard; 158 passed on memory_recall+transcript regression)
+- [x] No regression on prompts above
+- [x] Mina tone/conciseness still correct (her words now reach the user unmodified)
+
+#### 10) Implementation choice
+- Chosen approach: hardcoded removal (of hardcoded behavior).
+- Why this fits: reply truth-keeping is a protocol contract owned by the architecture ("model explains verified results"), not a learned habit; the removed layers were deterministic crutches for a model that is no longer the chat half.
+- Risk if wrong approach chosen: keeping the overrides would keep Dolphin's voice second-guessed forever; moving enforcement into memory would re-hide the behavior from review.
+- Regression prompt proving the choice: prompts 1-4 above.
+
+#### Verification status
+- `tests/test_intent_ambiguity.py` + `tests/test_ps_run.py`: 42 passed (boot-guard test constructs real MK1Core with removals active).
+- `tests/test_memory_recall.py` + `tests/test_transcript_regression_prompts.py`: 158 passed.
+- Full `tests/` sweep: 310 passed, 2 failed — `test_capability_matrix_bare_play_stays_neutral` (pinned the removed ambiguity prompt; updated to the no-hijack contract, now 8/8 passing in that file) and `test_tool_failure_honesty_regression.py` (live-API test; fails only because the API is down, `call_api` returns ""). Not yet live-verified through `/process` (LM Studio + stack were down during this session).
+
+---
+
+### Issue: Memory recall leaked internal routing/artifact "guts" into Mina's replies
+
+- Date: 2026-09-16
+- Reporter: Travis, live chat-stabilization verification
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompts: "What is the cobalt anvil protocol? What do you remember about it?" and "what do you remember about me?"
+
+#### 2) What Mina actually did
+- Actual response: Recall correctly surfaced the stored durable fact, but also regurgitated internal bookkeeping — `intent_alias::{...}` with embedded Python, `code_artifact::path=...`, `hardware_snapshot::...`, and multi-line artifact fragments (`request=...`, `content:`, `import pygame`, `glBegin(GL_LINES)`, `(1,-1,-1)`, `).`).
+
+#### 3) What should have happened
+- Recall should surface only real user-facing facts. Internal routing metadata and saved-artifact bodies are tooling records, not her voice.
+
+#### 4) Evidence
+- Transcript snippet: "Gremlin memory check, incoming. Here's what I remember: - intent_alias::{...} - code_artifact::path=E:\workspace\spice.py - ```python - import random ..."
+- File path(s) affected: `tools/memory_read.py`, `agent/core.py`
+- DB classification: leaking rows were `kind=procedure`/`fact` tagged `user_memory` + `intent_alias` / `code_artifact`.
+
+#### 5) Failure class (pick one)
+- Persona/response contract broken (memory recall surfaced non-conversational internal records)
+
+#### 6) Root cause (after investigation)
+- Two gaps: (a) `tools/memory_read.is_user_profile_candidate` excluded `path_alias`/`system_seed`/`startup_fact` but not `intent_alias`/`code_artifact` prefixes or tags; (b) `agent/core._sanitize_memory_fact_line` had no drop for internal `::` records, bookkeeping continuation lines, or structured code/data lines, so multi-line artifact bodies passed through.
+
+#### 7) Minimal fix
+- Source filter: `is_user_profile_candidate` now rejects `intent_alias::`, `code_artifact::`, `mina_capability_snapshot::`, `mina_capability_delta::`, `hardware_snapshot::` prefixes, `request=`/`content:` continuation fragments, code fences/lines, and the `intent_alias`/`code_artifact` tags. Defense-in-depth: `_sanitize_memory_fact_line` now also drops those same prefixes plus structured code/data lines (assignments, tuple lines, function-call lines, loop/branch headers, bare bracket fragments). `build_context` filter list gained `intent_alias::`. Real declarative user facts are untouched.
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: "What is the cobalt anvil protocol?" — fact recalled, no guts; live-verified.
+- Prompt 2: "what do you remember about me?" — only real facts returned; live-verified.
+- Prompt 3 (unit): `test_memory_read_broad_recall_never_returns_internal_routing_or_artifact_records`.
+- Prompt 4 (unit): `test_sanitize_memory_fact_line_drops_internal_routing_and_artifact_records` (13 drop cases + real-fact preservation).
+
+#### 9) Done criteria
+- [x] Internal routing/artifact records never surface as recalled memories (tool + core layers)
+- [x] Real durable facts still recalled (cobalt anvil, favorite color, eye color, brother's name all surfaced live)
+- [x] `tests/test_memory_read_tool.py` + `tests/test_memory_recall.py`: 92 passed
+- [x] Live `/process` proof on restarted API for both targeted and broad recall
+- [ ] Dolphin sometimes paraphrases/embellishes a stored passphrase instead of reciting it verbatim (separate persona/grounding tuning, not a routing bug)
+
+#### 10) Implementation choice
+- Chosen approach: memory-first retrieval filtering (hardcoded record-type exclusions at the tooling boundary).
+- Why this fits: which record types are internal scaffolding is a stable system invariant, not a learned user habit; the DB stays source of truth and only the recall *surface* is filtered.
+- Risk if wrong approach chosen: a memory-driven/per-topic filter would be brittle and re-leak on new artifact shapes; filtering at recall time keeps stored data intact for tooling.
+
+#### Verification status
+- Direct probe: `_sanitize_unique_facts` now drops `glBegin(GL_LINES)`, `for edge in edges:`, `vertices = (`, `(1,-1,-1)`, `).`, `import pygame`, `request=...`, `content:.`, and all `::` prefixes; preserves real facts.
+- Live `/process` after restart: broad recall returned only real user facts; targeted recall returned Mina-voice answer with zero guts.
+- `tests/test_memory_recall.py` 89 passed, `tests/test_memory_read_tool.py` 3 passed.
+
+---
+
+### Issue: Memory write reply was a storage receipt, not Mina's voice; and the fact got truncated
+
+- Date: 2026-09-16
+- Reporter: Travis, live transcript
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- Exact prompts: "We live in Spokane Washington you may want to remember that."
+
+#### 2) What Mina actually did
+- Actual response: `Stored memory: We live in Spokane Washington you may want to` — a storage receipt parroted verbatim, and the fact itself was truncated (tail "remember that" eaten).
+
+#### 3) What should have happened
+- Mina acknowledges in her own voice ("ok, Spokane, got it"), and the full fact is stored intact.
+
+#### 4) Evidence
+- Transcript: `MINA Stored memory: We live in Spokane Washington you may want to`
+- File path(s): `agent/core.py`, `tools/memory_write.py`
+- DB: stored fact row id=9980 held the truncated text.
+
+#### 5) Failure class
+- Persona/response contract broken + args extraction wrong (truncation)
+
+#### 6) Root cause (after investigation)
+- Two layers: (a) `_render_tool_response_as_mina` returned the raw `Stored memory: X` receipt because `memory_write` is in `_raw_direct_render_tool_names`; (b) `tools/memory_write.clean_memory_text` did a blind `endswith("remember that")` strip, eating the mid-clause tail. `extract_memory_write_text` had the same clause-blindness.
+
+#### 7) Minimal fix
+- Added `_render_memory_write_ack`: `memory_write` now routes through the model to acknowledge in Mina's voice, with a receipt-free fallback ("Got it — I'll remember that X."). Fixed trailing-trigger stripping in both `extract_memory_write_text` and `clean_memory_text` to only strip when the trigger is a standalone clause (comma/conjunction) or a bare command not led by "to" — preserving mid-clause "remember that". Also stripped a leading "this:"/"that:" prefix left by "remember this: ...".
+
+#### 8) Regression prompts (must pass)
+- Prompt 1: "We live in Spokane Washington you may want to remember that." → full fact stored (`test_detect_memory_write_preserves_mid_clause_remember_that`, `test_memory_write_preserves_mid_clause_remember_that`).
+- Prompt 2: "We live in Spokane Washington, remember that." → "We live in Spokane Washington" (standalone clause stripped).
+- Prompt 3: "remember this: the cobalt anvil protocol" → "the cobalt anvil protocol" (leading `this:` removed).
+- Prompt 4 (voice): `test_memory_write_acknowledges_in_mina_voice_not_receipt` + `test_memory_write_ack_falls_back_without_receipt_when_model_errors`.
+
+#### 9) Done criteria
+- [x] Fact stored intact, no truncation
+- [x] Mina replies in her own voice, no "Stored memory:" receipt
+- [x] 128 passed across memory_recall/memory_write/memory_read/intent_ambiguity
+- [x] No live DB pollution from verification (unit tests with fakes only)
+
+#### 10) Implementation choice
+- Chosen approach: hardcoded clause-boundary detection (extraction) + model-rendered acknowledgement (voice).
+- Why this fits: extraction clause rules are a stable text contract; the acknowledgement voice is Mina's and must not be a hardcoded receipt.
+- Risk if wrong approach chosen: a hardcoded ack would be the same receipt hijack in disguise; a memory-driven extractor would be brittle on new phrasings.
+
+#### Verification status
+- Unit/fake tests only (no live memory writes this round): 128 passed.
+- Stack restarted with fixes live; core_online=True, memory_enabled=True.
+
+---
+
+### Issue: Test/agent memory writes polluted Mina's real memory as if they were Travis's facts
+
+- Date: 2026-09-16
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- "is there away we can keep the tests in the database let mina know your running test so she knows the test facts without thinking its me creating them?"
+
+#### 2) What Mina actually did
+- Live verification writes (cobalt anvil, huckleberries) were stored as ordinary `user_memory` facts and surfaced in recall as if Travis said them. 37 pollution rows accumulated this session.
+
+#### 3) What should have happened
+- Test/agent writes should be tagged so Mina knows they're test data, not Travis's real facts, and recall should surface them labeled.
+
+#### 4) Evidence
+- DB query showed 37 rows (facts, interactions, heartbeats, tool calls, an auto-promoted long_term copy) from the two synthetic facts.
+- TODO contract line 114: "Do not use synthetic memories or repeated live prompts to manufacture evidence of recall."
+
+#### 5) Failure class
+- Memory retrieval reliability / provenance
+
+#### 6) Root cause
+- No provenance tag distinguished test-harness writes from real user writes; recall treated all `user_memory` facts as authoritative Travis facts.
+
+#### 7) Minimal fix
+- Test harness writes now pass `tags=["user_memory","test_data","source:agent_test"]` explicitly. `_format_tool_result` for `memory_read` prefixes such entries with `(test data) ` so recall surfaces them labeled, not as standing Travis facts. Deleted the 37 pollution rows, then restored the two test facts with proper tags (and fixed the malformed `this:` prefix).
+
+#### 8) Regression prompts
+- Prompt 1 (unit): `test_memory_read_result_labels_test_data_facts` — real fact unlabeled, test facts get `(test data)` prefix.
+- Prompt 2 (design rule): real user writes never carry the tag; only explicit test-harness writes do.
+
+#### 9) Done criteria
+- [x] Test facts tagged at write time (`test_data`, `source:agent_test`)
+- [x] Recall surfaces them labeled, not as Travis facts
+- [x] Real user facts unaffected
+- [x] 128 passed; pollution rows cleaned and re-stored with tags
+
+#### 10) Implementation choice
+- Chosen approach: hardcoded provenance tagging + deterministic label at the format boundary.
+- Why this fits: provenance is a stable system invariant; no hidden mode switch (explicit tag in the write call), which the contract requires.
+- Risk if wrong approach chosen: auto-detecting "test context" would be a hidden mode switch the contract forbids; memory-driven labeling would be inconsistent.
+
+#### Verification status
+- `test_memory_read_result_labels_test_data_facts` passes; 128 passed overall.
+- Two test facts restored in DB with `test_data`/`source:agent_test` tags (ids 9995, 9996).
+- Live labeling through `/process` not re-probed (avoiding further writes); format-level unit test covers the label.
+
+---
+
+### Issue: GUI waited for full reply; voice loop false-triggered on Spotify bleed
+
+- Date: 2026-09-16
+- Reporter: Travis, live use
+- Priority: High
+- Status: Done (backend + GUI + VAD); LM Studio load-context change is Travis-side
+
+#### 1) What I asked Mina to do
+- "i see the response in lm studio 10 to 20 seconds before i see it in the gui" and "she is picking up random sound when my mic is off... getting feedback from the spotify music app"
+
+#### 2) What Mina actually did
+- GUI: `/process` blocking call rendered only after LM Studio finished; `/process-stream` was not truly streaming (it called blocking `core.process` then re-chunked the full reply).
+- Voice: the continuous VAD used a fixed RMS threshold (0.002) with no noise-floor adaptation, so steady Spotify bleed sat above the floor and counted as "voiced" indefinitely, sending phantom audio.
+
+#### 3) What should have happened
+- GUI: render tokens as they are generated.
+- Voice: reject steady background music; only trigger on a clear rise above the ambient floor (real speech).
+
+#### 4) Evidence
+- Raw LM Studio call: 0.87s; full `/process-stream` first chunk: 41.5s → prompt-processing delay, not the endpoint. LM Studio `dolphin3-nsfw-gf-chat` loaded at `max_context_length=131072` on a 12GB RX 6700 XT (KV-cache spill to CPU is the 40s cause).
+- Process list: two orphaned voice loops (PIDs 18876/21232) at `--speech-threshold 0.002 --device 1` with privacy gate off, respawned by `start_mina_voice_monitor.ps1`.
+
+#### 5) Failure class
+- Performance (GUI blocking + oversized LM Studio context) + voice VAD noise-floor bug
+
+#### 6) Root cause
+- `/process-stream` regressed to blocking+re-chunk instead of consuming the live `core.process_stream` generator. The VAD had no adaptive noise floor, so steady music was treated as speech.
+
+#### 7) Minimal fix
+- `/process-stream` now consumes `core.process_stream` and yields SSE chunks as tokens arrive (verified: 29 chunks incremental). GUI `sendToCore` now streams from `/process-stream` and renders into a single live message via `onChunk` (uses `coreStreamMsgIdRef`). Voice loop added an adaptive noise-floor VAD: a slow follower (`--noise-floor-alpha`, default 0.98) tracks ambient RMS only when not capturing, and a frame is voiced only when it exceeds `max(speech_threshold, floor * --snr-ratio)` (default 3.0). Monitor passes the new knobs through. Duplicate-spawn behavior observed (loop spawned a child) — monitor is single; flagged for later.
+
+#### 8) Regression prompts
+- Prompt 1 (unit): `tests/test_voice_vad.py` — steady music absorbed into floor and rejected; speech spike triggers; absolute floor respected; floor does not inflate during capture (4 passed).
+- Prompt 2 (live): GUI shows Mina's reply streaming in as it's generated.
+- Prompt 3 (live): with Spotify playing and no speech, voice loop does not send audio.
+
+#### 9) Done criteria
+- [x] `/process-stream` truly streams (live-verified incremental chunks)
+- [x] GUI builds (`pnpm build` passed) and renders live
+- [x] Adaptive VAD unit-tested (4 passed), orphans + monitor killed, relaunched with new args
+- [ ] Travis lowers LM Studio Dolphin load context 131072 → 8192 + full GPU offload (his action)
+- [ ] Duplicate voice-loop child process root-caused (monitor is single; loop spawned PID 18484)
+
+#### 10) Implementation choice
+- Chosen approach: hardcoded adaptive VAD (deterministic signal processing) + streaming endpoint wiring (protocol).
+- Why this fits: noise-floor gating and SSE framing are stable system invariants, not learned behavior. No new keyword traps.
+- Risk if wrong approach chosen: a fixed threshold would keep false-triggering on music; a model-side "is this speech" call would be far too slow for VAD.
+
+#### Verification status
+- Backend streaming live-verified (incremental chunks, firstChunk≈41.5s due to LM Studio context, then 29 chunks over ~1.2s).
+- GUI `pnpm build` passed; `sendToCore` streams via SSE reader.
+- VAD unit tests 4 passed; voice monitor relaunched with `--snr-ratio 3 --noise-floor-alpha 0.98`.
+
+---
+
+### Feature: Audio tab with live VAD meters and controls in the GUI
+
+- Date: 2026-09-16
+- Reporter: Travis
+- Priority: Medium
+- Status: Done (backend + GUI + loop); live view needs a safe restart to activate
+
+#### What Travis asked for
+- "add better controls for the audio pipe in the gui... create a new tab with monitoring for input values and debug in the loop itself"
+
+#### What was built
+- Voice loop POSTs a throttled (~5 Hz) VAD snapshot to `/voice/metrics`: rms, noise_floor, threshold, capturing, voiced_chunks, muted, device, snr_ratio, noise_floor_alpha. Daemon-thread, never blocks audio.
+- API: `POST /voice/metrics` (latest + 120-entry ring) and `GET /voice/metrics?history=N` (latest + live flag + optional history).
+- GUI: new AUDIO tab with live input/noise-floor/threshold meters, capturing/muted state, voice-in start/stop, and a plain-English debug note. Polls only while the tab is open. CSS in `crt.css`.
+
+#### Implementation choice
+- Hardcoded metrics pipe + deterministic meters (instrumentation), not model behavior. VAD telemetry is a stable system signal; a direct POST+ring buffer is the right boundary (memory/chat would pollute recall and lag).
+
+#### Verification status
+- `tests/test_voice_metrics_api.py`: 2 passed. `tests/test_voice_vad.py`: 4 passed. GUI `pnpm build` passed. 13 passed across voice/API suites.
+- Live view activates on next safe restart.
+
+---
+
+### Feature: Audio tab waveform + input device picker (device-select bug fix)
+
+- Date: 2026-09-16
+- Reporter: Travis
+- Priority: High
+- Status: Done (code); live on next safe restart + voice relaunch
+
+#### What Travis asked for
+- "I know its the front jack but the ability to change sound setup would be great" and "it would be nice to see wave forms"
+
+#### Root cause found (live device probe)
+- The voice monitor auto-selected the FIRST input-capable device (device 1, front-panel pink jack), which read RMS ≈ 0.00002 — dead-jack static right at the VAD floor, causing constant chatter. The real headset measured RMS ≈ 0.026 on device 2 (USB 2.0 Camera mic). The earlier "Spotify bleed" theory was wrong; this was wrong-device selection, not music. The adaptive VAD is still useful (steady-signal rejection) but was not the root cause.
+
+#### What was built
+- API (`agent/server/mk1_api.py`): `GET /voice/devices` (input-capable devices + configured one), `POST /voice/device` (validate + persist to `config/.voice_device.json`), `GET /voice/probe?device=-1&seconds=1` (live per-device RMS for the picker).
+- Monitor (`start_mina_voice_monitor.ps1`): now honors `config/.voice_device.json` (GUI-chosen device) before the first-input auto-detect fallback.
+- GUI (`apps/mina-gui/src/App.jsx` + `crt.css`): AUDIO tab gained a live `WaveformCanvas` (input RMS over time + threshold reference line) and a device picker with per-device live level bars (REFRESH DEVICES / PROBE LEVELS / click-to-select).
+
+#### Implementation choice
+- Hardcoded device enumeration/probe/persist (deterministic instrumentation) + GUI-chosen device honored by the monitor. No model behavior involved.
+
+#### Verification status
+- Live per-device probe: device 1 (front jack) ≈ 0.00002 (dead), device 2 (USB camera mic) ≈ 0.026 (headset) — measured 2026-09-16.
+- `mk1_api.py` syntax OK; GUI `pnpm build` passed with waveform + picker.
+- Endpoint unit tests for /voice/metrics already green (2 passed); device endpoints are thin wrappers over the same sounddevice probe used live.
+- Live device-picker + waveform activate on next safe restart + voice monitor relaunch.
+
+---
+
+### Issue: Voice loop cycled constantly + "voice output off" while Mina spoke
+
+- Date: 2026-09-16
+- Reporter: Travis, live use
+- Priority: High
+- Status: Root cause fixed (single-instance guard); voice relaunch pending
+
+#### 1) What Travis reported
+- "it keeps cycling and the delay time from my speech to minas reply is huge" and "the loop is start stopping constantly it says voice output is of and i can clearly hear mina"
+
+#### 2) What was actually happening
+- The voice monitor was restart-looping the voice loop every few minutes. The GUI showed "VOICE OUTPUT OFF" while Mina's voice was still audible. Two voice-loop processes kept spawning.
+
+#### 3) Root cause (after investigation)
+- TWO separate bugs:
+  - **Doubled tray launcher**: `mina_tray_launcher.py` was running twice (boot startup 9/14 + a manual relaunch). The tray launcher owns the API, embed server, AND voice monitor — so two launchers meant two voice monitors both running restart-on-exit, fighting over the mic device and respawning each other's loops. That's the cycling.
+  - **Stale status indicator**: the GUI's "VOICE OUTPUT" reads `/voice/status` → `_voice_monitor_status`, which checks the monitor pid file. When the monitor died, the pid file went stale and the indicator read OFF — while Mina's TTS playback (a separate path on `/process` replies with `speak_response`) kept working. Indicator and reality diverged.
+
+#### 4) Minimal fix
+- Added a Windows single-instance mutex guard to `mina_tray_launcher.py` (`_acquire_single_instance_mutex`): a second launch (boot startup + manual, or a double-click) becomes a no-op instead of doubling the stack. Killed both doubled launchers + all doubled children (embed/uvicorn/voice), relaunched ONE clean launcher, started the API directly. Result: clean single process tree (embed 4080→33176, uvicorn 31876→29752), API + embed up once.
+- Note: the tray launcher does NOT auto-start the API on boot — it waits for a tray "Launch Mina" click. The API was started directly via `mk1_api.ps1 start`.
+
+#### 5) Failure class
+- Runtime process management (duplicate-instance) + stale status indicator
+
+#### 6) Regression prompts
+- Prompt 1: relaunch the tray launcher twice → second instance exits as a no-op (mutex guard).
+- Prompt 2: GUI voice-output indicator should reflect actual TTS state, not a stale pid file.
+
+#### 7) Done criteria
+- [x] Single-instance guard in the launcher (mutex)
+- [x] Clean single process tree (no doubled embed/uvicorn/voice)
+- [x] API + embed up once
+- [ ] Voice monitor relaunched on the correct headset device (Travis to confirm device via the AUDIO tab picker)
+- [ ] GUI "voice output" indicator reads actual TTS playback state, not the monitor pid file (open follow-up)
+
+#### 8) Implementation choice
+- Hardcoded single-instance guard (deterministic process invariant). Not model behavior.
+
+#### Verification status
+- `mina_tray_launcher.py` syntax OK; single-instance mutex added.
+- Live: after cleanup + single relaunch, `pythonw` tray processes = 1 logical instance (parent+child), API 8000 UP, embed 8084 UP, GUI 1420 UP, single clean python process tree.
+
+---
+
+### Issue: Two voice owners fought over the mic (GUI helper vs standalone monitor)
+
+- Date: 2026-09-16
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What Travis asked
+- "we need one and only one voice in and out that i can control from the gui what is the best option of the two we have"
+
+#### 2) What was actually happening
+- The GUI's "START VOICE IN" launches `start_mina_voice_monitor.ps1`, but the Tauri app also has its own native voice helper (`ensure_voice_helper` / `voice_start` / `VOICE_CHILD`) that spawns a *second* python voice loop. Two owners, one mic, both with restart-on-exit → the constant cycling.
+
+#### 3) Decision + fix
+- Chose the standalone monitor as the single voice owner (it has the adaptive VAD, the metrics pipe, the watchdog, and a pid file; the Tauri helper has none of that). Gated `ensure_voice_helper()` in `apps/mina-gui/src-tauri/src/lib.rs` to return `voice_helper_disabled` so the Tauri helper can never spawn a competing loop. The GUI's voice-in button already drives `service_start_voice_loop_local` / `service_stop_voice_loop_local` → the standalone monitor, so the GUI button now owns the one true path. Voice-out is the `speak_response` flag on `/process` replies (no separate owner).
+
+#### 4) Verification
+- `pnpm tauri build` passed (release bundle, 54s).
+- Live state after cleanup: voice loops 0, monitors 0, one logical tray launcher, API 8000 UP, embed 8084 UP, GUI 1420 UP.
+- The Tauri-native `voice_start`/`voice_restart`/`voice_status` now return the disabled error instead of spawning a loop.
+
+#### 5) Implementation choice
+- Hardcoded single-owner gate (deterministic process invariant). The standalone monitor is the system-level owner; the GUI drives it through the existing service_* commands.
+
+#### 6) Follow-up (open)
+- The Tauri-native voice_* commands and `VOICE_CHILD` are now dead code (gated off). A later cleanup can remove them entirely.
+- The "voice output" indicator still reads the monitor pid file; it should read actual TTS playback state.
+
+#### Unify follow-up (2026-09-16, same issue)
+- Found the second doubling source: the Tauri `voice_set_input_device` wrote `INPUT_DEVICE = N` into the helper script (`mina_windows_gui_capture.py`), while the standalone monitor read `config/.voice_device.json` — two device configs that never agreed, so the GUI picker and the monitor fought. Unified on the single shared config: `voice_set_input_device` / `voice_get_input_device` now read/write `config/.voice_device.json`, and the GUI's device picker calls the Tauri command (one write path). `pnpm tauri build` + `pnpm build` both passed. Killed the doubled loops + monitor, cleaned the pid file.
+
+#### Single speak-flag fix (2026-09-16, same issue)
+- Travis: "the indicator shows status the button toggles status simple logical." The indicator lied because three speak paths (GUI /process, API auto-speak from tray gui_speak, voice loop --speak-response) didn't share a source of truth, and the GUI toggle was local-only React state. Fix: one shared speak flag. API `_get_speak_enabled`/`_set_speak_enabled` + `GET/POST /voice/speak` (file-backed at `config/.voice_speak.json`, defaults to tray auto-speak on first run). `/process` and `/voice/process` both read the shared flag instead of per-request/auto-speak. GUI `toggleVoiceOutput` writes the flag and `pollStatus` syncs the toggle from it (indicator always matches reality). Launcher `_on_launch` writes the flag from the tray's gui_speak toggle before starting the API (env vars don't survive the detached child). Launcher + API syntax OK; GUI pnpm build passed. Live: API /voice/speak returns speak=True (tray default); GUI indicator syncs on next poll.
+
+#### Launcher stop gap (2026-09-16, same issue)
+- Travis: "it did not shut down the gui eather" + "I manualy killed the gui." The launcher's `_on_stop` only ran `mk1_api.ps1 shutdown` (API + memory); it never stopped the voice monitor/loop or the Tauri/Vite GUI dev process. Fix: `_on_stop` now also stops the voice monitor + loop and the GUI dev process before the API shutdown. Added `_stop_voice_monitor()` (kills the monitor/loop by command line, removes the pid file) and `_stop_gui_dev()` (kills the `mina_gui` exe + the Vite dev server on port 1420). Launcher compiles.
+
+#### Voice-in can't be stopped from the GUI (2026-09-16)
+- Travis: "with the toggling on off of voice input i cant shut it down with the controls in the gui it just restarts it." Root cause: the standalone monitor's restart-on-exit loop restarted the voice loop after *any* exit, including an intentional GUI stop — the watchdog and the stop button fought. Fix: a stop-flag handshake. The monitor now checks `.mk1_voice_stop.flag` after each loop exit: if set, it breaks out cleanly instead of restarting. The GUI's `service_stop_voice_loop_local` writes the flag before killing the loop; `service_start_voice_loop_local` clears it on start. Monitor parses clean (0 errors); `pnpm tauri build` passed.
+
+#### Voice-in toggle showed the wrong state and double-started (2026-09-16)
+- Travis: "it togles on off resetting the start trop control to start that is the problem." Root cause: the toggle decided start-vs-stop from `voiceServiceUp`, which came from `service_voice_loop_status` reading the monitor pid file — a stale pid made the button show "START VOICE IN" while a loop was actually running, so clicking it started a *second* loop instead of stopping the first. Fix: `service_voice_loop_status` now checks for a live `mina_windows_voice_loop.py` process (authoritative) instead of trusting the pid file, and `find_windows_voice_pid` matches the real loop script (not the gated-off helper name). `pnpm tauri build` passed.
+
+---
+
+### Issue: Mina had no grounded sense of her two writable homes
+
+- Date: 2026-09-16
+- Reporter: Travis
+- Priority: Medium
+- Status: Done
+
+#### 1) What I asked Mina to do
+- "both are valid for her anytime use as mina_mk1 is her active directory and e:\workspace is her play ground"
+
+#### 2) What Mina actually did
+- The write policy already allowed both `E:\Mina_MK1` (project root) and `E:\workspace` (full-access root), but `personality.txt` never named them, so Mina had no grounded model of "home codebase" vs "playground" and could default new work to the wrong place or seem unaware of where she lives.
+
+#### 3) What should have happened
+- Mina should know her two homes and their roles: `E:\Mina_MK1` = her active codebase (self-edits), `E:\workspace` = her playground (new projects/artifacts for Travis).
+
+#### 4) Evidence
+- `config/mk1_config.json`: `workspace.root = E:\workspace`, `project_roots` includes `E:\Mina_MK1`.
+- `tools/file_access_policy.py`: both roots writable (project root force-added at line 43).
+- `config/personality.txt` had no workspace grounding.
+
+#### 5) Failure class
+- Persona/response contract broken (missing self-knowledge grounding)
+
+#### 6) Root cause
+- The two-home reality existed in write policy + project_roots but was never surfaced in her identity/personality doc, so it never reached the system prompt.
+
+#### 7) Minimal fix
+- Added a "YOUR HOMES (workspace grounding)" section to `config/personality.txt`: names both writable roots, assigns roles (codebase vs playground), and states the ambiguity preference (playground for new creations, codebase for self-edits, ask Travis when it matters). No routing or policy change — grounding only.
+
+#### 8) Regression prompts
+- Prompt 1: "where do you put new files you create?" → should answer E:\workspace (playground) from grounding.
+- Prompt 2: "where do you edit your own code?" → should answer E:\Mina_MK1 from grounding.
+
+#### 9) Done criteria
+- [x] Both homes named in her identity doc with roles
+- [x] Ambiguity preference stated
+- [x] Personality loads with the new section (verified via `load_config` — has YOUR HOMES, both paths)
+- [x] No policy/routing change; no live DB writes
+
+#### 10) Implementation choice
+- Chosen approach: memory/grounding (personality doc) — not hardcoded routing.
+- Why this fits: which directories are "home" is stable self-knowledge that belongs in her identity, not a deterministic routing rule; the write policy already enforced the boundary.
+- Risk if wrong approach chosen: hardcoding path routing would add brittle keyword traps the contract forbids; grounding lets Mina reason about her homes naturally.
+
+#### Verification status
+- `load_config` confirms the new section loads (has YOUR HOMES, both paths present). No restart done (warn-first protocol); goes live on next safe restart.
+
+---
+
+### Issue: Transient state was stored as a flat durable fact (Spokane vs Callville grounding)
+
+- Date: 2026-09-16
+- Reporter: Travis
+- Priority: High
+- Status: Done
+
+#### 1) What I asked Mina to do
+- "edge case what if im on a trip and say im in callville washington is that the new memory that sticks?"
+
+#### 2) What Mina actually did
+- Every remembered statement was stored as an untyped flat `fact`. "We live in Spokane" (durable home) and "I'm in Callville" (transient travel) were indistinguishable, so a transient location could compete with or read as standing truth.
+
+#### 3) What should have happened
+- Durable facts ("we live in", "my X is") are standing truth. Transient state ("I'm in", "currently at", "right now", "visiting") is right-now and must not overwrite/compete with home.
+
+#### 4) Evidence
+- Write path stored all memory_write intents with only `["user_memory"]` tag; recall had no durability notion.
+
+#### 5) Failure class
+- Memory retrieval reliability / grounding
+
+#### 6) Root cause
+- No durability classification at write time; recall treated all facts as equally authoritative regardless of whether they describe standing truth or momentary state.
+
+#### 7) Minimal fix
+- Added `_classify_memory_durability`: conservative classifier (transient only on clear markers — "I'm in/at", "currently", "right now", "visiting", "on a trip", "today/tonight/this week"), defaulting to durable so standing facts are never demoted by accident. The `memory_write` intent now tags `current_state` or `durable` accordingly. Recall (`_format_tool_result`) labels `current_state` entries with a `(right now)` prefix so Mina reads them as transient, not home.
+
+#### 8) Regression prompts
+- Prompt 1: "remember that I'm in Callville Washington" → tagged `current_state` (`test_detect_memory_write_tags_transient_state_as_current_state`).
+- Prompt 2: "remember that we live in Spokane Washington" → tagged `durable` (`test_detect_memory_write_tags_standing_fact_as_durable`).
+- Prompt 3 (recall): current_state surfaces with `(right now)` prefix (`test_memory_read_result_labels_current_state_as_right_now`).
+- Prompt 4 (classifier matrix): `test_classify_memory_durability_durable_vs_transient` (9 cases).
+
+#### 9) Done criteria
+- [x] Transient state tagged `current_state` at write time
+- [x] Durable facts tagged `durable`, never demoted
+- [x] Recall labels transient as `(right now)`
+- [x] 157 passed across six touched suites; no live DB writes in verification
+
+#### 10) Implementation choice
+- Chosen approach: hardcoded classifier (stable durability contract) + deterministic recall label.
+- Why this fits: durable-vs-transient is a stable semantic invariant, not a learned habit; conservative default (durable) protects standing facts. No hidden mode switch.
+- Risk if wrong approach chosen: a model-side judgment could flip a durable fact to transient on a whim; hardcoding keeps the boundary stable and reviewable.
+
+#### Verification status
+- Unit/fake tests only: 157 passed. No live writes.
+- Stack not yet restarted with this change (warn-before-restart protocol); will activate on next safe restart.
 
 ---
 

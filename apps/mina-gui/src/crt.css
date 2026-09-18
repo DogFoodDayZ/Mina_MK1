@@ -2068,11 +2068,130 @@ body,
 .mk1-tab-status .mk1-view-chat,
 .mk1-tab-system .mk1-view-visuals,
 .mk1-tab-system .mk1-view-chat,
+.mk1-tab-audio .mk1-view-visuals,
+.mk1-tab-audio .mk1-view-chat,
+.mk1-tab-audio .mk1-view-system,
+.mk1-tab-audio .mk1-view-status,
 .mk1-tab-tasks .mk1-view-chat,
 .mk1-tab-tasks .mk1-right-stack,
 .mk1-tab-images .mk1-view-chat,
 .mk1-tab-images .mk1-right-stack {
     display: none;
+}
+
+/* Audio tab: show only the audio panel, full width. */
+.mk1-view-audio {
+    display: none;
+}
+
+.mk1-tab-audio .mk1-main {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.mk1-tab-audio .mk1-right-stack {
+    display: flex;
+    flex-direction: column;
+}
+
+.mk1-tab-audio .mk1-view-audio {
+    display: block;
+    grid-column: 1 / -1;
+}
+
+/* VAD meters */
+.mk1-meter {
+    position: relative;
+    height: 14px;
+    border: 1px solid #1a2a2f;
+    border-radius: 6px;
+    background: #060b0c;
+    overflow: hidden;
+}
+
+.mk1-meter-fill {
+    height: 100%;
+    transition: width 120ms linear;
+}
+
+.mk1-meter-rms {
+    background: linear-gradient(90deg, #14975f, #2cfaa2);
+}
+
+.mk1-meter-floor {
+    background: linear-gradient(90deg, #5a4a10, #ffbf3a);
+}
+
+.mk1-meter-thresh {
+    background: linear-gradient(90deg, #472029, #ff4a5e);
+}
+
+/* Waveform canvas */
+.mk1-waveform {
+    width: 100%;
+    height: 90px;
+    border: 1px solid #1a2a2f;
+    border-radius: 6px;
+    background: #060b0c;
+    display: block;
+}
+
+/* Device picker */
+.mk1-device-actions {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.mk1-device-list {
+    display: grid;
+    gap: 4px;
+}
+
+.mk1-device-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 90px 52px;
+    align-items: center;
+    gap: 8px;
+    text-align: left;
+    padding: 6px 8px;
+    border: 1px solid #163136;
+    border-radius: 8px;
+    background: #091214;
+    color: #c6ffe0;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.mk1-device-row.is-active {
+    border-color: #2cfaa2;
+    background: #0c1f18;
+}
+
+.mk1-device-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mk1-device-meter {
+    height: 8px;
+    border-radius: 4px;
+    background: #060b0c;
+    border: 1px solid #1a2a2f;
+    overflow: hidden;
+}
+
+.mk1-device-meter-fill {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, #14975f, #2cfaa2);
+}
+
+.mk1-device-rms {
+    color: #8fc6a8;
+    font-size: 11px;
+    text-align: right;
 }
 
 .mk1-tab-status .mk1-right-stack,

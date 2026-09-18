@@ -94,6 +94,27 @@ def tool_entry(args):
         if low.startswith("path_alias::") or low.startswith("path_alias_deleted::"):
             return False
 
+        # Internal routing/artifact bookkeeping is tooling metadata, not a user
+        # memory, and must never be surfaced as something Mina "remembers".
+        if low.startswith((
+            "intent_alias::",
+            "code_artifact::",
+            "mina_capability_snapshot::",
+            "mina_capability_delta::",
+            "hardware_snapshot::",
+        )):
+            return False
+
+        # Multi-line bookkeeping (e.g. code_artifact bodies) spills continuation
+        # lines such as "request=...", "content:...", or raw code fences. Drop
+        # those fragments too so they never read as recalled facts.
+        if re.match(r"^(request=|content\s*:)", low):
+            return False
+        if low.startswith("```"):
+            return False
+        if re.match(r"^(import|from|def|class|print)\s", low):
+            return False
+
         if low.startswith("file \"") and " as \"" in low:
             return False
 
@@ -101,6 +122,11 @@ def tool_entry(args):
         if "system_seed" in tag_set or "startup_fact" in tag_set:
             return False
         if "path_alias" in tag_set or "path_alias_deleted" in tag_set:
+            return False
+        # Stored routing metadata and file-artifact bodies are tooling records,
+        # not user memories; exclude by tag so their content (incl. code lines)
+        # never reads back as something Mina "remembers".
+        if "intent_alias" in tag_set or "code_artifact" in tag_set:
             return False
 
         return True

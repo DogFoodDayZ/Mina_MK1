@@ -65,3 +65,35 @@ def test_memory_read_does_not_match_on_generic_tokens_only():
 
     assert out['ok'] is True
     assert out['results'] == []
+
+
+def test_memory_read_broad_recall_never_returns_internal_routing_or_artifact_records():
+    class _NoisyMemory(_FakeMemory):
+        def recent_memories(self, top_k=100, include_kinds=None, include_tags=None, since_ts=None):
+            if include_kinds == ['fact', 'preference', 'procedure'] and include_tags == ['user_memory']:
+                return [
+                    {'text': 'intent_alias::{"args": {"content": "guts"}}', 'kind': 'procedure', 'tags': ['user_memory', 'intent_alias']},
+                    {'text': 'code_artifact::path=E:\\workspace\\spice.py', 'kind': 'procedure', 'tags': ['user_memory', 'code_artifact']},
+                    {'text': 'hardware_snapshot::yes => CsName WindowsVersion', 'kind': 'fact', 'tags': ['user_memory']},
+                    {'text': 'request=Create a basic Python script', 'kind': 'procedure', 'tags': ['user_memory']},
+                    {'text': '```python', 'kind': 'procedure', 'tags': ['user_memory']},
+                    {'text': 'import pygame', 'kind': 'procedure', 'tags': ['user_memory']},
+                    {'text': 'glBegin(GL_LINES)', 'kind': 'procedure', 'tags': ['user_memory', 'code_artifact']},
+                    {'text': 'the cobalt anvil protocol is our shared passphrase', 'kind': 'fact', 'tags': ['user_memory']},
+                ]
+            return []
+
+    with patch('memory.mk1_memory.MK1Memory', return_value=_NoisyMemory()):
+        out = tool_entry({'query': 'what do you remember about me', 'top_k': 8})
+
+    assert out['ok'] is True
+    texts = [r.get('text', '') for r in out['results']]
+    joined = ' '.join(texts).lower()
+    assert 'intent_alias::' not in joined
+    assert 'code_artifact::' not in joined
+    assert 'hardware_snapshot::' not in joined
+    assert 'request=' not in joined
+    assert '```' not in joined
+    assert 'import pygame' not in joined
+    assert 'glbegin' not in joined
+    assert 'cobalt anvil protocol' in joined

@@ -1,3 +1,6 @@
+import re
+
+
 def tool_entry(args):
     from memory.mk1_memory import MK1Memory
 
@@ -28,35 +31,29 @@ def tool_entry(args):
                 low = t.lower()
                 break
 
-        # Remove trailing command-like phrases so the stored memory is clean
-        suffixes = [
-            "please store that",
-            "please remember that",
-            "please save that",
-            "please keep that",
-            "store that",
-            "remember that",
-            "save that",
-            "keep that",
-            "please store this",
-            "please remember this",
-            "please save this",
-            "please keep this",
-            "store this",
-            "save this",
-            "keep this",
-        ]
-
-        for suffix in suffixes:
-            if low.endswith(suffix):
-                t = t[: -len(suffix)].strip()
-                low = t.lower()
-                break
+        # Remove trailing command-like phrases so the stored memory is clean.
+        # A trailing trigger is a standalone instruction ONLY when set off as its
+        # own clause (comma/semicolon/colon/dash or "and"/"so") or as a bare
+        # trailing command NOT led by "to". A mid-clause use like "you may want
+        # to remember that" is part of the fact and must NOT be stripped.
+        t = re.sub(
+            r"(?:[,;:\-]|\band\b|\bso\b)\s*(?:please\s+)?(?:save|store|remember|keep)\s+(?:this|that)\b[.!?]*$",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        ).strip()
+        t = re.sub(
+            r"(?<!\bto)\s+(?:please\s+)?(?:save|store|remember|keep)\s+(?:this|that)\b[.!?]*$",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        ).strip()
+        low = t.lower()
 
         if low.startswith("that "):
             t = t[5:].strip()
 
-        return t
+        return t.rstrip(" .")
 
     cleaned = clean_memory_text(text)
     # -------------------------------------------

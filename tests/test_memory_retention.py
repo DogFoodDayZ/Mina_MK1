@@ -32,9 +32,10 @@ def test_retention_preserves_recent_and_durable_interactions():
         failed_decision_retention_days=14,
     )
 
-    assert plan["delete_ids"] == []
+    assert plan["delete_ids"] == [3]
     assert plan["recent_ids"] == [1]
-    assert plan["preserved_ids"] == [2, 3]
+    assert plan["preserved_ids"] == [2]
+    assert plan["regular_ids"] == [3]
 
 
 def test_retention_groups_old_conversation_by_day_for_digest():
@@ -59,6 +60,22 @@ def test_failed_decisions_use_shorter_retention():
 
     assert plan["failed_ids"] == [20]
     assert plan["recent_ids"] == [21]
+
+
+def test_user_memory_without_durable_tags_is_not_treated_as_permanent():
+    plan = plan_conversation_retention(
+        [
+            row(40, 120, ["short_term", "user_memory"], "generic user memory"),
+            row(41, 120, ["user_memory", "durable"], "standing fact"),
+        ],
+        now_ts=NOW,
+        interaction_retention_days=90,
+        failed_decision_retention_days=14,
+    )
+
+    assert 40 in plan["regular_ids"]
+    assert 41 in plan["preserved_ids"]
+    assert 40 not in plan["preserved_ids"]
 
 
 def test_legacy_untagged_refusal_uses_failed_decision_retention():

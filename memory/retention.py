@@ -8,9 +8,9 @@ from typing import Any, Dict, Iterable, List, Set
 DURABLE_TAGS = {
     "authoritative_identity",
     "authoritative_profile",
+    "durable",
     "long_term",
     "routing_correction",
-    "user_memory",
     "verified_tool_result",
 }
 

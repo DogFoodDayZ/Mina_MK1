@@ -500,6 +500,29 @@ def test_process_keeps_learned_lessons_for_live_ostranauts_queries():
     assert any("reactor control panel path first" in msg for msg in system_messages)
 
 
+def test_store_turn_memory_tags_voice_turns_for_learning():
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    core.auto_promote_min_hits = 2
+    core.auto_promote_recent_window = 40
+    core.auto_promote_semantic_top_k = 8
+
+    MK1Core._store_turn_memory(
+        core,
+        "what time is it?",
+        "It is 2026-09-30 18:52:49.",
+        request_context={"input_source": "voice"},
+    )
+
+    assert len(core.memory.writes) >= 2
+    user_write = core.memory.writes[0]
+    assistant_write = core.memory.writes[1]
+    assert "voice_turn" in user_write["tags"]
+    assert "source:voice" in user_write["tags"]
+    assert "voice_turn" in assistant_write["tags"]
+    assert "source:voice" in assistant_write["tags"]
+
+
 def test_store_turn_memory_invokes_auto_promotion_with_settings():
     core = MK1Core.__new__(MK1Core)
     core.memory = FakeMemory()
@@ -770,14 +793,13 @@ def test_detect_memory_write_strips_leading_this_colon_prefix():
     assert args["text"] == "the cobalt anvil protocol"
 
 
-def test_detect_system_question_does_not_force_ps_run():
-    # Contract update 2026-08-05: hardware/system keyword routing removed — model decides
+def test_detect_system_question_routes_for_current_machine_state():
     core = MK1Core.__new__(MK1Core)
     core.tools = SimpleNamespace(tools={"ps_run": object()})
 
-    tool_name, _args = MK1Core.detect_tool_intent(core, "what cpu are you on?")
+    tool_name, _args = MK1Core.detect_tool_intent(core, "what gpu or gpus are we currently running?")
 
-    assert tool_name is None
+    assert tool_name == "ps_run"
 
 
 def test_hardware_question_is_command_like_for_reflex_execution():
@@ -786,13 +808,31 @@ def test_hardware_question_is_command_like_for_reflex_execution():
     assert MK1Core._is_command_like_query(core, "how much physical ram is on a rx 6700 tx") is True
 
 
-def test_detect_time_question_does_not_force_ps_run():
-    # Contract update 2026-08-05: hardware/system keyword routing removed — model decides
+def test_detect_time_question_routes_to_ps_run_for_local_machine_state():
     core = MK1Core.__new__(MK1Core)
+    core.tools = SimpleNamespace(tools={"ps_run": object()})
 
     tool_name, _args = MK1Core.detect_tool_intent(core, "what time is it?")
 
-    assert tool_name is None
+    assert tool_name == "ps_run"
+
+
+def test_detect_current_gpu_cpu_phrase_routes_to_ps_run_for_live_machine_state():
+    core = MK1Core.__new__(MK1Core)
+    core.tools = SimpleNamespace(tools={"ps_run": object(), "web_search": object()})
+
+    tool_name, _args = MK1Core.detect_tool_intent(core, "TRAVIS hey Mina what gpu and cpu are we on")
+
+    assert tool_name == "ps_run"
+
+
+def test_detect_gpu_count_phrase_routes_to_ps_run_for_live_machine_state():
+    core = MK1Core.__new__(MK1Core)
+    core.tools = SimpleNamespace(tools={"ps_run": object(), "web_search": object()})
+
+    tool_name, _args = MK1Core.detect_tool_intent(core, "what gpu's do we have ?")
+
+    assert tool_name == "ps_run"
 
 
 def test_detect_gpu_model_vram_question_routes_to_web_search_when_available():

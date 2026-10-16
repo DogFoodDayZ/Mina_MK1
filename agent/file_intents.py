@@ -41,7 +41,7 @@ def detect_file_directory_intent(core: Any, text: str, raw_text: str, t: str) ->
             r'\b(?:at|to|in)\s+([A-Za-z]:\\[^\s,;]+)',
             r'\b(?:at|to|in)\s+([.]{1,2}[\\/][^\s,;]+)',
             r'\b(?:at|to|in)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
-            r'\b(?:named|called)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
+            r'\b(?:named|called|call\s+it|call\s+this|name\s+it|name\s+this)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
         ]
 
         for pattern in patterns:

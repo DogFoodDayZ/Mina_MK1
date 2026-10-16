@@ -1,7 +1,7 @@
 {
     "file": "agent/core.py",
     "generated_from": "tmp/core_functions.txt",
-    "function_count": 390,
+    "function_count": 396,
     "owners": {
         "primary": "MK1 runtime",
         "supporting": [
@@ -208,26 +208,38 @@
         },
         {
             "name": "main_processing_pipeline",
-            "line_start": 7155,
-            "line_end": 9344,
-            "responsibility": "Main request processing, streaming, context build, result formatting",
+            "line_start": 10035,
+            "line_end": 12551,
+            "responsibility": "Main request processing, streaming, recent dialogue, retrieved older speaker-labelled exchanges, context build, result formatting",
             "risk": "critical",
             "key_functions": [
                 {
                     "name": "process",
-                    "line": 7155
+                    "line": 10035
                 },
                 {
                     "name": "process_stream",
-                    "line": 7479
+                    "line": 10249
+                },
+                {
+                    "name": "_build_process_messages",
+                    "line": 10439
+                },
+                {
+                    "name": "_build_recent_conversation_messages",
+                    "line": 10571
+                },
+                {
+                    "name": "_build_older_conversation_context",
+                    "line": 10577
                 },
                 {
                     "name": "build_context",
-                    "line": 7865
+                    "line": 11244
                 },
                 {
                     "name": "_format_tool_result",
-                    "line": 7946
+                    "line": 11416
                 }
             ]
         },

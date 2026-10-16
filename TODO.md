@@ -1,4 +1,633 @@
 
+### Non-negotiable contract: no broad deterministic routing, no keyword-trap hardcoding, no silent tool hijack
+
+- This project does not approve broad deterministic behavior unless it is a security requirement or a protocol invariant explicitly approved by the user.
+- Local queries like "what time is it", GPU, memory, CPU, and system-state checks must stay on the local tool path or conversational path as appropriate, not become hardcoded route shortcuts.
+- We do not add hidden mode switches, keyword-triggered deterministic routes, or memory-based learned shortcuts that bypass the user's explicit approval.
+- We do not treat a route as "safe" just because it works once in a test. A fix must preserve the contract: memory-first by default, hardcoded only for stable safety guarantees, and explicit user approval for any non-trivial deterministic path.
+- If a future fix would hardcode a local machine route without user approval, it is rejected as a contract violation.
+
+---
+
+### Issue: Core ran tools for Mina instead of letting her decide
+
+- Date: 2026-10-15
+- Reporter: Travis
+- Priority: High
+- Status: Applied, tests pass; live check pending Travis's restart of Mina
+
+#### What the user asked Mina to do
+- Talk normally; Mina herself decides whether to use a tool.
+
+#### What Mina actually did
+- Core ran tools before she saw the message (pre-model reflex) and, after she replied, could discard her reply and run a tool core picked (`_maybe_rescue_chat_suggested_action`, used in `process`, `process_stream` preflight, and post-stream).
+
+#### What should have happened
+- Her reply stands unless she emits a tool call herself; her own calls run and the result goes back to her.
+
+#### Evidence
+- Reflex present Jul 9, gate added Jul 13; rescue/action/incident triggers added in the Jul 30 stabilization sweep; `_is_local_machine_state_query` trigger is uncommitted (after Sep 17).
+- `tools.reflex_enabled` defaulted on; the rescue had no switch at all.
+
+#### Failure class
+- Silent tool hijack / deterministic routing around the model.
+
+#### Root cause
+- Deterministic routing placed ahead of and after the model, overriding the Aug 5 "model decides" contract.
+
+#### Minimal fix
+- `config/mk1_config.json`: `"tools": {"reflex_enabled": false}`.
+- `agent/core.py`: 3-line guard at the top of `_maybe_rescue_chat_suggested_action` sharing the same switch. Removing the config line restores old behavior.
+- Tradeoff: malformed tool markup is no longer guessed into a tool by core; it shows as her reply instead.
+
+#### Regression prompts
+- "what cpu are you on?" (switch off: no core tool, one model call, her reply kept; her own JSON `ps_run` call still runs and she answers from the result).
+- "What CPU and GPU are actually installed in this computer?" and "TRAVIS hay mina how's the memory ?" (override fires with switch on, returns nothing with switch off).
+- `tests/test_model_decides_tools.py`: 5 passed; with the guard removed, 2 fail (proves the test is not vacuous).
+
+#### Implementation choice
+- Hardcoded protocol switch: this is a contract invariant (who owns tool decisions), not learned behavior. Wrong choice risk: a memory-driven version could drift back into core deciding.
+
+#### Done criteria
+- Travis restarts Mina; natural tool requests either get her own tool call or her plain reply, never a core-substituted tool result.
+- Known open question: whether the current model emits tool calls reliably on its own. If not, fix on the model/prompt side, not by core deciding.
+- Pre-existing, unrelated: 5 tests in `test_intent_ambiguity.py`/`test_memory_recall.py` fail with and without this guard.
+
+---
+
+### Issue: Recent conversation lost Mina's side of the exchange after context reconstruction
+
+- Date: 2026-10-15
+- Reporter: Travis, conversation-continuity review
+- Priority: High
+- Status: Recent-history restart check passed by user report; older-recall follow-up tracked below
+
+#### What the user asked Mina to do
+- Remember and carry on a conversation with context even after a restart.
+- Build and verify the system with disposable memory first; reset current memory only later, with separate approval.
+
+#### What Mina actually did
+- The normal context builder reduced recent exchanges to retrieved snippets and excluded assistant turns.
+- After recreating core/storage objects, both text and streaming model requests contained only the current user message as dialogue.
+
+#### What should have happened
+- Both sides of recent dialogue should reach the model in chronological user/assistant roles, before the current request, independently of older factual recall.
+
+#### Evidence
+- Before the patch, the new isolated regression suite reported 5 failed and 2 passed.
+- The two follow-up regressions showed that "ok lets proceed" reached the model without the preceding user goal or Mina's plan.
+- Existing records already have `user_turn` / `assistant_turn` tags; no database migration or live-memory rewrite is required for this patch.
+
+#### Failure class
+- Conversation-context assembly / loss of speaker attribution and recent exchange continuity.
+
+#### Root cause and why previous logic failed
+- Semantic snippets were being used in place of ordered dialogue. Filtering assistant snippets addressed a reported mimicry loop, but removed Mina's side of the conversation without supplying it separately as assistant-role history.
+
+#### Minimal fix
+- Add `_build_recent_conversation_messages` to shared message assembly used by `process` and `process_stream`.
+- Read up to 24 recent short-term interaction candidates, order by timestamp and ID, and retain at most 12 labelled messages within 12,000 content characters.
+- Exclude unlabelled/ambiguous-role records, tool-result/file-operation bookkeeping, and explicitly tagged agent test data. Drop whole oldest messages and any leading orphan assistant reply.
+- Leave the existing semantic-recall filter intact. Previous assistant replies are dialogue, not system instructions or a replacement answer.
+
+#### Why this cannot reroute neighboring intents
+- No intent classifier, execution gate, tool renderer, or route is changed. The patch appends persisted dialogue to the existing shared message builder; the same new request still goes through existing routing.
+- Behavioral quality and routing in the real runtime remain acceptance checks, not claims established by this isolated patch.
+
+#### Regression prompts
+- Transcript-grounded user goal: "I can work with that, If you feel, think or know something must change explane why. the end goal is a working Mina that remebers and can carry on a conversation with context even after a restart ."
+- Follow-up after recreating objects: "ok lets proceed".
+- Adjacent transcript wording: "hay little mouse." and "oh." must not require special recall wording or be deduplicated from history.
+- The assistant plan in the test is a fixture, not a claim that a live model generated it.
+
+#### Implementation choice
+- Chosen approach: memory-driven conversation continuity; deterministic bounds and role checks are message-assembly protocol rules, not conversational routes.
+- Why this fits: the content comes from persisted exchanges, not hardcoded answers, learned keyword triggers, or injected personality.
+- Risk if the wrong approach is chosen: canned recall or assistant text promoted to system instructions would recreate substitution/mimicry; blindly replaying all memory would include tool noise and overwhelm context.
+
+#### Verification status
+- `tests/test_conversation_continuity.py`: 9 isolated checks pass.
+- Combined focused run with existing context/recall regressions: 29 passed, 82 deselected.
+- Disposable SQLite writes replace vector-dependent insertion only in the test fixture; production `recent_memories`, turn storage, shared message assembly, and text/stream process paths are exercised.
+- Normal core/memory constructors, network connections, background-thread starts, subprocesses, and tool execution are blocked in the new harness. No live database, embedding endpoint, LM Studio request, restart, or memory reset was used.
+- Required core reference refresh completed. Existing tests were not rewritten.
+
+#### Done criteria and remaining limits
+- [x] Recreated objects recover labelled chronological dialogue from disposable SQLite.
+- [x] Both text and streaming paths include history and the current request; older factual context remains present.
+- [x] History is bounded, preserves repeated turns, and does not itself execute historical tool examples.
+- [x] Existing neighboring recall/context checks remain passing.
+- [ ] Isolated real-model validation of natural continuation and absence of repetition.
+- [ ] Full isolated process-restart proof and embedding-outage durability investigation.
+- No claim that Mina is fully repaired or that this harness proves production vector writes, concurrency, or model behavior.
+
+#### Isolated real-model harness preparation
+- User approved preparing `tools/isolated_conversation.py` and isolation tests, without launching services.
+- Why a separate harness: the normal launcher can stop processes, and normal startup seeds memory and starts background work. Core initialization also omits the configured backup directory when constructing memory; config overrides alone do not isolate backups.
+- The harness explicitly supplies disposable DB/index/backup/workspace paths, suppresses vault export even when inherited from the environment, and disables tools/background maintenance only in its own subclass. Production configuration, personality and current memory are unchanged.
+- Startup capability/identity seeds are omitted so this acceptance conversation begins without synthetic standing facts or false claims about tools. The configured personality text is retained.
+- Run with `.\.venv\Scripts\python.exe .\tools\isolated_conversation.py --root "<new disposable directory outside the repository>"`. The root must be new or carry the harness's matching marker. `/quit` closes memory; reuse the same root for the restart check.
+- LM Studio and embeddings must be available separately. Preparing the launcher does not authorize starting services or sending model prompts.
+- Verification: 13 checks passed across the launcher and continuity suites. Launcher tests use real vector-backed memory insertion/reopening and shutdown backups with stub embeddings, confined SQLite connections, blocked sockets/workers, and a forbidden inherited vault.
+- This does not prove real embeddings, real Dolphin output, a process restart, or OS-level sandbox confinement. No real-model conversation has run yet.
+
+#### Subsequent user acceptance evidence
+- The user authorized starting embeddings and the isolated conversation harness, then explicitly quit before the isolated instance was relaunched with the same memory directory.
+- User reported natural-enough conversation and recall of the Calville trip and Mina's own appearance detail after the process restart.
+- User then reported continuity loss after roughly six exchanges. This establishes a recent-history success, not general long-term recall success.
+- Read-only inspection of the authorized isolated database confirmed the earlier detail remained stored outside the recent window. An offline assembly check supplied the correct assistant record as a retrieval hit and confirmed the old short-term filter discarded it.
+
+---
+
+### Issue: Older assistant-introduced conversation details disappeared from usable recall
+
+- Date: 2026-10-15
+- Reporter: Travis, isolated Dolphin acceptance conversation
+- Status: 39 targeted checks pass; user-reported isolated Dolphin older-recall acceptance passed
+
+#### What the user asked Mina to do
+- Keep conversation continuity beyond five or six exchanges, including details Mina introduced herself.
+
+#### What Mina actually did
+- After the earlier detail left recent dialogue, she supplied an inconsistent replacement. The original reply remained in isolated storage.
+
+#### What should have happened
+- Relevant earlier exchanges should be available with speakers and surrounding context, while later corrections remain distinguishable from earlier statements.
+
+#### Evidence and failure class
+- Isolated-memory inspection and controlled context assembly established a retrieval-to-context exclusion, not deletion of the original detail. The exact historical FAISS ranking was not reconstructed.
+- Failure class: older conversational recall / loss of assistant-side evidence.
+
+#### Root cause and why previous logic failed
+- Recent dialogue restored both speakers only inside its bounded window. The existing short-term semantic context still discarded assistant turns and supplied no separate older-exchange channel.
+
+#### Minimal fix
+- Keep the recent 12-message / 12,000-character window unchanged.
+- Use existing memory search for up to 12 short-term interaction hits; consider up to three older matching anchors and read up to two neighboring interactions on either side.
+- Quote deduplicated excerpts chronologically in a separately labelled historical-evidence block, bounded to 6,500 characters including JSON attribution and framing.
+- Add a read-only memory-engine neighborhood helper; use parameterized SQL and a read-only connection. No schema migration or memory rewrite.
+- Share role and test/bookkeeping filters with recent dialogue. This compensates for the added retrieval path instead of duplicating filtering branches.
+
+#### Why neighboring intents are not rerouted
+- No keyword-triggered mode, router, tool selection, execution policy, personality, retention or promotion behavior changes.
+- Lexical overlap is a generic relevance check on search results, not an intent switch. Historical assistant statements are explicitly identified as potentially mistaken statements, not permanent facts.
+
+#### Regression prompts
+- Transcript-grounded: "so remind me what color your eyes are ?" followed after intervening exchanges by "so what color are your eyes again ?".
+- Ordinary fixture details exercise assistant-introduced color and a later correction; no intimate transcript is copied into tests or promoted to standing memory.
+
+#### Implementation choice
+- Chosen approach: memory-driven evidence retrieval. Deterministic bounds, ordering and attribution are data/message protocol rules.
+- Why this fits: Mina receives her own stored exchanges rather than canned answers or new hardcoded topic routes.
+- Risk of the wrong approach: enlarging recent history only postpones failure; promoting model statements to facts preserves mistakes; unlabelled excerpts can restart mimicry.
+
+#### Verification status and done criteria
+- [x] Before implementation, four older-recall regressions failed.
+- [x] After implementation, 39 targeted checks passed, 82 deselected, including existing context/recall checks and isolation tests.
+- [x] Both text and streaming model requests contain older assistant statements and neighboring correction context after object recreation.
+- [x] Tests cover unrelated/test-data exclusion, recent/older deduplication, size bounds, read-only neighborhood retrieval, tied timestamps, and no execution of historical tool examples.
+- [x] Required core reference refresh completed; previous regression expectations were not rewritten.
+- [x] User conversation check with the patched isolated Dolphin process, beyond the recent window.
+- After a clean relaunch with the same isolated memory, Travis reported: "yep her recall goes past several turns now and can even hit solid on a ambiguess recal". This is user-reported live-model acceptance, not an independently scored transcript or proof that all ambiguous references resolve correctly.
+- No model prompts, running-process interruption, original-memory access, reset, or memory cleanup was performed for this patch.
+
+#### Limits and tradeoffs
+- Adds an existing-memory search per assembled request, so embedding latency may increase.
+- Top-hit and size limits can omit relevant exchanges; current lexical relevance checks can miss paraphrases with no shared meaningful word. This patch is not a complete conversational-memory design.
+- Neighbors are stored adjacent interactions, not guaranteed turn pairs in concurrent conversations; session/turn identifiers remain outside this scope.
+- A current factual contradiction or later correction outside retrieved excerpts can still be missed. Historical evidence is not guaranteed truth or current state.
+- Automated tests use recording models and keyword retrieval or stub embeddings, not proof of Dolphin interpretation or real FAISS ranking. The subsequent patched-process conversation adds user-reported real-model evidence; comprehensive recall accuracy remains unmeasured.
+
+#### Live memory set aside for a fresh start (2026-10-15, user-approved)
+- Travis approved setting aside the polluted live memory after accepting recall in isolation. Nothing was deleted.
+- Moved `memory\memory.db`, `memory\faiss_small.index`, `memory\faiss_base.index`, and `memory\backups\` to `E:\Mina_MK1_memory_set_aside_20261015\`. SHA-256 verified before and after: 97 files, 0 mismatches.
+- Confirmed beforehand: normal API not listening on port 8000; restore is manual-only (`/restore/open`); vault is export-only; October vault note IDs start at 10453, so new IDs will not overwrite them.
+- Not touched: config, personality, code, Obsidian vault, `E:\workspace\.mina_runtime_state.json` (clock/idle-timer state only), `memory\alt_model_sessions\`.
+- To restore: stop Mina, then move those four items back into `memory\`.
+- Next: Travis starts Mina normally; she creates fresh memory. GUI acceptance with routing, tools, and heartbeat active is still pending.
+
+---
+
+### Persistent recurrence: local system routing and memory pollution reappear in every new session
+
+- Date: 2026-09-30
+- Reporter: user contract review / repeated live transcript failures
+- Priority: Critical
+- Status: Open and recurring across sessions
+
+#### What this means
+- This is not a one-off bug and must not be treated as a single incident.
+- Every fresh session can reintroduce the same failure pattern: local system-state prompts route to the wrong tool class, wrong-tool results get stored as learning/memory noise, and the next session inherits the same bad route.
+- The failing class is local hardware / memory / system-status routing combined with memory poisoning from failed tool attempts.
+
+#### Required repo rule
+- Any fix for this class must be treated as a session-level regression, not a per-case patch.
+- The memory system must not be used to permanently encode bad routing failures as learned truth without explicit user approval.
+- Local system-state prompts must stay on the local system tool path unless the request is explicitly external or a direct web lookup.
+
+#### Contract reminder
+- Memory-first is the default; hardcoded behavior is only allowed for stable safety invariants or explicit user-approved deterministic routing.
+- Do not hardcode broad deterministic routing for all system checks without direct approval.
+- Every fix must include a transcript-grounded regression prompt and fresh verification output.
+
+---
+
+### Issue: Voice-originated turns were stripped of source context and could not learn or remember correctly
+
+- Date: 2026-09-30
+- Reporter: live voice transcript review / user contract complaint
+- Priority: Critical
+- Status: Fixed in source; targeted regressions pass
+
+#### What the user asked Mina to do
+- Use the live voice channel naturally and retain the voice context so Mina can learn, remember, and route correctly from spoken turns.
+
+#### What Mina actually did
+- Voice turns were being stored as ordinary interaction memory without recording the source context. The path dropped `request_context` / `input_source`, so the memory system could not distinguish voice from text.
+
+#### What should have happened
+- Every voice turn should carry `input_source=voice`, be tagged with `voice_turn` and `source:voice`, and remain distinguishable from text turns for learning, recall, and routing.
+- A live voice session should never be treated as an anonymous text chat when storing memory.
+
+#### Evidence
+- The live transcript showed spoken prompts like "what time is it?" and "what gpu and cpu are we on" being answered from the system tool path while the memory layer was not preserving voice provenance.
+- Before the fix, the voice regression failed because `_store_turn_memory` rejected `request_context` and no voice tags were written.
+
+#### Failure class
+- Voice-memory provenance loss / learning regression / source-context stripping
+
+#### Root cause
+- `MK1Core._store_turn_memory` accepted only `user_input` and `assistant_text`; it discarded `request_context`. The voice route passed `input_source=voice` into `core.process`, but that value never reached the memory write logic, so the memory records looked identical to text turns.
+
+#### Minimal fix
+- Add `request_context` to `_store_turn_memory` and preserve `voice_turn` plus `source:voice` tags when `input_source == "voice"`.
+- Thread `request_context` through all call sites in `process` and `process_stream` before persisting turn memory.
+- Keep the fix contract-safe: no shutdown or restart is required to preserve the live voice session.
+
+#### Regression prompt
+- Transcript-grounded prompt: a spoken turn such as "what time is it?" must be stored as a voice-originated memory with source tags, not as a plain text turn.
+
+#### Implementation choice
+- Chosen approach: memory-first provenance fix.
+- Why this fits: the bug was in the live memory lifecycle and source attribution, which must be preserved for proper learning and recall; it is not a safe place for a hidden hardcoded shortcut.
+- Risk if wrong: stripping voice provenance causes Mina to forget which turns were voice-originated, distort route learning, and fail to retain context correctly.
+- Regression prompt proving the choice works in natural phrasing: spoken questions remain tagged as voice turns and retain their source metadata across memory writes.
+
+#### Verification status
+- Source fix applied in `agent/core.py`.
+- Targeted regression passes: `tests/test_memory_recall.py -k voice_turns_for_learning` and the combined retention/route verification pass.
+- No shutdown was triggered during the active voice session; this was left intact by design.
+
+---
+
+### Issue: Generic `user_memory` was being treated as permanent and could outlive transient state
+
+- Date: 2026-10-01
+- Reporter: retention regression / live memory hygiene review
+- Priority: Critical
+- Status: Fixed in source; targeted retention regression passes
+
+#### What the user asked Mina to do
+- Keep a healthy live memory system without letting stale or transient facts survive cleanup forever.
+
+#### What Mina actually did
+- Memory retention treated any record tagged `user_memory` as durable, even when it was a plain short-term interaction or transient state.
+
+#### What should have happened
+- Only explicitly durable records (`durable`, `long_term`, `authoritative_*`, `routing_correction`, `verified_tool_result`) should be exempt from retention pruning.
+- Generic `user_memory` should remain eligible for normal lifespan cleanup unless it is explicitly marked durable.
+
+#### Evidence
+- Before the fix, the regression in `tests/test_memory_retention.py` failed because `user_memory` records were preserved by the retention plan even when they were not durable.
+
+#### Failure class
+- Retention policy bug / overly broad durable-tag classification
+
+#### Root cause
+- `DURABLE_TAGS` in `memory/retention.py` included the broad tag `user_memory`, which is used as a normal record label rather than a durability marker.
+
+#### Minimal fix
+- Remove generic `user_memory` from the permanent-retention set and require explicit `durable`/`long_term` tags for permanent preservation.
+
+#### Regression prompt
+- Transcript-grounded prompt: a plain memory of a transient interaction or current-state fact should not survive retention if it is not explicitly marked as durable.
+
+#### Implementation choice
+- Chosen approach: hardcoded retention policy fix.
+- Why this fits: this is a deterministic data hygiene rule, not a learned route or a conversational shortcut.
+- Risk if wrong: leaving generic `user_memory` as durable silently preserves stale facts and rebuilds bad memory state across restarts.
+- Regression prompt proving the choice works: a generic `user_memory` record can be trimmed, while an explicit `durable` fact remains protected.
+
+#### Verification status
+- Fix applied in `memory/retention.py`.
+- Retention regression passes in `tests/test_memory_retention.py`.
+
+---
+
+### Issue: Local hardware/system prompts still missed the live machine-state route
+
+- Date: 2026-10-01
+- Reporter: live regression sweep in `tests/test_memory_recall.py`
+- Priority: Critical
+- Status: Fixed in source; targeted regressions pass
+
+#### What the user asked Mina to do
+- Ask for the machine's current GPU/CPU and GPU count without falling back to stale memory or web search.
+
+#### What Mina actually did
+- Natural prompts like "what gpu and cpu are we on" and "what gpu's do we have?" were not recognized as current-machine system-state queries, so they missed the `ps_run` route and could fall through to stale context or external search.
+
+#### What should have happened
+- Any live current-system prompt that names the machine state (GPU, CPU, RAM, system, time, date) and references the active machine via "we/our/currently/this system" should route to the local PowerShell check path.
+
+#### Evidence
+- Before the fix, these assertions failed in `tests/test_memory_recall.py`:
+  - `test_detect_current_gpu_cpu_phrase_routes_to_ps_run_for_live_machine_state`
+  - `test_detect_gpu_count_phrase_routes_to_ps_run_for_live_machine_state`
+- The route returned `None` instead of `ps_run` for both prompts.
+
+#### Failure class
+- Local machine-state routing gap / current-state query false negative
+
+#### Root cause
+- `_is_local_machine_state_query` only accepted a small set of literal phrases like "what gpu or gpus are we currently running" and missed the more natural variants with "what gpu and cpu are we on" and "what gpu's do we have?".
+
+#### Minimal fix
+- Allow the current-machine route when the prompt includes local machine markers (`we`, `our`, `currently`, `on`, `running`, `have`) alongside a hardware/system term, while keeping the route narrow enough to exclude assistant-self and product/spec lookups.
+
+#### Regression prompt
+- Transcript-grounded prompt: "TRAVIS hey Mina what gpu and cpu are we on" must route to `ps_run`.
+- Follow-up prompt: "what gpu's do we have ?" must also route to `ps_run`.
+
+#### Implementation choice
+- Chosen approach: hardcoded deterministic gate on genuine current-machine state queries.
+- Why this fits: this is a stable safety invariant for local system-state facts and should not be learned from memory or treated as a product lookup.
+- Risk if wrong: allowing broader memory-driven routing here would reintroduce stale hardware snapshots and bogus web fallback decisions.
+- Regression prompt proving the choice works in natural phrasing: "what gpu and cpu are we on" and "what gpu's do we have?" both call the local system probe.
+
+#### Verification status
+- Source fix applied in `agent/core.py`.
+- Targeted regression passes via `pytest tests/test_memory_recall.py -k 'current_gpu_cpu_phrase or gpu_count_phrase or detect_time_question or detect_system_question or detect_gpu_model_vram_question'`.
+
+---
+
+### Issue: Reflex layer auto-routed normal chat into tool execution
+
+- Date: 2026-10-01
+- Reporter: regression sweep in `tests/test_intent_ambiguity.py`
+- Priority: High
+- Status: Fixed in source; target regression passes
+
+#### What the user asked Mina to do
+- Keep ordinary conversation in chat and only hand off to tools when the prompt is explicitly command-like or prefixed for tool use.
+
+#### What Mina actually did
+- When `reflex_enabled` was on, `_should_run_reflex` returned `True` for any non-empty user input, so normal prompts like "what time is it?" were auto-entering the tool reflex path instead of staying conversational.
+
+#### What should have happened
+- Only explicit commands, tool-prefixed requests, or obvious operational/system tasks should trigger the reflex layer. Plain questions and general chat should remain in the model chat path.
+
+#### Evidence
+- Before the fix: `tests/test_intent_ambiguity.py::test_default_reflex_is_off_for_normal_chat_but_on_for_explicit_tool_requests` failed because `_should_run_reflex("what time is it?")` returned `True`.
+- After the fix: the full ambiguity suite passes (`26 passed in 0.89s`).
+
+#### Failure class
+- Reflex routing bug / unguarded tool hijack
+
+#### Root cause
+- `_should_run_reflex` returned `True` immediately when `reflex_enabled` was set and `reflex_requires_prefix` was false, ignoring the command-like and action-like guards already used elsewhere in the router.
+
+#### Minimal fix
+- Gate the reflex layer behind explicit prefix, command-like intent, action request, or operational incident detection instead of a blanket non-empty-input pass.
+
+#### Regression prompt
+- Transcript-grounded prompt: "what time is it?" must stay conversational and not trigger tool execution. "please run the mk1 diagnostic script now" must still route to the tool layer.
+
+#### Implementation choice
+- Chosen approach: hardcoded route gate for explicit tool intent.
+- Why this fits: this is a deterministic safety invariant for the live routing boundary, not a learned user habit; normal conversation should not be hard-routed to tools.
+- Risk if wrong: a memory-first or overly permissive route would keep reintroducing the hijack pattern and blur the chat-vs-execution boundary.
+- Regression prompt proving the choice works in natural phrasing: "what time is it?" stays in chat; "please run the mk1 diagnostic script now" still runs correctly.
+
+#### Verification status
+- Source fix applied in `agent/core.py`.
+- Targeted regression passes via `pytest tests/test_intent_ambiguity.py`.
+
+---
+
+### Issue: Pylance type error in short-term memory recall: `assistant_turn` check on untyped tags
+
+- Date: 2026-09-30
+- Reporter: editor diagnostic in `agent/core.py`
+- Priority: High
+- Status: Fixed in source; pending refresh validation
+
+#### What Mina asked to do
+- No user request; this is a runtime/static correctness issue surfaced by the editor while processing memory recall.
+
+#### What Mina actually did
+- The memory filter at `_is_user_turn` compared `"assistant_turn" not in tags` while `tags` could still be `None`, mixed values, or an untyped list.
+
+#### What should have happened
+- `tags` should be normalized to a concrete `List[str]` before membership checks, avoiding the static type error while preserving the intended exclusion of assistant turns.
+
+#### Evidence
+- Pylance error: `Operator "not in" not supported for types "Literal['assistant_turn']" and "Any | list[Unknown] | None"`.
+- The failing location was the `short-term recall` filter within `agent/core.py`.
+
+#### Failure class
+- Type narrowing / static analysis bug in memory filtering
+
+#### Root cause
+- The local `tags` value was produced from `item.get("tags")` with a loose truthy check, leaving the type as `Any | list[Unknown] | None` rather than a normalized `list[str]`.
+
+#### Minimal fix
+- Normalize `raw_tags` to `List[str]` via `isinstance(raw_tags, list)` and a string-only filtering step before testing membership.
+
+#### Regression prompt
+- Transcript-grounded prompt: a normal follow-up turn should still be treated as a user turn even when prior memory entries include `tags=None` or mixed non-string values; assistant turns remain excluded.
+
+#### Implementation choice
+- Chosen approach: hardcoded normalization (deterministic guard on typed memory data).
+- Why this fits: this is a type-safety invariant for a memory record, not a learned conversational route.
+- Risk if wrong: leaving mixed tag types unnormalized can cause both static analysis failures and dirty memory selection logic.
+
+#### Verification status
+- Source fix applied in `agent/core.py`.
+- Need to refresh generated reference metadata and recheck static diagnostics.
+
+---
+
+### Issue: Learned "what time is it" shortcut gated to yes/no every single time
+
+- Date: 2026-09-20
+- Reporter: Travis, live voice transcript
+- Priority: High
+- Status: Verified live 2026-09-20 (confirmed alias persisted across restart; gate no longer re-asks)
+
+#### What Travis asked Mina to do
+- "what time is it" (then "yes" to the confirmation)
+
+#### What Mina actually did
+- "I have a learned shortcut for that phrase. Do you want me to run it now? Reply yes or no." — even after confirming once, it would ask again on the next identical request.
+
+#### What should have happened
+- Once a learned shortcut is confirmed, replay it immediately next time; don't re-gate an already-approved alias.
+
+#### Evidence
+- Transcript: two-step yes/no for a plain time query.
+- Root: `_alias_replay_confidence` caps info-query aliases at 0.75 (< 0.8 threshold) with no promotion path, so confirmed aliases never clear the gate.
+
+#### Failure class
+- Learned-alias confidence ceiling with no confirmation-promotion
+
+#### Root cause
+- No `confirmed` state was tracked on alias records; every replay recomputed the same sub-threshold score regardless of prior user approval.
+
+#### Minimal fix
+- Add a `confirmed` flag to intent-alias records; when the user answers "yes" to a pending alias replay, re-learn it with `confirmed=True`; confirmed aliases score 0.95 and replay instantly.
+
+#### Regression prompt
+- Transcript-grounded: `what time is it` → confirm `yes` once → next `what time is it` must run immediately with no yes/no gate.
+
+#### Implementation choice
+- Chosen approach: memory (learned-alias confirmation state).
+- Why this fits: the behavior depends on a learned user pattern (an approved shortcut), which the contract says must stay memory-first, not hardcoded.
+- Risk if wrong: hardcoding a time route would bypass the learning system and add a keyword trap, violating the no-hidden-modes rule.
+
+#### Verification status
+- Offline: `test_confirmed_alias_replays_immediately` + `test_unconfirmed_info_alias_stays_below_gate` pass.
+- Live: 2026-09-20 via /process — first ask gated once, "yes" confirmed, all subsequent asks ran immediately (steps 1-3 of tmp/live_validate_20260920.py).
+
+---
+
+### Issue: "call it im_here.py" produced a hallucinated success claim, no file written
+
+- Date: 2026-09-20
+- Reporter: Travis, live voice transcript
+- Priority: High
+- Status: Verified live 2026-09-20 (file_write routed, file verified on disk)
+
+#### What Travis asked Mina to do
+- "write a short hello script call it im_here.py code it to say I am here."
+
+#### What Mina actually did
+- Printed the code block and claimed "Wrote that simple hello script for you!" — no tool ran, no file existed.
+
+#### What should have happened
+- Detect the write intent with the named file, save the drafted code, verify, and report proof (or ask once if genuinely ambiguous).
+
+#### Evidence
+- Transcript: success claim with zero verification; file never created.
+- Root: `extract_file_write_path` only recognized named/called, not "call it", so extraction returned empty, the router bailed (`return None, {}`), and the chat model hallucinated success.
+
+#### Failure class
+- Intent parser gap + missing draft-save gate → hallucinated success
+
+#### Root cause
+- (a) Filename extractor didn't cover "call it"/"name it" phrasing. (b) When a draft artifact existed but routing fell through to chat, nothing intercepted to offer a real save, so the model improvised a false success.
+- (c) DUPLICATE CODE PATH discovered during live validation: `agent/file_intents.py` is dead code (nothing imports it); the live logic is the inline `MK1Core._detect_file_directory_intent`. The first patch only fixed the dead module. Both copies now carry the fix; a future dedup should make the method delegate to the module.
+
+#### Minimal fix
+- (a) Extend `extract_file_write_path` and `_infer_draft_target_path` to cover "call it"/"call this"/"name it". (b) Add a pending-draft-save confirmation: if a captured draft exists when an action request falls through, ask "Want me to save it? yes/no" and route `file_write` on confirm.
+
+#### Regression prompt
+- Transcript-grounded: `write a short hello script call it im_here.py code it to say I am here.` must route to file_write (or a single save-confirm), never a bare success claim with no file.
+
+#### Implementation choice
+- Chosen approach: memory-first gate (pending-draft confirmation) + deterministic extractor phrasing fix.
+- Why this fits: extraction phrasing is a parser correctness fix; the save-offer reuses the existing learned draft-artifact system instead of a hardcoded route.
+- Risk if wrong: a hardcoded auto-write would skip user confirmation on file creation; pure chat fallback hallucinates. The confirm gate is the contract-compliant middle path.
+
+#### Verification status
+- Offline: 5 `call it`/`name it`/`called`/`named` extraction cases + no-filename clarify case pass against the live method.
+- Live: 2026-09-20 via /process — "write a short hello script call it im_here_livecheck.py code it to say I am here." returned "File written to: E:\workspace\im_here_livecheck.py" and the file existed on disk.
+
+---
+
+### Issue: "run the im_here.py" shipped raw English to PowerShell
+
+- Date: 2026-09-20
+- Reporter: Travis, live voice transcript
+- Priority: High
+- Status: Verified live 2026-09-20 (resolved to draft artifact and ran python; correct output)
+
+#### What Travis asked Mina to do
+- "run the im_here.py"
+
+#### What Mina actually did
+- `ps_run` executed `run the im_here.py` verbatim → PowerShell: "run: The term 'run' is not recognized as the name of a cmdlet..."
+
+#### What should have happened
+- Resolve the draft artifact and run `python im_here.py`, or at minimum refuse to execute a plainly-English command.
+
+#### Evidence
+- Transcript STDERR shows the literal utterance was the command.
+- Root: `_is_execution_followup_request` didn't match a literal filename ("run the im_here.py"), so it fell to the LLM planner, which passed raw text to `ps_run` with no guard.
+
+#### Failure class
+- Follow-up matcher gap + missing sanitizer guard
+
+#### Root cause
+- (a) Execution-followup regex only matched generic "run it"/"run the script", not a literal `<name>.py`. (b) `_sanitize_planned_tool_args` had no rejection for multi-word no-marker English strings.
+- (c) LIVE PATH discovered during validation: `detect_tool_intent`'s `^(run|execute|start)` block passed the raw utterance through `_infer_ps_command`, bypassing the planner sanitizer entirely.
+
+#### Minimal fix
+- (a) Extend the execution-followup regex to `run/execute the <name>.py` and `run <name>.py`. (b) Sanitizer now blanks any ps_run script that is 4+ words with no path/code markers, forcing a safe fallback.
+
+#### Regression prompt
+- Transcript-grounded: `run the im_here.py` must resolve to the draft and run python, or fail safe — never pass raw English to PowerShell.
+
+#### Implementation choice
+- Chosen approach: deterministic follow-up resolution against the learned draft artifact + a sanitizer safety guard.
+- Why this fits: resolving "run the X.py" against the remembered draft is memory-driven; the sanitizer guard is a stable safety constraint (allowed hardcoded per contract).
+- Risk if wrong: without the guard, any planner slip ships garbage to the shell; without draft resolution, the follow-up can't find the file.
+
+#### Verification status
+- Offline: `test_sanitizer_rejects_raw_english_command` + `test_sanitizer_allows_real_script` pass.
+- Live: 2026-09-20 via /process — "run the im_here_livecheck.py" resolved the draft/written file and executed `python "E:\workspace\im_here_livecheck.py"`, printing the script's output.
+
+---
+
+### Issue: Generated file content kept its markdown fence, corrupting the written script
+
+- Date: 2026-09-20
+- Reporter: live validation run (step 5 of tmp/live_validate_20260920.py)
+- Priority: High
+- Status: Verified live 2026-09-20
+
+#### What was asked
+- "write a short hello script call it im_here_livecheck.py code it to say I am here." then "run the im_here_livecheck.py"
+
+#### What Mina actually did
+- Wrote the file with ```python as line 1; running it raised SyntaxError on the fence.
+
+#### What should have happened
+- Written code files must contain only code; fences are chat formatting, never file content.
+
+#### Failure class
+- Content-generation sanitization gap
+
+#### Root cause
+- `_strip_code_fences` only matched when the entire model output was one perfectly-formed fence block (anchored ^...$, required trailing newline). Trailing prose or a missing trailing newline left fences intact, and nothing re-stripped at the file_write finalization point.
+
+#### Minimal fix
+- Robust `_strip_code_fences` (full-wrap, embedded-block, and unclosed/inline fence handling) + a final fence strip on file_write content for code extensions at the finalization point.
+
+#### Regression prompt
+- Transcript-grounded: `write a short hello script call it im_here.py code it to say I am here.` then `run the im_here.py` must produce a runnable file whose first line is code, and the run must print the greeting.
+
+#### Implementation choice
+- Chosen approach: hardcoded sanitization (deterministic safety invariant for written artifacts).
+- Why this fits: file content integrity is a stable contract, not learned behavior.
+- Risk if wrong: none material; stripping is gated to code extensions (.md/.txt exempt).
+
+#### Verification status
+- Offline: 4 fence-shape cases pass (`test_strip_code_fences_robust`).
+- Live: 2026-09-20 — rewritten file's first line is `print("I'm here!")` and the run printed the greeting.
+
+---
+
 ### Issue: Alarm intent with "a.m." + "morning" phrasing fell into clarify fallback
 
 - Date: 2026-09-17
@@ -1366,6 +1995,24 @@ Copy this block for each new problem and fill it in.
 3. For file/code tasks, Mina must verify the result and show proof in the reply.
 4. Tool inventory and internal routing details are hidden unless explicitly requested.
 5. Build/generate intent outranks direct move/rename intent unless source and destination are explicit.
+
+# TODO
+
+Last updated: 2026-09-30
+
+## Tomorrow handoff
+
+- Priority order for tomorrow:
+  1. Fix the recurring local system-state routing bug and stop bad tool output from polluting memory.
+  2. Verify the live voice-memory provenance fix still holds in a real running session.
+  3. Re-check retention hygiene so generic transient memory does not survive as durable data.
+  4. Resume the autonomous verification and tool-failure honesty work only after the routing and memory fixes are validated.
+
+- Guardrail: do not shut Mina down mid-conversation while a live memory or voice session is active. The user specifically called out that abrupt shutdown can fragment or corrupt memory writes.
+- Recovery rule: if the live app is unstable, restart cleanly and revalidate with a small, explicit set of prompts instead of broad speculative patches.
+- The active open issue remains the recurring local machine-state route + memory pollution pattern, even though the immediate code-side fixes for voice provenance and retention hygiene are already in place.
+
+---
 
 # TODO
 

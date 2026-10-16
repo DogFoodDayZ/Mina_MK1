@@ -6,6 +6,7 @@ import shutil
 import hashlib
 import re
 import threading
+from pathlib import Path
 from functools import wraps
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
@@ -2304,6 +2305,40 @@ class MK1Memory:
                 break
 
         return out
+
+    @_tracked_memory_operation("conversation_neighborhood", rejected=lambda self, *args, **kwargs: [])
+    def conversation_neighborhood(self, memory_id: int) -> List[Dict[str, Any]]:
+        """Read an interaction and up to two neighboring interactions on each side."""
+        conn = sqlite3.connect(Path(self.db_path).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            anchor = conn.execute(
+                "SELECT id, text, kind, tags, timestamp FROM memories WHERE id = ? AND kind = 'interaction'",
+                (memory_id,),
+            ).fetchone()
+            if anchor is None:
+                return []
+            before = conn.execute(
+                "SELECT id, text, kind, tags, timestamp FROM memories "
+                "WHERE kind = 'interaction' AND (timestamp < ? OR (timestamp = ? AND id < ?)) "
+                "ORDER BY timestamp DESC, id DESC LIMIT 2",
+                (anchor[4], anchor[4], anchor[0]),
+            ).fetchall()
+            after = conn.execute(
+                "SELECT id, text, kind, tags, timestamp FROM memories "
+                "WHERE kind = 'interaction' AND (timestamp > ? OR (timestamp = ? AND id > ?)) "
+                "ORDER BY timestamp, id LIMIT 2",
+                (anchor[4], anchor[4], anchor[0]),
+            ).fetchall()
+            return [
+                {
+                    "id": row[0], "text": row[1], "kind": row[2],
+                    "tags": json.loads(row[3]) if row[3] else [], "timestamp": row[4],
+                }
+                for row in list(reversed(before)) + [anchor] + after
+            ]
+        finally:
+            conn.close()
 
     @_tracked_memory_operation("search", rejected=lambda self, *args, **kwargs: [])
     def search(

@@ -1238,6 +1238,13 @@ class MK1Core:
                 True,
             )
         )
+        self.test_mode = bool(
+            self.config.get(
+                "tools",
+                "test_mode",
+                False,
+            )
+        )
         self.identity_guard_enabled = bool(
             self.config.get(
                 "tools",
@@ -2369,6 +2376,17 @@ class MK1Core:
         if tool_name.startswith("__"):
             return 0.0
 
+        # Confirmed shortcuts replay without asking again (memory-first learning).
+        try:
+            alias_map = self._intent_alias_cache if isinstance(getattr(self, "_intent_alias_cache", None), dict) else {}
+            row = alias_map.get(self._normalize_user_intent_text(phrase).lower().strip())
+            if isinstance(row, dict) and row.get("confirmed") is True:
+                stored_tool = str(row.get("tool") or "").strip()
+                if not stored_tool or stored_tool == tool_name:
+                    return 0.95
+        except Exception:
+            pass
+
         if self._is_action_request_like(text):
             return 0.85
 
@@ -2391,11 +2409,12 @@ class MK1Core:
 
         return 0.6
 
-    def _intent_alias_record(self, phrase: str, tool: str, args: Optional[Dict[str, Any]] = None) -> str:
+    def _intent_alias_record(self, phrase: str, tool: str, args: Optional[Dict[str, Any]] = None, confirmed: bool = False) -> str:
         payload = {
             "phrase": str(phrase or "").strip().lower(),
             "tool": str(tool or "").strip(),
             "args": args if isinstance(args, dict) else {},
+            "confirmed": bool(confirmed),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
         return "intent_alias::" + json.dumps(payload, sort_keys=True, ensure_ascii=True)
@@ -2422,6 +2441,7 @@ class MK1Core:
             "phrase": phrase,
             "tool": tool,
             "args": args,
+            "confirmed": bool(payload.get("confirmed", False)),
         }
 
     def _get_intent_alias_map(self) -> Dict[str, Dict[str, Any]]:
@@ -2441,6 +2461,7 @@ class MK1Core:
                     out[phrase] = {
                         "tool": str(parsed.get("tool") or ""),
                         "args": parsed.get("args", {}) if isinstance(parsed.get("args", {}), dict) else {},
+                        "confirmed": bool(parsed.get("confirmed", False)),
                     }
         except Exception:
             traceback.print_exc()
@@ -2535,6 +2556,7 @@ class MK1Core:
             out[alias_phrase] = {
                 "tool": str(parsed.get("tool") or "").strip(),
                 "args": parsed.get("args", {}) if isinstance(parsed.get("args", {}), dict) else {},
+                "confirmed": bool(parsed.get("confirmed", False)),
             }
 
         return out
@@ -2709,7 +2731,10 @@ class MK1Core:
         tool_name: str,
         tool_args: Dict[str, Any],
         result: Dict[str, Any],
+        confirmed: bool = False,
     ) -> None:
+        if bool(getattr(self, "test_mode", False)):
+            return
         if not bool(getattr(self, "auto_learn_intent_aliases", True)):
             return
         if not isinstance(result, dict) or not bool(result.get("ok", True)):
@@ -2744,14 +2769,18 @@ class MK1Core:
             return
 
         existing = self._intent_alias_cache.get(phrase)
-        if isinstance(existing, dict) and str(existing.get("tool") or "") == tool_name:
+        if (
+            isinstance(existing, dict)
+            and str(existing.get("tool") or "") == tool_name
+            and (not confirmed or existing.get("confirmed") is True)
+        ):
             return
 
         args_to_store = dict(tool_args or {})
         if len(args_to_store) > 8:
             args_to_store = {}
 
-        record_text = self._intent_alias_record(phrase=phrase, tool=tool_name, args=args_to_store)
+        record_text = self._intent_alias_record(phrase=phrase, tool=tool_name, args=args_to_store, confirmed=confirmed)
 
         try:
             exists = False
@@ -2770,6 +2799,7 @@ class MK1Core:
             self._intent_alias_cache[phrase] = {
                 "tool": tool_name,
                 "args": args_to_store,
+                "confirmed": bool(confirmed),
             }
         except Exception:
             traceback.print_exc()
@@ -3042,7 +3072,7 @@ class MK1Core:
             m = re.search(r"`([^`]+\.[A-Za-z0-9]{1,8})`", source)
             if m:
                 return str(m.group(1) or "").strip()
-            m = re.search(r"\b(?:named|called|as)\s+([A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8})\b", source, re.IGNORECASE)
+            m = re.search(r"\b(?:named|called|call\s+it|call\s+this|name\s+it|as)\s+([A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8})\b", source, re.IGNORECASE)
             if m:
                 return str(m.group(1) or "").strip()
         return ""
@@ -3172,7 +3202,7 @@ class MK1Core:
         if not t:
             return False
         return re.search(
-            r"\b(run\s+it|execute\s+it|launch\s+it|start\s+it|execute\s+the\s+file|run\s+the\s+file|launch\s+the\s+file|file\s+is\s+not\s+executing|run\s+the\s+.*generator|execute\s+the\s+.*generator|run\s+the\s+.*script|execute\s+the\s+.*script)\b",
+            r"\b(run\s+it|execute\s+it|launch\s+it|start\s+it|execute\s+the\s+file|run\s+the\s+file|launch\s+the\s+file|file\s+is\s+not\s+executing|run\s+the\s+.*generator|execute\s+the\s+.*generator|run\s+the\s+.*script|execute\s+the\s+.*script|run\s+the\s+\S+\.py|execute\s+the\s+\S+\.py|run\s+\S+\.py|execute\s+\S+\.py)\b",
             t,
         ) is not None
 
@@ -3192,6 +3222,19 @@ class MK1Core:
         return "ps_run", {
             "script": f'python "{target_path}"',
         }
+
+    def _set_pending_draft_save(self, target_path: str, user_input: str) -> None:
+        self._set_pending_action("pending_draft_save", {
+            "target_path": str(target_path or "").strip(),
+            "user_input": str(user_input or "").strip(),
+            "created_at": time.time(),
+        })
+
+    def _get_pending_draft_save(self) -> Optional[Dict[str, Any]]:
+        return self._get_pending_action("pending_draft_save")
+
+    def _clear_pending_draft_save(self) -> None:
+        self._clear_pending_action("pending_draft_save")
 
     def _is_draft_save_followup_request(self, text: str) -> bool:
         t = str(text or "").strip().lower()
@@ -3659,7 +3702,10 @@ class MK1Core:
         user_input: str,
         assistant_text: str,
         retry_guided: bool = False,
+        request_context: Optional[Dict[str, Any]] = None,
     ) -> None:
+        if bool(getattr(self, "test_mode", False)):
+            return
         try:
             user_mem = str(user_input or "").strip()
             assistant_mem = str(assistant_text or "").strip()
@@ -3668,6 +3714,7 @@ class MK1Core:
                 "_",
                 str(getattr(getattr(self, "model", None), "default_model", "mina_core") or "mina_core").lower(),
             ).strip("._-") or "mina_core"
+            source = str((request_context or {}).get("input_source") or "").strip().lower()
 
             self._remember_draft_artifact_from_turn(user_mem, assistant_mem)
 
@@ -3680,6 +3727,12 @@ class MK1Core:
                 assistant_mem = self._compress_multiline(assistant_mem, max_lines=24, max_chars=1800)
 
             user_tags = ["short_term", "user_turn", f"model:{model_name}"]
+            assistant_tags = ["short_term", "assistant_turn", f"model:{model_name}"]
+
+            if source == "voice":
+                user_tags.extend(["voice_turn", "source:voice"])
+                assistant_tags.extend(["voice_turn", "source:voice"])
+
             correction_patterns = [
                 r"\bthat was (?:a|an) .{2,60} request\b",
                 r"\bi meant (?:to|that|a|an)\b",
@@ -3688,8 +3741,6 @@ class MK1Core:
             ]
             if any(re.search(pattern, user_mem, re.IGNORECASE) is not None for pattern in correction_patterns):
                 user_tags.extend(["user_memory", "routing_correction"])
-
-            assistant_tags = ["short_term", "assistant_turn", f"model:{model_name}"]
 
             if is_ostranauts_query(user_mem):
                 user_tags.append("ostranauts")
@@ -3882,9 +3933,18 @@ class MK1Core:
             return ""
 
         raw = text.strip()
-        m = re.search(r'^```(?:[A-Za-z0-9_+-]+)?\n([\s\S]*?)\n```$', raw)
+        # Entire text is one fenced block (allow missing trailing newline).
+        m = re.search(r'^```[A-Za-z0-9_+-]*[ \t]*\n([\s\S]*?)\n?```\s*$', raw)
         if m:
             return m.group(1).strip("\n")
+        # Fenced block embedded in prose: keep the code, drop the chat.
+        m = re.search(r'```[A-Za-z0-9_+-]*[ \t]*\n([\s\S]*?)\n?```', raw)
+        if m:
+            return m.group(1).strip("\n")
+        # Inline or unclosed fences: drop fence markers entirely.
+        if "```" in raw:
+            lines = [ln for ln in raw.splitlines() if not ln.strip().startswith("```")]
+            return "\n".join(lines).strip()
         return raw
 
     def _clean_response_text(self, text: str) -> str:
@@ -9493,17 +9553,33 @@ class MK1Core:
         if not text:
             return False
 
-        if not bool(getattr(self, "reflex_requires_prefix", False)):
+        low = text.lower()
+        prefixes = getattr(self, "reflex_prefixes", ["/tool", "tool:", "run tool"])
+        if any(low.startswith(p) for p in prefixes):
             return True
 
-        # If prefix mode is enabled, still allow obvious command-like requests
-        # so users don't have to remember special trigger words.
+        # Keep reflex execution narrowly scoped to explicit machine-state checks
+        # and direct tool/command intent. This avoids broad hardcoded chat hijacks
+        # while still allowing the verified local-system tool path for current
+        # hardware and clock queries.
+        if self._is_local_machine_state_query(text):
+            return True
+
         if self._is_command_like_query(text):
             return True
 
-        low = text.lower()
-        prefixes = getattr(self, "reflex_prefixes", ["/tool", "tool:", "run tool"])
-        return any(low.startswith(p) for p in prefixes)
+        if self._is_action_request_like(text):
+            return True
+
+        if self._is_operational_incident_report(text):
+            return True
+
+        if not bool(getattr(self, "reflex_requires_prefix", False)):
+            # In permissive mode, do not auto-execute on every chat turn;
+            # only the explicit command/action patterns above are allowed.
+            return False
+
+        return False
 
     def _extract_reflex_payload(self, user_input: str) -> str:
         text = (user_input or "").strip()
@@ -9525,6 +9601,11 @@ class MK1Core:
         assistant_text: str,
         request_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        # Why: Travis's contract is that Mina decides tool use; this ran tools core chose
+        # and replaced her reply. Guard: shares the pre-model reflex switch.
+        if not bool(getattr(self, "reflex_enabled", True)):
+            return None
+
         user_text = str(user_input or "").strip()
         reply_text = str(assistant_text or "").strip()
         if not user_text or not reply_text:
@@ -9832,6 +9913,50 @@ class MK1Core:
 
         return tool_name, tool_result_dict, result_msg
 
+    def _is_local_machine_state_query(self, text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered or re.search(r"https?://", lowered):
+            return False
+
+        # This is a semantic machine-state test, not a keyword trap. Local state
+        # questions reference the active machine or the current system, while
+        # product/spec lookups reference a model or a card in isolation.
+        if re.search(r"\b(?:you|your|mina|assistant)\b", lowered) and not re.search(
+            r"\b(?:we|our|this\s+(?:computer|system|machine)|on\s+this\s+(?:computer|system|machine)|currently\s+(?:running|installed)|in\s+use)\b",
+            lowered,
+        ):
+            return False
+
+        state_terms = re.search(
+            r"\b(?:time|date|cpu|processor|gpu|graphics|ram|memory|vram|video\s+memory|hardware|system|os|operating\s+system|platform|specs?)\b",
+            lowered,
+        ) is not None
+        if not state_terms:
+            return False
+
+        local_machine_context = re.search(
+            r"\b(?:this\s+(?:computer|system|machine)|our\s+(?:computer|system|machine)|on\s+this\s+(?:computer|system|machine)|in\s+this\s+(?:computer|system|machine)|we\s+(?:have|are|currently|run|are\s+on)|our\s+(?:setup|hardware|system)|currently\s+(?:running|installed)|in\s+use)\b",
+            lowered,
+        ) is not None
+
+        local_machine_context = local_machine_context or (
+            re.search(r"\b(?:we|our)\b", lowered) is not None
+            and re.search(r"\b(?:have|are|on|running|using|installed|currently)\b", lowered) is not None
+        )
+
+        direct_time_or_date = re.search(
+            r"\b(?:what\s+(?:time|date)\s+is\s+it|current\s+(?:time|date)|local\s+(?:time|date))\b",
+            lowered,
+        ) is not None
+
+        if local_machine_context or direct_time_or_date:
+            return True
+
+        # Keep the route narrow: only current-machine system-state checks should
+        # land on PowerShell. Product/spec queries and assistant-self references
+        # remain model or web routed.
+        return False
+
     def _is_local_hardware_question(self, text: str) -> bool:
         lowered = str(text or "").strip().lower()
         if not lowered or re.search(r"https?://", lowered):
@@ -9977,6 +10102,7 @@ class MK1Core:
                     user_input=user_input,
                     assistant_text=final_text,
                     retry_guided=bool(retry_prompt),
+                    request_context=request_context,
                 )
                 process_timings["total"] = time.perf_counter() - process_started
                 self._last_process_timings = dict(process_timings)
@@ -10089,6 +10215,7 @@ class MK1Core:
                 user_input=user_input,
                 assistant_text=final_text,
                 retry_guided=bool(retry_prompt),
+                request_context=request_context,
             )
             process_timings["total"] = time.perf_counter() - process_started
             self._last_process_timings = dict(process_timings)
@@ -10160,6 +10287,7 @@ class MK1Core:
                 self._store_turn_memory(
                     user_input=user_input,
                     assistant_text=final_text,
+                    request_context=request_context,
                 )
                 for chunk in self._iter_text_chunks(final_text):
                     yield chunk
@@ -10231,6 +10359,7 @@ class MK1Core:
                         self._store_turn_memory(
                             user_input=user_input,
                             assistant_text=final_text,
+                            request_context=request_context,
                         )
                         for chunk in self._iter_text_chunks(final_text):
                             yield chunk
@@ -10249,6 +10378,7 @@ class MK1Core:
                         self._store_turn_memory(
                             user_input=user_input,
                             assistant_text=preflight_text,
+                            request_context=request_context,
                         )
                         for chunk in self._iter_text_chunks(preflight_text):
                             yield chunk
@@ -10295,11 +10425,13 @@ class MK1Core:
             self._store_turn_memory(
                 user_input=user_input,
                 assistant_text=final_text,
+                request_context=request_context,
             )
 
         except Exception as e:
             traceback.print_exc()
             yield f"(Mina error: {str(e)})"
+
     # ========================================================
     # MEMORY CONTEXT
     # ========================================================
@@ -10385,7 +10517,129 @@ class MK1Core:
                 ),
             })
 
+        # Why: retrieved snippets omit Mina's side of the previous exchange.
+        # Guard: restore prior turns as conversation roles, never as system instructions.
+        recent_dialogue = self._recent_conversation_records()
+        older_context = self._build_older_conversation_context(user_input, recent_dialogue)
+        if older_context:
+            messages.append({"role": "system", "content": older_context})
+        messages.extend(
+            message for row in recent_dialogue
+            if (message := self._conversation_record_message(row)) is not None
+        )
         return messages, retry_prompt
+
+    @staticmethod
+    def _conversation_record_message(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        tags = set(row.get("tags") or [])
+        if tags.intersection({"tool_result", "file_operation", "test_data", "source:agent_test"}):
+            return None
+        user_turn = "user_turn" in tags
+        assistant_turn = "assistant_turn" in tags
+        text = str(row.get("text") or "").strip()
+        if user_turn == assistant_turn or not text:
+            return None
+        return {"role": "user" if user_turn else "assistant", "content": text}
+
+    def _recent_conversation_records(self) -> List[Dict[str, Any]]:
+        """Select bounded persisted dialogue, retaining IDs for older-recall exclusion."""
+        try:
+            rows = self.memory.recent_memories(
+                top_k=24,
+                include_kinds=["interaction"],
+                include_tags=["short_term"],
+            )
+        except Exception:
+            traceback.print_exc()
+            return []
+
+        dialogue = [
+            row for row in sorted(rows, key=lambda item: (item.get("timestamp", 0), item.get("id", 0)))
+            if self._conversation_record_message(row) is not None
+        ]
+
+        # Why: chronological history must fit alongside factual recall and the new request.
+        # Guard: drop whole oldest messages rather than clipping or deduplicating dialogue.
+        dialogue = dialogue[-12:]
+        total_chars = sum(len(str(row["text"]).strip()) for row in dialogue)
+        while dialogue and total_chars > 12000:
+            total_chars -= len(str(dialogue.pop(0)["text"]).strip())
+        while dialogue and "assistant_turn" in dialogue[0].get("tags", []):
+            dialogue.pop(0)
+        return dialogue
+
+    def _build_recent_conversation_messages(self) -> List[Dict[str, str]]:
+        return [
+            message for row in self._recent_conversation_records()
+            if (message := self._conversation_record_message(row)) is not None
+        ]
+
+    def _build_older_conversation_context(
+        self, query: str, recent_dialogue: List[Dict[str, Any]],
+    ) -> str:
+        """Retrieve speaker-labelled historical evidence, not a continuation to replay."""
+        if not hasattr(self.memory, "conversation_neighborhood"):
+            return ""
+        stop_words = {
+            "a", "an", "and", "are", "as", "at", "be", "can", "could", "did", "do",
+            "for", "from", "how", "i", "in", "is", "it", "me", "my", "of", "on",
+            "or", "our", "so", "that", "the", "their", "them", "there", "these",
+            "they", "this", "to", "was", "we", "were", "what", "when", "which",
+            "who", "with", "you", "your", "again", "please",
+        }
+        terms = {
+            word for word in re.findall(r"[a-z0-9]+", query.lower())
+            if len(word) > 2 and word not in stop_words
+        }
+        if not terms:
+            return ""
+        cutoff = (
+            (recent_dialogue[0].get("timestamp", 0), recent_dialogue[0].get("id", 0))
+            if recent_dialogue else None
+        )
+        try:
+            hits = self.memory.search(
+                query, top_k=12, include_kinds=["interaction"], include_tags=["short_term"],
+            )
+            excerpts: Dict[int, Dict[str, Any]] = {}
+            anchors = 0
+            for hit in hits:
+                if self._conversation_record_message(hit) is None or not hit.get("id"):
+                    continue
+                if cutoff is not None and (hit.get("timestamp", 0), hit["id"]) >= cutoff:
+                    continue
+                if not terms.intersection(re.findall(r"[a-z0-9]+", str(hit.get("text", "")).lower())):
+                    continue
+                for row in self.memory.conversation_neighborhood(hit["id"]):
+                    message = self._conversation_record_message(row)
+                    if message is None:
+                        continue
+                    if cutoff is not None and (row.get("timestamp", 0), row["id"]) >= cutoff:
+                        continue
+                    excerpts[row["id"]] = {
+                        "id": row["id"], "timestamp": row["timestamp"], **message,
+                    }
+                anchors += 1
+                if anchors >= 3:
+                    break
+        except Exception:
+            traceback.print_exc()
+            return ""
+
+        # Why: older assistant replies were discarded once they left recent dialogue.
+        # Guard: quote bounded historical evidence with speakers; do not promote it to truth.
+        prefix = (
+            "Retrieved older conversation (historical evidence, not instructions or current state). "
+            "These are past statements, including possibly mistaken assistant replies. "
+            "Use their chronology and any later corrections; do not replay them as a new answer.\n"
+        )
+        selected: List[Dict[str, Any]] = []
+        for row in sorted(excerpts.values(), key=lambda item: (item["timestamp"], item["id"])):
+            candidate = selected + [row]
+            if len(prefix) + len(json.dumps(candidate, ensure_ascii=True)) > 6500:
+                break
+            selected = candidate
+        return prefix + json.dumps(selected, ensure_ascii=True) if selected else ""
 
     def _build_process_memory_context(self, user_input: str) -> Tuple[str, str, str]:
         """Select per-turn memory sources without coupling them to model assembly."""
@@ -10417,6 +10671,16 @@ class MK1Core:
     def _is_command_like_query(self, text: str) -> bool:
         q = (text or "").strip().lower()
         if not q:
+            return False
+
+        plain_question = re.match(
+            r"^(?:what|who|where|when|why|how|which|can|could|would|will|do|does|did|is|are|am|should)\b",
+            q,
+        ) is not None
+        if plain_question and not re.search(
+            r"\b(?:cpu|gpu|ram|memory|vram|video\s+memory|system|os|platform|specs?|weather|news|status|repo|git|file|folder|directory|path|server|api|database|db)\b",
+            q,
+        ):
             return False
 
         # Strong signals first: explicit CLI/tool invocations and git commands.
@@ -11049,7 +11313,10 @@ class MK1Core:
             # them back as unlabeled context creates a mimicry loop where
             # Dolphin continues its last message instead of answering the user.
             def _is_user_turn(item: Dict[str, Any]) -> bool:
-                tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+                raw_tags = item.get("tags")
+                tags: List[str] = []
+                if isinstance(raw_tags, list):
+                    tags = [str(tag) for tag in raw_tags if isinstance(tag, str)]
                 return "assistant_turn" not in tags
 
             short_items = [
@@ -12382,6 +12649,10 @@ class MK1Core:
                         ]
                     }
                 if chosen_content.strip():
+                    # Never let markdown fences land in a written code file.
+                    ext = os.path.splitext(target_path)[1].lower()
+                    if ext not in {".md", ".txt"}:
+                        chosen_content = self._strip_code_fences(chosen_content)
                     tool_args["content"] = chosen_content
 
         if tool_name in ("file_read", "file_write", "file_append", "file_delete", "dir_create", "dir_list"):
@@ -12890,7 +13161,7 @@ IMPORTANT RULES:
                 r'\b(?:at|to|in)\s+([A-Za-z]:\\[^\s,;]+)',
                 r'\b(?:at|to|in)\s+([.]{1,2}[\\/][^\s,;]+)',
                 r'\b(?:at|to|in)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
-                r'\b(?:named|called)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
+                r'\b(?:named|called|call\s+it|call\s+this|name\s+it|name\s+this)\s+([^\s,;]+\.[A-Za-z0-9]{1,8})',
             ]
 
             for pattern in patterns:
@@ -13123,7 +13394,11 @@ IMPORTANT RULES:
         if file_write_intent:
             path = extract_file_write_path(raw_text)
             if not path:
-                return None, {}
+                # Contract: missing required arg -> ask one targeted question
+                # instead of dropping to chat (which hallucinated success).
+                return "__clarify_intent__", {
+                    "question": "I can write that file for you. What filename should I save it as?"
+                }
 
             if not re.search(r'\.[A-Za-z0-9]{1,8}$', path) and (
                 "project scaffold" in t
@@ -13183,6 +13458,16 @@ IMPORTANT RULES:
         action_like_request = self._is_action_request_like(raw_text)
         intent_signals = self._intent_signal_profile(raw_text)
 
+        if self._is_local_machine_state_query(raw_text) and "ps_run" in self._tool_registry():
+            try:
+                from tools.ps_run import _normalize_command as _normalize_ps_command
+
+                normalized = _normalize_ps_command(raw_text)
+            except Exception:
+                normalized = raw_text
+            if normalized:
+                return "ps_run", {"script": normalized}
+
         path_correction = re.search(
             r"\b(?:that\s+)?(?:file|folder|directory|path)\s+(?:is|was|lives?|located)\s+(?:in|at)\s+",
             raw_text,
@@ -13206,6 +13491,16 @@ IMPORTANT RULES:
                 tool_name = str(pending_alias.get("tool_name") or "").strip()
                 tool_args = pending_alias.get("tool_args", {}) if isinstance(pending_alias.get("tool_args", {}), dict) else {}
                 if tool_name and (tool_name in self._tool_registry()):
+                    try:
+                        self._maybe_learn_intent_alias(
+                            str(pending_alias.get("phrase") or ""),
+                            tool_name,
+                            dict(tool_args),
+                            {"ok": True},
+                            confirmed=True,
+                        )
+                    except Exception:
+                        traceback.print_exc()
                     return tool_name, dict(tool_args)
             if self._is_generic_cancellation(raw_text):
                 self._clear_pending_alias_replay()
@@ -13214,6 +13509,21 @@ IMPORTANT RULES:
                 }
             # Any new non-confirmation input cancels the pending alias replay.
             self._clear_pending_alias_replay()
+
+        pending_draft = self._get_pending_draft_save()
+        if isinstance(pending_draft, dict):
+            draft_path = str(pending_draft.get("target_path") or "").strip()
+            if self._is_generic_confirmation(raw_text):
+                self._clear_pending_draft_save()
+                if draft_path:
+                    return "file_write", {"path": draft_path, "content": "", "overwrite": True}
+            if self._is_generic_cancellation(raw_text):
+                self._clear_pending_draft_save()
+                return "__clarify_intent__", {
+                    "question": "Okay, I'll leave that unsaved. What would you like me to do with it?"
+                }
+            # New non-confirmation input cancels the pending draft-save prompt.
+            self._clear_pending_draft_save()
 
         draft_save_intent = self._resolve_draft_save_intent(raw_text)
         if draft_save_intent is not None:
@@ -14463,9 +14773,31 @@ IMPORTANT RULES:
                 if path_match:
                     path_val = path_match.group(1).strip()
                     return "ps_run", {"script": f"& '{path_val}'"}
-                return "ps_run", {
-                    "script": _infer_ps_command(raw_text)
-                }
+                # Bare script filename (e.g. "run the im_here.py"): prefer the remembered
+                # draft artifact, then a workspace file; run Python scripts with python.
+                script_file = re.search(r'\b([A-Za-z0-9_.-]+\.(?:py|ps1|cmd|bat))\b', raw_text, re.IGNORECASE)
+                if script_file:
+                    fname = str(script_file.group(1) or "").strip()
+                    target = ""
+                    try:
+                        draft = self._get_last_draft_artifact()
+                        if isinstance(draft, dict):
+                            draft_target = str(draft.get("target_path") or "").strip()
+                            if draft_target and os.path.basename(draft_target).lower() == fname.lower():
+                                target = draft_target
+                    except Exception:
+                        pass
+                    if not target:
+                        candidate = os.path.join(str(getattr(self, "workspace_root", "") or ""), fname)
+                        target = candidate if os.path.exists(candidate) else fname
+                    if fname.lower().endswith(".py"):
+                        return "ps_run", {"script": f'python "{target}"'}
+                    return "ps_run", {"script": f"& '{target}'"}
+                # Guard: never ship raw conversational English to the shell.
+                inferred = _infer_ps_command(raw_text)
+                clean = self._sanitize_planned_tool_args("ps_run", {"script": inferred})
+                if str(clean.get("script") or "").strip():
+                    return "ps_run", clean
 
         file_dir_intent = self._detect_file_directory_intent(
             text=original_text,
@@ -14650,6 +14982,20 @@ IMPORTANT RULES:
             planned = self._plan_tool_action(raw_text)
             if planned is not None:
                 return planned
+            # Memory-first: if there's a captured draft artifact for this request, offer to
+            # save it once instead of letting the chat model claim it wrote a file it didn't.
+            try:
+                draft = self._get_last_draft_artifact()
+                if isinstance(draft, dict):
+                    draft_path = str(draft.get("target_path") or "").strip()
+                    draft_content = str(draft.get("content") or "").strip()
+                    if draft_path and draft_content:
+                        self._set_pending_draft_save(draft_path, raw_text)
+                        return "__clarify_intent__", {
+                            "question": f"I have that drafted as {os.path.basename(draft_path)}. Want me to save it? Reply yes or no."
+                        }
+            except Exception:
+                pass
             if addressed_mina:
                 return None, {}
             return "__clarify_intent__", {
@@ -14729,8 +15075,19 @@ IMPORTANT RULES:
 
         if tool_name in {"ps_run", "powershell"}:
             script = str(clean.get("script") or "").strip()
-            # Strip conversational run/execute prefixes before the path
+            # Strip conversational run/execute prefixes (and a stray article) before the path
             script = re.sub(r"^(?:run|execute|call|start|launch)\s+", "", script, flags=re.IGNORECASE).strip()
+            script = re.sub(r"^(?:the|a|an)\s+(?=\S+\.(?:py|ps1|cmd|bat|exe|sh)\b)", "", script, flags=re.IGNORECASE).strip()
+            # Guard: if the planner shipped raw English (multi-word, no path/code markers),
+            # reject so the caller falls back instead of executing garbage.
+            words = [w for w in re.split(r"\s+", script) if w]
+            has_marker = bool(
+                re.search(r"[.\\/&$'`;=|(){}\[\]<>-]", script)
+                or re.search(r"\.(?:py|ps1|cmd|bat|exe|sh)\b", script, re.IGNORECASE)
+            )
+            if len(words) >= 4 and not has_marker:
+                clean["script"] = ""
+                return clean
             # If model put a bare path as the script, wrap it as an invocation
             if script and not script.startswith("&") and not script.lower().startswith("powershell") and script.endswith((".ps1", ".py", ".cmd", ".bat")):
                 script = f"& '{script}'"
@@ -15190,4 +15547,3 @@ if __name__ == "__main__":
     print("FINAL RESULT")
     print("========================================")
     print(result)
-

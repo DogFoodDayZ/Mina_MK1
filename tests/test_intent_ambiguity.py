@@ -223,6 +223,16 @@ def test_info_question_does_not_trigger_play_clarification():
     assert tool != "__clarify_intent__"
 
 
+def test_default_reflex_is_off_for_normal_chat_but_on_for_explicit_tool_requests():
+    core = _core_with_spotify()
+    core.reflex_enabled = True
+    core.reflex_requires_prefix = False
+
+    assert not core._should_run_reflex("what time is it?")
+    assert core._should_run_reflex("/tool run python -c \"print(2 + 2)\"")
+    assert core._should_run_reflex("please run the mk1 diagnostic script now")
+
+
 def test_meta_play_rule_is_learned_not_executed_immediately():
     core = _core_with_spotify()
     core._intent_alias_cache = {}

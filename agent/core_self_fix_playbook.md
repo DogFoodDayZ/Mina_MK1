@@ -93,6 +93,20 @@ At minimum, these prompt classes must pass before considering a self-fix complet
 - yes
 - yes run the script countdown.py (must return real tool-backed output, never roleplay terminal transcripts)
 
+## Conversation Continuity Validation
+
+- For message-assembly changes, run `tests/test_conversation_continuity.py` with disposable SQLite storage and a recording model.
+- Preserve chronological user/assistant roles, the latest request, bounded history, and exclusion of tool bookkeeping; do not turn prior assistant replies into system instructions or automatically execute them.
+- The isolated harness must block normal runtime startup, network access, background workers, and tool execution. Do not use live memory or repeated live prompts as test data.
+- Passing these checks proves message assembly and object-recreation continuity only. Real-model repetition checks and a full isolated process restart remain separate acceptance steps.
+- Older-recall changes must also preserve speaker attribution, neighboring context and chronology after details leave recent history; test later corrections, recent/older deduplication, bounded output, and read-only neighborhood access without executing quoted tool examples.
+
+## Tool Ownership Validation
+
+- Mina decides tool use. With `tools.reflex_enabled: false`, core must not run a tool before her reply (pre-model reflex) or replace her reply with a tool core chose (`_maybe_rescue_chat_suggested_action`).
+- Run `tests/test_model_decides_tools.py` for any change to reflex, rescue, preflight, or the process tool loop. It must show: no core-chosen tool when off, her own tool calls still execute and feed back to her, and the switch-on control still fires (so the gate is proven, not vacuous).
+- Do not re-enable the switch or add new pre/post-model tool triggers without Travis's explicit approval.
+
 ## Rollback Trigger
 
 Rollback or halt if any of these occur:

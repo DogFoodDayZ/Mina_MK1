@@ -43,7 +43,8 @@
     "obsidian_vault": "D:\\Black Valt\\Mina"
   },
   "tools": {
-    "directory": "E:\\mina_mk1\\tools"
+    "directory": "E:\\mina_mk1\\tools",
+    "reflex_enabled": false
   },
   "workspace": {
     "root": "E:\\workspace",

@@ -20,7 +20,7 @@ Memory is Mina. Do not replace normal learned behavior with hardcoded chat or ro
 
 ## File Scale Snapshot
 
-- Function count: 390
+- Function count: 396
 - Main classes:
   - `LMStudioClient`
   - `MK1Core`
@@ -179,19 +179,24 @@ Shutdown changes must prove memory durability is preserved.
   - `_git_push`
 
 ### 12) Main Request Pipelines
-- Approx lines: 7155-7664
+- Approx lines: 10035-10642
 - Responsibility:
   - request processing (`process`, `process_stream`)
-  - reflex entry and orchestration
+  - reflex entry and orchestration; `tools.reflex_enabled: false` disables both the pre-model reflex and the after-reply `_maybe_rescue_chat_suggested_action` override, so Mina decides tool use
+  - shared message assembly with bounded persisted user/assistant dialogue
+  - separately quoted older conversation excerpts with speaker attribution and neighboring context
 - Critical functions:
   - `process`
   - `process_stream`
+  - `_build_process_messages`
+  - `_build_recent_conversation_messages`
+  - `_build_older_conversation_context`
 
 Maintainer comment:
 Most production regressions land here. Keep changes tiny and test after each one.
 
 ### 13) Context, Formatting, and Tool Output
-- Approx lines: 7665-9344
+- Approx lines: 10644-12556
 - Responsibility:
   - command-like detection
   - context assembly

@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
+from agent.inference_gate import serial_completion, serial_stream
 from agent.curiosity import AutonomousCuriosity, TOPIC_STOP_WORDS
 from agent.pending_actions import (
     PendingActionStore,
@@ -51,6 +52,11 @@ from memory.retention import is_failed_decision_text
 # ============================================================
 # LM STUDIO CLIENT
 # ============================================================
+
+class EmptyModelResponseError(RuntimeError):
+    def __init__(self):
+        super().__init__("Model returned no final answer or tool call. This request is incomplete.")
+
 
 class LMStudioClient:
 
@@ -150,39 +156,82 @@ class LMStudioClient:
         )
 
     def _estimate_tokens(self, messages: List[Dict[str, Any]]) -> int:
-        """Rough token estimate: 4 chars ≈ 1 token, plus 4 overhead per message."""
+        """Conservative text estimate including UTF-8 and chat-template overhead."""
         total = 0
         for m in messages:
             content = m.get("content") or ""
             if isinstance(content, list):
                 content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
-            total += len(str(content)) // 4 + 4
+            total += (len(str(content).encode("utf-8")) + 2) // 3 + 16
+            if m.get("tool_calls"):
+                total += (len(json.dumps(m["tool_calls"]).encode("utf-8")) + 2) // 3
         return total
 
-    def _trim_messages_to_budget(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Drop oldest non-system messages until payload fits within context_window budget."""
+    def _budget_model_messages(
+        self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]],
+        max_tokens: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if not tools:
+            return self._trim_messages_to_budget(messages, max_tokens=max_tokens)
+        schema_cost = {
+            "role": "system",
+            "content": json.dumps(tools, ensure_ascii=True, separators=(",", ":")),
+        }
+        budgeted = self._trim_messages_to_budget([schema_cost] + list(messages), max_tokens=max_tokens)
+        return [message for message in budgeted if message is not schema_cost]
+
+    def _trim_messages_to_budget(
+        self, messages: List[Dict[str, Any]], max_tokens: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Budget old context without separating the current request from its tool results."""
         if not self.context_window or self.context_window <= 0:
             return messages
         # Reserve headroom for the model's own output
-        budget = self.context_window - (self.max_tokens if self.max_tokens > 0 else 2048)
-        if budget <= 0 or self._estimate_tokens(messages) <= budget:
+        output_limit = self.max_tokens if max_tokens is None else max_tokens
+        budget = self.context_window - (output_limit if output_limit > 0 else 2048)
+        if self._estimate_tokens(messages) <= budget:
             return messages
-
-        system = [m for m in messages if str(m.get("role", "")).lower() == "system"]
-        non_system = [m for m in messages if str(m.get("role", "")).lower() != "system"]
-
-        # Always keep the last user message
-        if non_system:
-            pinned = [non_system[-1]]
-            trimmable = non_system[:-1]
-        else:
-            return messages
-
-        # Drop from oldest end until we fit
-        while trimmable and self._estimate_tokens(system + trimmable + pinned) > budget:
-            trimmable.pop(0)
-
-        trimmed = system + trimmable + pinned
+        last_user = next(
+            (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"),
+            len(messages),
+        )
+        trimmed = list(messages)
+        # Why: pinning only the final tool result discarded the actual request.
+        # Guard: retain the whole current user/tool exchange and immutable instructions.
+        recall_prefixes = (
+            "Retrieved older conversation (", "Relevant memory context:",
+        )
+        eviction_groups = [
+            [i]
+            for prefix in recall_prefixes
+            for i, message in enumerate(messages[:last_user])
+            if i > 0 and message.get("role") == "system"
+            and str(message.get("content") or "").startswith(prefix)
+        ]
+        old_turn: List[int] = []
+        for i, message in enumerate(messages[:last_user]):
+            if message.get("role") == "system":
+                continue
+            if message.get("role") == "user" and old_turn:
+                eviction_groups.append(old_turn)
+                old_turn = []
+            old_turn.append(i)
+        if old_turn:
+            eviction_groups.append(old_turn)
+        removed = set()
+        # Why: recalling old prose while dropping the previous turn erased
+        # the referent of follow-ups such as "the file ... find it".
+        for group in eviction_groups:
+            if self._estimate_tokens(trimmed) <= budget:
+                break
+            removed.update(group)
+            trimmed = [message for i, message in enumerate(messages) if i not in removed]
+        if self._estimate_tokens(trimmed) > budget:
+            raise ValueError(
+                "Context budget exceeded: current turn and required instructions "
+                f"need about {self._estimate_tokens(trimmed)} input tokens; budget is {budget}. "
+                "Use a smaller tool result or a larger loaded context."
+            )
         if len(trimmed) < len(messages):
             dropped = len(messages) - len(trimmed)
             print(f"[context budget] trimmed {dropped} message(s) to fit {self.context_window}-token window")
@@ -208,7 +257,9 @@ class LMStudioClient:
                     parts.append(item)
             return "\n".join(parts).strip()
         if isinstance(content, dict):
-            txt = content.get("text")
+            txt = content.get("content")
+            if not isinstance(txt, str):
+                txt = content.get("text")
             if isinstance(txt, str):
                 return txt
         return ""
@@ -501,10 +552,30 @@ class LMStudioClient:
         ):
             return bool(self._vision_support_cache_value)
 
-        # Synthetic capability probing is disabled to avoid background
-        # image turns and context churn. Use model-name hints/cache only.
+        if allow_probe:
+            origin = self.chat_url.split("/v1", 1)[0].rstrip("/")
+            try:
+                response = requests.get(f"{origin}/api/v1/models", timeout=5)
+                response.raise_for_status()
+                for model in response.json().get("models", []):
+                    instances = model.get("loaded_instances") or []
+                    if model.get("key") == self.default_model or any(
+                        instance.get("id") == self.default_model for instance in instances
+                    ):
+                        vision = model.get("capabilities", {}).get("vision")
+                        if isinstance(vision, bool):
+                            self._vision_support_cache_value = vision
+                            self._vision_support_cache_until = now + max(1.0, self._vision_support_cache_ttl)
+                            return vision
+            except (requests.RequestException, ValueError):
+                traceback.print_exc()
+
+        # Never generate synthetic image turns to discover capabilities.
         return bool(self._vision_support_cache_value) if self._vision_support_cache_value is not None else False
 
+    # Why: both local models share GPU resources.
+    # Guard: hold one inference slot until the complete response is consumed.
+    @serial_completion
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -538,13 +609,18 @@ class LMStudioClient:
         if self.presence_penalty:
             payload["presence_penalty"] = self.presence_penalty
 
+        effective_max_tokens = (
+            self.vision_max_tokens if has_image and self.vision_max_tokens > 0
+            else int(max_tokens_override) if max_tokens_override is not None else self.max_tokens
+        )
+        payload["messages"] = self._budget_model_messages(
+            payload["messages"], tools, max_tokens=effective_max_tokens,
+        )
         # Normalize role layout for templates that allow only one optional
         # system message before user/assistant alternation.
         if self._system_message_count(payload.get("messages", [])) > 1:
             payload["messages"] = self._coalesce_system_messages(payload.get("messages", []))
 
-        # Trim to context window budget before sending
-        payload["messages"] = self._trim_messages_to_budget(payload["messages"])
 
         # Add tools if provided
         if tools:
@@ -554,16 +630,19 @@ class LMStudioClient:
         # Vision calls are slower; cap response length to keep UI snappy.
         if has_image and self.vision_max_tokens > 0:
             payload["max_tokens"] = self.vision_max_tokens
-        if has_image and self.vision_reasoning_effort.lower() not in {"none", "off"}:
-            payload["reasoning_effort"] = self.vision_reasoning_effort
+        if has_image and self.vision_reasoning_effort:
+            payload["reasoning_effort"] = (
+                "none" if self.vision_reasoning_effort.lower() == "off" else self.vision_reasoning_effort
+            )
 
         # Apply non-vision token cap and reasoning effort when configured
         if not has_image:
-            effective_max_tokens = int(max_tokens_override) if max_tokens_override is not None else self.max_tokens
             if effective_max_tokens > 0:
                 payload["max_tokens"] = effective_max_tokens
-            if self.reasoning_effort.lower() not in {"", "none", "off"}:
-                payload["reasoning_effort"] = self.reasoning_effort
+            if self.reasoning_effort:
+                payload["reasoning_effort"] = (
+                    "none" if self.reasoning_effort.lower() == "off" else self.reasoning_effort
+                )
 
         print("\n========================================")
         print("MK1 → LM STUDIO REQUEST")
@@ -670,12 +749,22 @@ class LMStudioClient:
                 except Exception:
                     pass
 
+                choices = data.get("choices") or []
+                message = choices[0].get("message", {}) if choices else {}
+                if not (
+                    self._extract_text_content(message.get("content")).strip()
+                    or message.get("tool_calls")
+                ):
+                    raise EmptyModelResponseError()
+
                 if model_idx > 0 and model_name != self.default_model:
                     print(f"LM STUDIO MODEL FALLBACK: switched from '{self.default_model}' to '{model_name}'")
                     self.default_model = model_name
 
                 return data
 
+            except EmptyModelResponseError:
+                raise
             except Exception as e:
                 last_error = e
                 err_text = str(e)
@@ -709,6 +798,7 @@ class LMStudioClient:
             ]
         }
 
+    @serial_stream
     def chat_stream(
         self,
         messages: List[Dict[str, Any]],
@@ -725,19 +815,19 @@ class LMStudioClient:
             "stream": True,
         }
 
+        payload["messages"] = self._budget_model_messages(payload["messages"], tools)
         # Normalize role layout for templates that allow only one optional
         # system message before user/assistant alternation.
         if self._system_message_count(payload.get("messages", [])) > 1:
             payload["messages"] = self._coalesce_system_messages(payload.get("messages", []))
 
-        # Trim to context window budget (same as non-streaming path)
-        payload["messages"] = self._trim_messages_to_budget(payload["messages"])
-
         # Apply token cap and reasoning effort (same as non-streaming path)
         if self.max_tokens > 0:
             payload["max_tokens"] = self.max_tokens
-        if self.reasoning_effort.lower() not in {"", "none", "off"}:
-            payload["reasoning_effort"] = self.reasoning_effort
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = (
+                "none" if self.reasoning_effort.lower() == "off" else self.reasoning_effort
+            )
 
         if tools:
             payload["tools"] = tools
@@ -754,6 +844,7 @@ class LMStudioClient:
         # State for stripping qwen3.5 <think>...</think> blocks across stream chunks
         in_think_block: bool = False
         think_buf: List[str] = []
+        native_calls: Dict[int, Dict[str, Any]] = {}
 
         for model_idx, model_name in enumerate(attempted_models):
             attempt_base = dict(payload)
@@ -770,7 +861,7 @@ class LMStudioClient:
                     self.chat_url,
                     json=attempt,
                     stream=True,
-                    timeout=180,
+                    timeout=self.request_timeout_seconds,
                 )
                 try:
                     if resp.status_code >= 400:
@@ -793,11 +884,14 @@ class LMStudioClient:
                                 self.chat_url,
                                 json=attempt,
                                 stream=True,
-                                timeout=180,
+                                timeout=self.request_timeout_seconds,
                             )
 
                         resp.raise_for_status()
 
+                    # SSE is UTF-8 even when the backend omits a charset.
+                    resp.encoding = "utf-8"
+                    has_visible_text = False
                     for raw_line in resp.iter_lines(decode_unicode=True):
                         if not raw_line:
                             continue
@@ -826,6 +920,17 @@ class LMStudioClient:
 
                         piece = ""
                         if isinstance(delta, dict):
+                            for fragment in delta.get("tool_calls") or []:
+                                index = fragment.get("index", 0)
+                                call = native_calls.setdefault(index, {
+                                    "id": "", "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                })
+                                if fragment.get("id"):
+                                    call["id"] = fragment["id"]
+                                function = fragment.get("function") or {}
+                                for key in ("name", "arguments"):
+                                    call["function"][key] += function.get(key) or ""
                             content = delta.get("content")
                             if isinstance(content, str):
                                 piece = content
@@ -851,6 +956,7 @@ class LMStudioClient:
                                     in_think_block = False
                                     think_buf = []
                                     if after:
+                                        has_visible_text = has_visible_text or bool(after.strip())
                                         yield after
                                 # else: still inside think block, keep buffering
                             else:
@@ -860,15 +966,23 @@ class LMStudioClient:
                                     in_think_block = True
                                     think_buf = [combined.split("<think>", 1)[1]]
                                     if before:
+                                        has_visible_text = has_visible_text or bool(before.strip())
                                         yield before
                                 else:
                                     think_buf = []
+                                    has_visible_text = has_visible_text or bool(combined.strip())
                                     yield combined
 
+                    if not has_visible_text and not native_calls:
+                        raise EmptyModelResponseError()
+                    if native_calls:
+                        yield {"tool_calls": [native_calls[i] for i in sorted(native_calls)]}
                     if model_idx > 0 and model_name != self.default_model:
                         print(f"LM STUDIO MODEL FALLBACK: switched from '{self.default_model}' to '{model_name}'")
                         self.default_model = model_name
                     return
+                except EmptyModelResponseError:
+                    raise
                 except Exception as e:
                     last_http_error = e
                 finally:
@@ -1017,6 +1131,9 @@ class MK1Core:
         )
 
         self.tools = ToolLoader(tools_dir)
+        # Why: memory tools opened their own default MK1Memory, so writes skipped
+        # this instance's index and ignored the configured database path.
+        self.tools.memory = self.memory
         self._seed_tool_inventory_memory()
 
         # Reflex tool layer controls:
@@ -1050,7 +1167,10 @@ class MK1Core:
         else:
             self.reflex_prefixes = ["/tool", "tool:", "run tool"]
 
+        self.native_tool_calls = bool(self.config.get("model", "native_tool_calls", False))
         self.model = LMStudioClient({
+            # Preserve model limits and tuning; omitted keys retain client defaults.
+            **self.config.data.get("model", {}),
             "endpoint": self.config.get(
                 "model",
                 "endpoint",
@@ -4080,6 +4200,16 @@ class MK1Core:
         if not text:
             return {}
 
+        # Why: the tool prompt asks for JSON args, but the key:value scanner
+        # split Windows paths at the drive colon and dropped the real args.
+        for candidate in (text, "{" + text + "}"):
+            try:
+                parsed_json = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(parsed_json, dict):
+                return parsed_json
+
         out: Dict[str, Any] = {}
         for m in re.finditer(
             r"([A-Za-z_][\w.-]*)\s*:\s*(\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|[^,{}]+)",
@@ -4117,6 +4247,32 @@ class MK1Core:
             out[key] = val
 
         return out
+
+    # Stream tail kept back so a tool-call opener split across chunks is
+    # caught before it reaches the user.
+    _STREAM_TOOL_MARKUP_HOLDBACK = 32
+
+    def _tool_markup_start(self, text: str) -> Optional[int]:
+        content = str(text or "")
+        patterns = [
+            r"```\s*json",
+            r"<\|",
+            r"\|>\s*[A-Za-z_]",
+            r"\bcall\s*:\s*[A-Za-z_]",
+            r"<\s*spotify_link",
+        ]
+        try:
+            names = [re.escape(n) for n in self._tool_registry().keys()]
+        except Exception:
+            names = []
+        if names:
+            patterns.append(r"(?m)^\s*(?:" + "|".join(names) + r")\s*\{")
+        starts = [
+            m.start()
+            for p in patterns
+            if (m := re.search(p, content, flags=re.IGNORECASE)) is not None
+        ]
+        return min(starts) if starts else None
 
     def _strip_tool_call_markup(self, text: str) -> str:
         cleaned = (text or "").strip()
@@ -7815,7 +7971,7 @@ class MK1Core:
                 except Exception:
                     traceback.print_exc()
 
-        lines.append("Pick the highest-priority due task and work on that before unrelated replies.")
+        lines.append("These are scheduled reminders, not permission to replace the user's request or execute an action.")
         return "\n".join(lines)
 
     def _register_user_activity(self) -> None:
@@ -9809,87 +9965,8 @@ class MK1Core:
                 "Ask the user for the exact path instead of guessing."
             )
 
-        hardware_context_query = (
-            self._is_local_hardware_question(user_intent)
-            or self._is_hardware_followup_query(user_intent)
-        )
-
-        if tool_name in {"powershell", "ps_run"} and self._is_hardware_followup_query(user_intent):
-            command = str(tool_args.get("command") or tool_args.get("script") or "").strip()
-            commands = tool_args.get("commands")
-            if not command and not (isinstance(commands, list) and commands):
-                snapshot_context = self._build_hardware_followup_context(user_intent)
-                if snapshot_context:
-                    return "memory_read", {
-                        "ok": True,
-                        "result": {"stdout": snapshot_context},
-                        "error": None,
-                    }, f"[VERIFIED MEMORY]\n{snapshot_context}"
-
-        if tool_name == "ps_run" and hardware_context_query:
-            current_script = str(tool_args.get("script") or tool_args.get("command") or "").strip().lower()
-            if "cpu" in user_intent.lower() and "gpu" in user_intent.lower() and not (
-                "win32_processor" in current_script and "win32_videocontroller" in current_script
-            ):
-                try:
-                    from tools.ps_run import _normalize_command as _normalize_ps_command
-
-                    normalized = _normalize_ps_command(user_intent)
-                except Exception:
-                    normalized = ""
-                if normalized:
-                    tool_args = {"script": normalized}
-
-        if tool_name in {"system_info", "hardware_info", "computer_info"} and hardware_context_query:
-            try:
-                from tools.ps_run import _normalize_command as _normalize_ps_command
-
-                normalized = _normalize_ps_command(user_intent)
-            except Exception:
-                normalized = ""
-            if normalized:
-                tool_name = "ps_run"
-                tool_args = {"script": normalized}
-
-        if tool_name == "powershell" and hardware_context_query:
-            command = str(tool_args.get("command") or tool_args.get("script") or "").strip()
-            commands = tool_args.get("commands")
-            if not command and not (isinstance(commands, list) and commands):
-                try:
-                    from tools.ps_run import _normalize_command as _normalize_ps_command
-
-                    normalized = _normalize_ps_command(user_intent)
-                except Exception:
-                    normalized = ""
-                if normalized:
-                    tool_name = "ps_run"
-                    tool_args = {"script": normalized}
-
-        if tool_name in {"web_fetch", "web_search"} and hardware_context_query:
-            try:
-                from tools.ps_run import _normalize_command as _normalize_ps_command
-
-                normalized = _normalize_ps_command(user_intent)
-            except Exception:
-                normalized = ""
-            if normalized:
-                tool_name = "ps_run"
-                tool_args = {"script": normalized}
-
-        spotify_actions = {
-            "play_track", "play_playlist", "pause", "stop", "shuffle_on",
-            "shuffle_off", "set_shuffle", "favorites_list", "liked_songs",
-            "play_favorite", "search_track", "list_playlists", "playlist_tracks",
-            "current_playback", "create_playlist", "add_track_to_playlist",
-            "add_tracks_to_playlist", "connect_status",
-        }
-        if (
-            tool_name in spotify_actions
-            and "spotify_link" in getattr(self.tools, "tools", {})
-        ):
-            tool_args.setdefault("action", tool_name)
-            tool_name = "spotify_link"
-
+        # Why: prompt keywords used to replace Mina's tool and arguments.
+        # Guard: dispatch only her parsed call; tool permissions still apply.
         print(f"\n>>> TOOL CALL: {tool_name} {tool_args}")
         tool_result = self.tools.run(tool_name, tool_args)
         print(f">>> RESULT: {str(tool_result)[:200]}")
@@ -9907,11 +9984,100 @@ class MK1Core:
 
         if not bool(tool_result_dict.get("ok", True)):
             error_msg = str(tool_result_dict.get("error") or "unknown_error")
-            result_msg = f"[TOOL FAILED] {tool_name}: {error_msg}"
+            result_msg = f"[TOOL FAILED] {tool_name}: {error_msg}\n"
         else:
-            result_msg = str(tool_result)
+            result_msg = f"[{tool_name} result]\n"
+        if tool_name == "file_write" and isinstance(tool_result_dict.get("result"), dict):
+            if tool_result_dict["result"].get("changed") is False:
+                result_msg += "[FILE UNCHANGED: saved bytes are identical; no code change was applied.]\n"
+        inference_result = tool_result_dict
+        if tool_name == "code_repair" and isinstance(tool_result_dict.get("result"), dict):
+            payload = tool_result_dict["result"]
+            inference_result = {**tool_result_dict, "result": {
+                key: value for key, value in payload.items() if key != "steps"
+            }, "steps_omitted": "Detailed workflow receipts retained in action reports, not repeated here."}
+        result_msg += json.dumps(inference_result, ensure_ascii=False, separators=(",", ":"))
 
         return tool_name, tool_result_dict, result_msg
+
+    def _remember_native_tool_exchange(
+        self, exchange: List[Dict[str, Any]], request: str,
+    ) -> None:
+        memory = getattr(self, "memory", None)
+        if memory is None or not getattr(self, "native_tool_calls", False):
+            return
+        saved = json.loads(json.dumps(exchange))
+        for message in saved:
+            for call in message.get("tool_calls") or []:
+                args = json.loads(call["function"]["arguments"])
+                call["function"]["arguments"] = json.dumps({
+                    key: value for key, value in args.items()
+                    if key not in {"authorized_write", "auth_token", "token"}
+                })
+            if message.get("role") == "tool" and len(message.get("content", "")) > 1800:
+                message["content"] = message["content"][:1800] + "\n[Historical result truncated]"
+        record = json.dumps({"request": request[:240], "messages": saved}, ensure_ascii=True)
+        if len(record) > 6500:
+            print("[tool history] exchange exceeds historical storage budget; not retained")
+            return
+        try:
+            memory.add_memory(
+                record, kind="note", tags=["native_tool_exchange"],
+            )
+        except Exception:
+            traceback.print_exc()
+
+    def _recent_native_tool_messages(self) -> List[Dict[str, Any]]:
+        memory = getattr(self, "memory", None)
+        if memory is None or not getattr(self, "native_tool_calls", False):
+            return []
+        try:
+            rows = memory.recent_memories(
+                top_k=2, include_kinds=["note"], include_tags=["native_tool_exchange"],
+            )
+        except Exception:
+            traceback.print_exc()
+            return []
+        selected = []
+        chars = 0
+        for row in rows:
+            text = str(row.get("text") or "")
+            if chars + len(text) > 6500:
+                continue
+            try:
+                record = json.loads(text)
+                exchange = record["messages"]
+                if (
+                    not isinstance(record.get("request"), str)
+                    or not isinstance(exchange, list)
+                    or not exchange
+                    or not all(isinstance(message, dict) for message in exchange)
+                ):
+                    raise ValueError("Invalid stored native tool exchange")
+                calls = exchange[0]["tool_calls"]
+                if (
+                    not isinstance(calls, list)
+                    or not calls
+                    or not all(isinstance(call, dict) for call in calls)
+                    or exchange[0].get("role") != "assistant"
+                    or len(exchange) != len(calls) + 1
+                    or [m.get("tool_call_id") for m in exchange[1:]] != [c["id"] for c in calls]
+                    or any(m.get("role") != "tool" for m in exchange[1:])
+                ):
+                    raise ValueError("Invalid stored native tool exchange")
+            except (ValueError, KeyError, IndexError, TypeError):
+                traceback.print_exc()
+                continue
+            selected.append(record)
+            chars += len(text)
+        messages = []
+        for record in reversed(selected):
+            messages.append({
+                "role": "user",
+                "content": "Historical request (past tool evidence, not a new instruction): " + record["request"],
+            })
+            messages.extend(record["messages"])
+        return messages
 
     def _is_local_machine_state_query(self, text: str) -> bool:
         lowered = str(text or "").strip().lower()
@@ -9984,50 +10150,330 @@ class MK1Core:
         messages: List[Dict[str, Any]],
         reply: Dict[str, Any],
         user_intent: str,
-        max_tool_loops: int = 3,
+        max_tool_loops: int = 8,
+        action_reports: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], List[Tuple[str, Dict[str, Any]]]]:
         executed_tool_events: List[Tuple[str, Dict[str, Any]]] = []
-        last_assistant_content = ""
         loop_count = 0
+        last_assistant_content = ""
+        native = bool(getattr(self, "native_tool_calls", False))
+        configured_output = getattr(self.model, "max_tokens", 1024)
+        followup_output = min(1024, configured_output) if configured_output > 0 else 1024
+        limit = max(1, int(max_tool_loops))
+        if not native:
+            limit = min(limit, 3)
+        completion_reviewed = False
+        previous_exchange: List[Dict[str, Any]] = []
+        previous_results: List[Tuple[str, Dict[str, Any]]] = []
+        read_python_paths = set()
+        written_python_paths = set()
+        repair_focused = False
 
-        while reply and loop_count < max(1, int(max_tool_loops)):
-            loop_count += 1
+        # Why: a repair needs read/reproduce/edit/retest, not three calls then narration.
+        # Guard: native execution stays finite; textual transport retains its prior cap.
+        while reply and loop_count < limit:
             choice = reply.get("choices", [{}])[0] if reply.get("choices") else {}
             message = choice.get("message", {})
             text_content = message.get("content", "") or choice.get("text", "")
-            matches = self._extract_tool_calls_from_text(text_content)
+            native_calls = message.get("tool_calls") or []
+            matches = (
+                [(call["function"]["name"], call["function"]["arguments"]) for call in native_calls]
+                if native_calls else self._extract_tool_calls_from_text(text_content)
+            )
 
-            if not matches or text_content == last_assistant_content:
+            if not matches or (not native_calls and text_content == last_assistant_content):
+                gaps = self._python_repair_verification_gaps(executed_tool_events) if native else []
+                if gaps and not completion_reviewed:
+                    completion_reviewed = True
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "Repair verification checkpoint: completion is unverified. "
+                            + " ".join(gaps)
+                            + f" You have {limit - loop_count} tool rounds left. "
+                            "Continue only the authorized repair using actual diagnostics; test the "
+                            "saved file with code_execute(path, mode=run). Preserve requested behavior. "
+                            "Syntax-only checks, substitute snippets and timeouts do not pass. "
+                            "If blocked, report the blocker, not success."
+                        ),
+                    })
+                    reply = self.model.chat(
+                        messages=messages, tools=self._native_tool_schemas(),
+                        allow_fallback=False, allow_model_load=False,
+                        max_tokens_override=followup_output,
+                    )
+                    continue
+                if gaps:
+                    raise RuntimeError("Repair verification incomplete: " + " ".join(gaps))
                 break
 
+            loop_count += 1
             last_assistant_content = text_content
             cleaned_content = self._strip_tool_call_markup(text_content)
-            messages.append({
+            assistant_message: Dict[str, Any] = {
                 "role": "assistant",
                 "content": cleaned_content or "[processing...]",
-            })
+            }
+            if native_calls:
+                assistant_message["tool_calls"] = native_calls
+            messages.append(assistant_message)
+            exchange = [assistant_message]
+            round_results: List[Tuple[str, Dict[str, Any]]] = []
 
-            for tool_name, args_str in matches:
+            for index, (tool_name, args_str) in enumerate(matches):
+                tool_args = self._parse_tool_args(args_str)
                 tool_name, tool_result_dict, result_msg = self._execute_process_tool_call(
                     tool_name=tool_name,
                     args_str=args_str,
                     user_intent=user_intent,
                 )
                 executed_tool_events.append((tool_name, tool_result_dict))
-                messages.append({"role": "tool", "content": result_msg})
+                round_results.append((tool_name, tool_result_dict))
+                if action_reports is not None:
+                    action_reports.append(self._tool_action_report(
+                        tool_name, tool_args, tool_result_dict,
+                    ))
+                result_message = {"role": "tool", "content": result_msg}
+                if native_calls:
+                    result_message["tool_call_id"] = native_calls[index]["id"]
+                    result_message["name"] = tool_name
+                messages.append(result_message)
+                exchange.append(result_message)
+                # Why: old assistant prose can dominate a resolved coding task.
+                # Guard: focus only after actual model-selected Python repair actions, never keywords.
+                path = str(tool_args.get("path") or "")
+                if native_calls and tool_result_dict.get("ok") and path.lower().endswith(".py"):
+                    key = os.path.normcase(os.path.abspath(path))
+                    if tool_name == "file_read":
+                        read_python_paths.add(key)
+                    elif tool_name == "file_write":
+                        written_python_paths.add(key)
+                    if getattr(self, "focused_repair_context", False) and not repair_focused and (
+                        (tool_name == "code_execute" and tool_args.get("mode") == "inspect")
+                        or (tool_name == "file_write" and key in read_python_paths)
+                        or (tool_name == "code_execute" and (
+                            key in written_python_paths or key in read_python_paths
+                        ))
+                    ):
+                        self._focus_repair_messages(messages)
+                        repair_focused = True
 
-            try:
-                reply = self.model.chat(
-                    messages=messages,
-                    tools=None,
-                    allow_fallback=False,
-                    allow_model_load=False,
-                )
-            except Exception as e:
-                print(f"\n>>> MODEL ERROR: {e}")
-                break
+            if native_calls:
+                self._remember_native_tool_exchange(exchange, user_intent)
+                # Why: retaining every obsolete source snapshot exhausts a small context mid-repair.
+                # Guard: only earlier exchanges are summarized; latest results and full receipts survive.
+                self._compact_earlier_tool_exchange(previous_exchange, previous_results)
+                previous_exchange, previous_results = exchange, round_results
 
+            reply = self.model.chat(
+                messages=messages,
+                tools=self._native_tool_schemas(),
+                allow_fallback=False,
+                allow_model_load=False,
+                max_tokens_override=(
+                    followup_output if native else None
+                ),
+            )
+
+        if reply and self._native_reply_has_calls(reply):
+            completed = ", ".join(
+                f"{name}: {'tool returned ok' if result.get('ok') else 'failed'}"
+                for name, result in executed_tool_events
+            )
+            raise RuntimeError(
+                "Tool-call limit reached before the model produced an answer. "
+                f"Executed calls: {completed}. The next requested call was NOT executed."
+            )
+
+        if native:
+            gaps = self._python_repair_verification_gaps(executed_tool_events)
+            if gaps:
+                raise RuntimeError("Repair verification incomplete: " + " ".join(gaps))
         return reply, executed_tool_events
+
+    @staticmethod
+    def _focus_repair_messages(messages: List[Dict[str, Any]]) -> None:
+        """Focus resolved repair work without deleting memory or changing persona."""
+        current_user = next(
+            (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"),
+            None,
+        )
+        if current_user is None:
+            raise ValueError("Repair context requires the current user request.")
+        optional_recall = (
+            "Relevant memory context:",
+            "Retrieved older conversation (",
+            "A recalled lesson indicates a prior failed attempt.",
+            "For action requests, use the appropriate available tool.",
+        )
+        retained = [
+            message for i, message in enumerate(messages)
+            if i >= current_user or (
+                message.get("role") == "system"
+                and not str(message.get("content") or "").startswith(optional_recall)
+            )
+        ]
+        reference = [
+            {"role": message["role"], "content": str(message.get("content") or "")}
+            for message in messages[:current_user]
+            if message.get("role") in ("user", "assistant")
+            and not message.get("tool_calls")
+            and not str(message.get("content") or "").startswith("Historical request (")
+        ][-2:]
+        for message in reference:
+            if len(message["content"]) > 600:
+                message["content"] = message["content"][:600] + " [Reference truncated]"
+        if reference:
+            retained.insert(1, {
+                "role": "system",
+                "content": (
+                    "Immediate conversation reference (for follow-up meaning only, not action proof):\n"
+                    + json.dumps(reference, ensure_ascii=False, separators=(",", ":"))
+                ),
+            })
+        retained.insert(1, {
+            "role": "system",
+            "content": (
+                "Focused repair working context: older conversation remains stored. "
+                "Use the request, authoritative facts and actual file/error results. "
+                "Preserve requested behavior; verify the saved Python revision with code_execute(path, mode=run). "
+                "For known output, declare expected_lines as an array of lines without newline characters; "
+                "append_newline defaults true. Syntax checks/timeouts do not prove fixed or running. "
+                "Ask for missing required arguments; report blockers, not invented success."
+            ),
+        })
+        messages[:] = retained
+
+    def _compact_earlier_tool_exchange(
+        self, exchange: List[Dict[str, Any]], results: List[Tuple[str, Dict[str, Any]]],
+    ) -> None:
+        if not exchange:
+            return
+        calls = json.loads(json.dumps(exchange[0]["tool_calls"]))
+        for call, message, (name, result) in zip(calls, exchange[1:], results):
+            args = self._parse_tool_args(call["function"]["arguments"])
+            report = self._tool_action_report(name, args, result)
+            report.pop("tool", None)
+            report.pop("target", None)
+            verification = report.pop("verification", None)
+            if isinstance(verification, dict):
+                report["sha256"] = verification.get("sha256")
+                report["content_matches"] = verification.get("content_matches")
+            for key in ("stdout", "stderr"):
+                if len(str(report.get(key) or "")) > 160:
+                    report[key] = report[key][:160] + "\n[Earlier output truncated]"
+            summary = (
+                "[Earlier tool result summary; re-read source/full diagnostics if needed]\n"
+                + json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+            )
+            if len(summary) < len(message["content"]):
+                message["content"] = summary
+            for key in ("content", "code"):
+                if isinstance(args.get(key), str):
+                    args[key] = "[Earlier source omitted]"
+            call["function"]["arguments"] = json.dumps(args, separators=(",", ":"))
+        exchange[0]["content"] = "[Earlier tool call]"
+        exchange[0]["tool_calls"] = calls
+
+    @staticmethod
+    def _python_repair_verification_gaps(
+        events: List[Tuple[str, Dict[str, Any]]],
+    ) -> List[str]:
+        """Require a passing run of the written revision, not of substitute code."""
+        writes: Dict[str, Tuple[str, bool]] = {}
+        repair_paths = set()
+        expected_outputs: Dict[str, str] = {}
+        events = [
+            (step["tool"], step["result"])
+            for name, result in events
+            for step in (
+                (result.get("result") or {}).get("steps", []) if name == "code_repair"
+                else [{"tool": name, "result": result}]
+            )
+        ]
+        for name, result in events:
+            payload = result.get("result") if isinstance(result.get("result"), dict) else result
+            path = str(payload.get("path") or "")
+            if not path:
+                continue
+            key = os.path.normcase(os.path.abspath(path))
+            if (name == "code_execute" and payload.get("mode") in ("inspect", "check", "run")) or (
+                name == "coding_specialist" and result.get("ok") and payload.get("proposed_content")
+            ):
+                repair_paths.add(key)
+                if isinstance(payload.get("expected_stdout"), str):
+                    expected_outputs.setdefault(key, payload["expected_stdout"])
+            if name == "file_write" and (
+                result.get("ok") or payload.get("written")
+            ):
+                proof = payload.get("verification") or {}
+                writes[key] = (str(proof.get("sha256") or ""), False)
+            elif name == "code_execute" and key in writes and payload.get("mode") == "run":
+                digest = writes[key][0]
+                writes[key] = (
+                    digest,
+                    bool(digest and result.get("ok") and payload.get("sha256") == digest
+                         and payload.get("exit_code") == 0
+                         and (key not in expected_outputs
+                              or payload.get("stdout") == expected_outputs[key])),
+                )
+        return [
+            f"{path}: saved Python changes have no passing run of the same SHA-256 revision"
+            + (f" with expected_stdout={expected_outputs[path]!r}." if path in expected_outputs else ".")
+            for path, (_, passed) in writes.items() if path in repair_paths and not passed
+        ]
+
+    @staticmethod
+    def _tool_action_report(
+        name: str, args: Dict[str, Any], result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        payload = result.get("result") if isinstance(result.get("result"), dict) else result
+        report: Dict[str, Any] = {
+            "tool": name, "ok": bool(result.get("ok", False)),
+            "target": str(payload.get("path") or args.get("path") or "")[:500],
+            "error": str(result.get("error") or "")[:1200],
+        }
+        for key in ("exit_code", "verification", "changed", "mode", "sha256", "expected_stdout",
+                    "model", "saved", "tested", "source_sha256", "status", "assessment_verified",
+                    "verification_level", "attempts", "questions", "changes", "change_evidence",
+                    "decoder_used", "bom", "python_syntax_check"):
+            if key in payload:
+                report[key] = payload[key]
+        if name == "coding_specialist" and payload.get("summary"):
+            report["summary"] = str(payload["summary"])[:2000]
+        if name == "code_repair":
+            report["steps"] = [
+                MK1Core._tool_action_report(step["tool"], {}, step["result"])
+                for step in payload.get("steps", [])
+            ]
+        for key in ("stdout", "stderr"):
+            if payload.get(key):
+                text = str(payload[key])
+                report[key] = text[:2000] + ("\n[Report output truncated]" if len(text) > 2000 else "")
+        return report
+
+    @staticmethod
+    def _native_reply_has_calls(reply: Dict[str, Any]) -> bool:
+        return bool(((reply.get("choices") or [{}])[0].get("message") or {}).get("tool_calls"))
+
+    def _native_tool_schemas(self) -> Optional[List[Dict[str, Any]]]:
+        if not getattr(self, "native_tool_calls", False):
+            return None
+        schemas = self.tools.get_tool_schemas()
+        public = []
+        hidden = {"authorized_write", "auth_token", "token"}
+        for tool in schemas:
+            fn = dict(tool["function"])
+            params = dict(fn.get("parameters") or {})
+            params["properties"] = {
+                name: spec for name, spec in params.get("properties", {}).items()
+                if name not in hidden
+            }
+            if "required" in params:
+                params["required"] = [name for name in params["required"] if name not in hidden]
+            fn["parameters"] = params
+            public.append({"type": "function", "function": fn})
+        return public
 # ========================================================
 # PROCESS
 # ========================================================
@@ -10039,6 +10485,7 @@ class MK1Core:
         request_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
+        action_reports: List[Dict[str, Any]] = []
         try:
             process_started = time.perf_counter()
             process_timings: Dict[str, float] = {}
@@ -10078,45 +10525,10 @@ class MK1Core:
             process_timings["message_assembly"] = time.perf_counter() - process_started
 
             # =================================================
-            # TOOL REFLEX FIRST
-            # =================================================
-
-            reflex_reply = None
-            if self._should_run_reflex(user_input):
-                reflex_input = self._extract_reflex_payload(user_input)
-                if reflex_input:
-                    reflex_reply = self._reflex_tools_and_memory(
-                        messages=messages,
-                        reply={},
-                        user_input=reflex_input,
-                        request_context=request_context,
-                    )
-
-            if reflex_reply is not None:
-
-                final_text = self._extract_text(
-                    reflex_reply
-                )
-
-                self._store_turn_memory(
-                    user_input=user_input,
-                    assistant_text=final_text,
-                    retry_guided=bool(retry_prompt),
-                    request_context=request_context,
-                )
-                process_timings["total"] = time.perf_counter() - process_started
-                self._last_process_timings = dict(process_timings)
-                print(f">>> PROCESS TIMINGS: {process_timings}")
-
-                return {
-                    "reply": final_text
-                }
-
-            # =================================================
             # NORMAL MODEL FLOW
             # =================================================
 
-            if ostranauts_context:
+            if ostranauts_context and self._interface_name(request_context) == "Ostranauts GUI":
                 messages.append({
                     "role": "system",
                     "content": ostranauts_context,
@@ -10165,11 +10577,9 @@ class MK1Core:
                     "content": user_input,
                 })
 
-            # NOTE: Gemma-4 doesn't support OpenAI-style tools parameter; it hangs if passed
-            # Instead, the model will generate tool calls in custom format: <|tool_call>call:name{args}<tool_call|>
             reply = self.model.chat(
                 messages=messages,
-                tools=None,  # Don't pass tools to avoid LMStudio timeout
+                tools=self._native_tool_schemas(),
                 allow_fallback=False,
                 allow_model_load=False,
             )
@@ -10179,37 +10589,15 @@ class MK1Core:
                 messages=messages,
                 reply=reply,
                 user_intent=user_input,
+                action_reports=action_reports,
             )
 
             final_text = self._handle_model_response(
                 messages,
                 reply,
             )
-
-            # If Mina's response executed inline tool calls (e.g. file_read to prep a fix),
-            # call the model once more so she can act on the results rather than just display them.
-            if "[file_read result]" in final_text or "[ps_run result]" in final_text or "[dir_list result]" in final_text:
-                followup_messages = list(messages) + [
-                    {"role": "assistant", "content": final_text},
-                    {"role": "user", "content": "Now use that result to complete the original request."},
-                ]
-                try:
-                    followup_reply = self.model.chat(messages=followup_messages, temperature=0.7)
-                    followup_text = self._handle_model_response(followup_messages, followup_reply)
-                    if followup_text and followup_text.strip():
-                        final_text = followup_text
-                except Exception:
-                    pass
-
-            if not executed_tool_events:
-                rescued = self._maybe_rescue_chat_suggested_action(
-                    messages=messages,
-                    user_input=user_input,
-                    assistant_text=final_text,
-                    request_context=request_context,
-                )
-                if rescued is not None:
-                    final_text = self._extract_text(rescued)
+            if not final_text.strip():
+                raise EmptyModelResponseError()
 
             self._store_turn_memory(
                 user_input=user_input,
@@ -10223,6 +10611,7 @@ class MK1Core:
 
             response: Dict[str, Any] = {
                 "reply": final_text,
+                "actions": action_reports,
             }
 
             if image_meta is not None:
@@ -10243,7 +10632,8 @@ class MK1Core:
             traceback.print_exc()
 
             return {
-                "reply": f"(Mina error: {str(e)})"
+                "reply": f"(Mina error: {str(e)})",
+                "actions": action_reports,
             }
 
     def process_stream(
@@ -10253,6 +10643,9 @@ class MK1Core:
         request_context: Optional[Dict[str, Any]] = None,
     ):
 
+        action_reports: List[Dict[str, Any]] = []
+        report_requested = bool((request_context or {}).get("include_action_reports"))
+        report_sent = False
         try:
             turn_clock = self._advance_turn_clock()
             self._refresh_idle_checkin_state()
@@ -10272,28 +10665,7 @@ class MK1Core:
                 user_input=user_input,
             )
 
-            reflex_reply = None
-            if self._should_run_reflex(user_input):
-                reflex_input = self._extract_reflex_payload(user_input)
-                if reflex_input:
-                    reflex_reply = self._reflex_tools_and_memory(
-                        messages=messages,
-                        reply={},
-                        user_input=reflex_input,
-                        request_context=request_context,
-                    )
-            if reflex_reply is not None:
-                final_text = self._extract_text(reflex_reply)
-                self._store_turn_memory(
-                    user_input=user_input,
-                    assistant_text=final_text,
-                    request_context=request_context,
-                )
-                for chunk in self._iter_text_chunks(final_text):
-                    yield chunk
-                return
-
-            if ostranauts_context:
+            if ostranauts_context and self._interface_name(request_context) == "Ostranauts GUI":
                 messages.append({
                     "role": "system",
                     "content": ostranauts_context,
@@ -10330,97 +10702,85 @@ class MK1Core:
                     "content": user_input,
                 })
 
-            tool_preflight = (
-                str(getattr(self, "action_mode_strictness", "balanced") or "balanced") in {"balanced", "strict"}
-                and (
-                    self._is_command_like_query(user_input)
-                    or self._is_action_request_like(user_input)
-                    or self._is_operational_incident_report(user_input)
-                )
-            )
-
-            if tool_preflight:
-                try:
-                    reply = self.model.chat(
-                        messages=messages,
-                        tools=None,
-                        allow_fallback=False,
-                        allow_model_load=False,
-                    )
-
-                    reply, executed_tool_events = self._run_process_tool_loop(
-                        messages=messages,
-                        reply=reply,
-                        user_intent=user_input,
-                    )
-
-                    if executed_tool_events:
-                        final_text = self._handle_model_response(messages, reply)
-                        self._store_turn_memory(
-                            user_input=user_input,
-                            assistant_text=final_text,
-                            request_context=request_context,
-                        )
-                        for chunk in self._iter_text_chunks(final_text):
-                            yield chunk
-                        return
-
-                    preflight_text = self._handle_model_response(messages, reply)
-                    rescued = self._maybe_rescue_chat_suggested_action(
-                        messages=messages,
-                        user_input=user_input,
-                        assistant_text=preflight_text,
-                        request_context=request_context,
-                    )
-                    if rescued is not None:
-                        preflight_text = self._extract_text(rescued)
-                    if preflight_text:
-                        self._store_turn_memory(
-                            user_input=user_input,
-                            assistant_text=preflight_text,
-                            request_context=request_context,
-                        )
-                        for chunk in self._iter_text_chunks(preflight_text):
-                            yield chunk
-                        return
-                except Exception:
-                    traceback.print_exc()
-
+            # Why: tools only ran when the user's wording matched keyword
+            # regexes; otherwise Mina's tool calls were streamed raw, stripped,
+            # and never executed. The model decides; the core always executes
+            # what she calls and returns the result to her.
             parts: List[str] = []
+            streamed_upto = 0
+            holding_tool_markup = False
+            native_calls = []
             for piece in self.model.chat_stream(
                 messages=messages,
-                tools=None,
+                tools=self._native_tool_schemas(),
                 allow_fallback=False,
                 allow_model_load=False,
             ):
                 if not piece:
                     continue
+                if isinstance(piece, dict):
+                    native_calls.extend(piece.get("tool_calls") or [])
+                    continue
                 parts.append(piece)
-                yield piece
+                if holding_tool_markup:
+                    continue
+                so_far = "".join(parts)
+                marker_at = self._tool_markup_start(so_far)
+                if marker_at is not None:
+                    holding_tool_markup = True
+                    safe_end = marker_at
+                else:
+                    safe_end = len(so_far) - self._STREAM_TOOL_MARKUP_HOLDBACK
+                if safe_end > streamed_upto:
+                    yield so_far[streamed_upto:safe_end]
+                    streamed_upto = safe_end
 
-            final_text = self._clean_response_text("".join(parts)).strip()
-            final_text = self._strip_tool_call_markup(final_text)
+            raw_text = "".join(parts)
+            executed_tool_events: List[Tuple[str, Dict[str, Any]]] = []
 
-            if not final_text:
-                # Fallback in case backend didn't emit stream chunks.
-                reply = self.model.chat(
+            if not raw_text.strip() and not native_calls:
+                raise EmptyModelResponseError()
+            elif native_calls or self._extract_tool_calls_from_text(raw_text):
+                visible_prefix = self._clean_response_text(raw_text[:streamed_upto]).strip()
+                reply = {"choices": [{"message": {"role": "assistant", "content": raw_text}}]}
+                if native_calls:
+                    reply["choices"][0]["message"]["tool_calls"] = native_calls
+                reply, executed_tool_events = self._run_process_tool_loop(
                     messages=messages,
-                    tools=None,
-                    allow_fallback=False,
-                    allow_model_load=False,
+                    reply=reply,
+                    user_intent=user_input,
+                    action_reports=action_reports,
                 )
-                final_text = self._handle_model_response(messages, reply)
-                for chunk in self._iter_text_chunks(final_text):
+                if report_requested:
+                    yield {"type": "actions", "actions": action_reports}
+                    report_sent = True
+                followup_text = self._handle_model_response(messages, reply)
+                if not followup_text.strip():
+                    raise EmptyModelResponseError()
+                streamed_raw = raw_text[:streamed_upto]
+                streamed_newlines = len(streamed_raw) - len(streamed_raw.rstrip("\n"))
+                separator = "\n" * max(0, 2 - streamed_newlines) if visible_prefix and followup_text else ""
+                for chunk in self._iter_text_chunks(separator + followup_text):
                     yield chunk
+                joiner = "\n\n" if visible_prefix and followup_text else ""
+                final_text = f"{visible_prefix}{joiner}{followup_text}".strip()
+            else:
+                if streamed_upto < len(raw_text):
+                    yield raw_text[streamed_upto:]
+                final_text = self._clean_response_text(raw_text).strip()
 
-            rescued = self._maybe_rescue_chat_suggested_action(
-                messages=messages,
-                user_input=user_input,
-                assistant_text=final_text,
-                request_context=request_context,
-            )
-            if rescued is not None:
-                final_text = self._extract_text(rescued)
+            if not final_text.strip():
+                raise EmptyModelResponseError()
+            if report_requested and not report_sent:
+                yield {"type": "actions", "actions": action_reports}
+                report_sent = True
+            if executed_tool_events:
+                self._store_turn_memory(
+                    user_input=user_input,
+                    assistant_text=final_text,
+                    request_context=request_context,
+                )
+                return
 
             self._store_turn_memory(
                 user_input=user_input,
@@ -10430,6 +10790,8 @@ class MK1Core:
 
         except Exception as e:
             traceback.print_exc()
+            if report_requested and not report_sent:
+                yield {"type": "actions", "actions": action_reports}
             yield f"(Mina error: {str(e)})"
 
     # ========================================================
@@ -10452,29 +10814,26 @@ class MK1Core:
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
 
-        messages.append({
-            "role": "system",
-            "content": self._interface_label_line(request_context),
-        })
-        messages.append({
-            "role": "system",
-            "content": self._interface_surface_line(request_context),
-        })
+        interface_name = str((request_context or {}).get("interface_name") or "").strip()
+        if interface_name:
+            messages.append({"role": "system", "content": f"Current interface: {interface_name}."})
 
+        recent_dialogue = self._recent_conversation_records()
+        retry_prompt = self._learned_lesson_retry_prompt(context)
+        context = self._deduplicate_recall_context(context, working_memory, recent_dialogue)
         if context:
             messages.append({
                 "role": "system",
                 "content": f"Relevant memory context:\n{context}",
             })
 
-        retry_prompt = self._learned_lesson_retry_prompt(context)
         if retry_prompt:
             messages.append({"role": "system", "content": retry_prompt})
 
         if working_memory:
             messages.append({
                 "role": "system",
-                "content": f"{working_memory}\nPrefer these DB-backed facts over guessing.",
+                "content": working_memory,
             })
 
         for prompt in (checkin_prompt, away_prompt, self._build_due_task_prompt()):
@@ -10486,16 +10845,7 @@ class MK1Core:
             "content": self._format_turn_clock_line(turn_clock),
         })
 
-        strict_mode = str(getattr(self, "action_mode_strictness", "balanced")) in {"balanced", "strict"}
-        action_request = (
-            self._is_command_like_query(user_input)
-            or self._is_action_request_like(user_input)
-            or self._is_operational_incident_report(user_input)
-        )
-        if strict_mode:
-            messages.append({"role": "system", "content": self._truth_first_system_rules()})
-        if strict_mode and action_request:
-            messages.append({"role": "system", "content": self._tool_usage_decision_rules()})
+        messages.append({"role": "system", "content": self._truth_first_system_rules()})
 
         tools_obj = getattr(self, "tools", None)
         tool_schemas = (
@@ -10503,23 +10853,43 @@ class MK1Core:
             if tools_obj and hasattr(tools_obj, "get_tool_schemas")
             else []
         )
-        if tool_schemas:
-            tool_names = [tool["function"]["name"] for tool in tool_schemas]
+        if tool_schemas and not getattr(self, "native_tool_calls", False):
+            # Why: argument names alone omitted required fields, types and limits.
+            # Guard: all tools stay visible without keyword-based selection.
+            hidden_params = {"authorized_write", "auth_token", "token"}
+            tool_lines = []
+            for tool in tool_schemas:
+                fn = tool.get("function", {})
+                parameters = dict(fn.get("parameters") or {})
+                parameters["properties"] = {
+                    name: spec for name, spec in (parameters.get("properties") or {}).items()
+                    if name not in hidden_params
+                }
+                if "required" in parameters:
+                    parameters["required"] = [
+                        name for name in parameters["required"] if name not in hidden_params
+                    ]
+                tool_lines.append(json.dumps({
+                    "tool": fn.get("name"),
+                    "description": fn.get("description", ""),
+                    "parameters": parameters,
+                }, ensure_ascii=True, separators=(",", ":")))
             messages.append({
                 "role": "system",
                 "content": (
-                    f"You have access to these tools: {', '.join(tool_names)}. "
-                    "Use them proactively when the user asks for information you can fetch, files to read/write, "
-                    "or tasks you can perform. "
-                    "To call a tool, output a JSON code block like this:\n"
+                    "Available tools (JSON Schema arguments):\n"
+                    + "\n".join(tool_lines)
+                    + "\nDecide from the conversation whether a tool is needed; ordinary chat needs no call. "
+                    "If a required argument is missing, ask one focused question. "
+                    "To call a tool, output this JSON code block with its exact name and arguments:\n"
                     "```json\n{\"tool\": \"tool_name\", \"args\": {\"key\": \"value\"}}\n```\n"
-                    "The system will detect and execute it. Do NOT use <|tool_call> syntax."
+                    "The system hides the call, executes it within permissions, and returns the result before you answer. "
+                    "Do NOT use <|tool_call> syntax."
                 ),
             })
 
         # Why: retrieved snippets omit Mina's side of the previous exchange.
         # Guard: restore prior turns as conversation roles, never as system instructions.
-        recent_dialogue = self._recent_conversation_records()
         older_context = self._build_older_conversation_context(user_input, recent_dialogue)
         if older_context:
             messages.append({"role": "system", "content": older_context})
@@ -10527,7 +10897,72 @@ class MK1Core:
             message for row in recent_dialogue
             if (message := self._conversation_record_message(row)) is not None
         )
+        if tool_schemas and getattr(self, "native_tool_calls", False):
+            messages.extend(self._recent_native_tool_messages())
+            messages.append({
+                "role": "system",
+                "content": (
+                    self._tool_usage_decision_rules()
+                    + " Prior assistant narration is not tool evidence. "
+                    "For a new inspection, obtain a fresh tool result before describing file contents."
+                    " For authorized Python fixes with permission to edit AND run, use "
+                    "code_repair(path, objective, expected_lines when known). It owns consultation, "
+                    "save and verification: do not manually alternate these steps. "
+                    "For review-only or no execution permission, use coding_specialist(path, objective); "
+                    "it only reads and proposes. Include actual diagnostics if available, but they "
+                    "are optional: do not ask again for an already supplied path/goal. "
+                    "Its status is proposal, no_change, or clarify, not a verified diagnosis. "
+                    "Preserve no_change; ask genuine clarification questions when needed. "
+                    "Never invent a defect or misstate its summary. For authorized repairs, apply "
+                    "the proposal then test the saved file with code_execute(mode=run) and finite timeout. "
+                    "Declare expected_lines on inspect/run when output is known. "
+                    "Retest failures within budget; preserve requested behavior. check is syntax-only; "
+                    "timeouts do not prove fixed/running. Report verification blockers. Ordinary "
+                    "save/generate requests never authorize execution."
+                    " Explain repairs from actual changes diffs, not a specialist's unverified "
+                    "diagnosis. A passing run proves only the recorded test, not every behavior. "
+                    "decoder_used names a decoding method; only bom reports a marker actually present "
+                    "(null means none). Do not infer a BOM from an encoding label."
+                ),
+            })
         return messages, retry_prompt
+
+    @staticmethod
+    def _deduplicate_recall_context(
+        context: str, working_memory: str, recent_dialogue: List[Dict[str, Any]],
+    ) -> str:
+        """Remove duplicate recall bullets, never dialogue or stored records."""
+        def key(text: str) -> str:
+            return " ".join(text.split())
+
+        authoritative = {
+            key(line[2:]) for line in working_memory.splitlines()
+            if line.startswith("- ")
+        }
+        dialogue = {key(str(row.get("text") or "")) for row in recent_dialogue}
+        seen = set(authoritative)
+        lines: List[str] = []
+        heading = ""
+        short_term = False
+        for line in context.splitlines():
+            if not line.strip():
+                continue
+            if not line.startswith("- ") and line.endswith(":"):
+                heading = line
+                short_term = line.startswith("Short-term recall")
+                continue
+            if line.startswith("- "):
+                value = key(line[2:])
+                if value in seen or (short_term and value in dialogue):
+                    continue
+                seen.add(value)
+            if heading:
+                if lines:
+                    lines.append("")
+                lines.append(heading)
+                heading = ""
+            lines.append(line)
+        return "\n".join(lines)
 
     @staticmethod
     def _conversation_record_message(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -10643,30 +11078,9 @@ class MK1Core:
 
     def _build_process_memory_context(self, user_input: str) -> Tuple[str, str, str]:
         """Select per-turn memory sources without coupling them to model assembly."""
-        fast_command_mode = bool(getattr(self, "fast_command_mode", True))
-        fast_command_skip_context = bool(getattr(self, "fast_command_skip_context", False))
-
-        command_like = fast_command_mode and self._is_command_like_query(user_input)
-        ostranauts_context = build_ostranauts_context()
-        live_ostranauts_query = bool(
-            ostranauts_context and is_ostranauts_query(user_input)
-        )
-        if command_like and fast_command_skip_context:
-            context = ""
-        elif live_ostranauts_query:
-            context = self._build_ostranauts_memory_context(user_input)
-        else:
-            context = self.build_context(user_input)
-
-        autonomy_awareness_context = self._build_autonomy_awareness_context(user_input)
-        if autonomy_awareness_context:
-            context = (
-                f"{context}\n\n{autonomy_awareness_context}".strip()
-                if context
-                else autonomy_awareness_context
-            )
-
-        return context, self._build_turn_working_memory(user_input), ostranauts_context
+        # Why: command/game keywords switched memory lanes or injected directives.
+        # Guard: every utterance uses the same memory path; surface telemetry is separate.
+        return self.build_context(user_input), self._build_turn_working_memory(user_input), build_ostranauts_context()
 
     def _is_command_like_query(self, text: str) -> bool:
         q = (text or "").strip().lower()
@@ -10865,9 +11279,11 @@ class MK1Core:
         )
 
     def _store_active_task_heartbeat(self, user_input: str, assistant_text: str) -> None:
-        """Persist a compact task heartbeat so Mina remembers the active issue across turns."""
+        """Remember task intent without promoting assistant narration into task state."""
         try:
-            signal = " ".join(str(part or "").strip() for part in [user_input, assistant_text] if str(part or "").strip())
+            # Why: unverified assistant success prose was recalled as task-state evidence.
+            # Guard: conversation replies stay in attributed dialogue, not task-state notes.
+            signal = str(user_input or "").strip()
             if len(signal) < 24:
                 return
             compact = " ".join(signal.split())
@@ -10876,12 +11292,12 @@ class MK1Core:
             if not any(word in compact.lower() for word in ["fix", "issue", "avatar", "debug", "work", "task", "problem", "status", "api", "test", "memory", "route", "script", "tool"]):
                 return
             self.memory.add_memory(
-                f"Task heartbeat: {compact}",
+                f"Task request: {compact}",
                 kind="note",
-                tags=["task_state", "heartbeat", "active_issue"],
+                tags=["task_state", "heartbeat", "active_issue", "user_request"],
             )
         except Exception:
-            pass
+            traceback.print_exc()
 
     def _build_learned_lesson_context(self, query: str, top_k: int = 6) -> str:
         lesson_semantic = self._learned_lesson_results(query, top_k=top_k)
@@ -10993,117 +11409,51 @@ class MK1Core:
         return "\n".join(lines).strip()
 
     def _build_turn_working_memory(self, query: str) -> str:
-        """
-        Build a compact, authoritative per-turn working-memory block from DB.
-        This complements semantic recall and helps prevent same-turn detail loss.
-        """
-        try:
-            recent = self.memory.recent_memories(
-                top_k=240,
-                include_kinds=["tool", "procedure", "fact"],
-            )
-        except Exception:
-            recent = []
-
+        """Keep authoritative identity anchors separate from recalled runtime history."""
         lines: List[str] = self._authoritative_working_memory_lines(query=query, max_lines=6)
-        seen = {ln.lower() for ln in lines}
-
-        for item in recent or []:
-            txt = str(item.get("text") or "").strip()
-            if not txt:
-                continue
-            if not self._is_turn_working_memory_record(txt):
-                continue
-
-            compact = self._compact_working_memory_line(txt, max_chars=180)
-            if not compact:
-                continue
-
-            k = compact.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            lines.append(compact)
-
-            if len(lines) >= 10:
-                break
-
-        try:
-            sem = self.memory.search(
-                query,
-                top_k=5,
-                include_kinds=["tool", "procedure", "fact"],
-                include_tags=["suggestion_context", "tool_result", "capability_delta", "capability_snapshot"],
-            )
-        except Exception:
-            sem = []
-
-        for item in sem or []:
-            txt = str(item.get("text") or "").strip()
-            if not self._is_turn_working_memory_record(txt) and not txt.lower().startswith((
-                "mina_capability_delta::",
-                "mina_capability_snapshot::",
-            )):
-                continue
-
-            compact = self._compact_working_memory_line(txt, max_chars=180)
-            if not compact:
-                continue
-
-            k = compact.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            lines.append(compact)
-
-            if len(lines) >= 8:
-                break
-
         if not lines:
             return ""
 
         out = ["Turn working memory (authoritative DB facts):"]
-        for ln in lines[:8]:
+        for ln in lines:
             out.append(f"- {ln}")
 
         return "\n".join(out)
 
     def _build_active_task_heartbeat_context(self, query: str, top_k: int = 6) -> str:
-        queries = [query, "task heartbeat", "active issue", "what were we working on"]
+        if not query:
+            return ""
+        try:
+            rows = self.memory.search(
+                query,
+                top_k=max(1, int(top_k)),
+                include_kinds=["note", "fact", "interaction", "procedure"],
+                include_tags=["task_state", "heartbeat", "active_issue"],
+            )
+        except Exception:
+            traceback.print_exc()
+            return ""
+
         seen: set[str] = set()
         lines: List[str] = []
-
-        for candidate in queries:
-            if not candidate:
+        for item in rows or []:
+            txt = str(item.get("text") or "").strip()
+            if not txt or txt.lower() in seen:
                 continue
-            try:
-                rows = self.memory.search(
-                    candidate,
-                    top_k=max(1, int(top_k)),
-                    include_kinds=["note", "fact", "interaction", "procedure"],
-                    include_tags=["task_state", "heartbeat", "active_issue"],
-                )
-            except Exception:
-                rows = []
-
-            for item in rows or []:
-                txt = str(item.get("text") or "").strip()
-                if not txt:
-                    continue
-                key = txt.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(f"- {txt}")
-                if len(lines) >= max(1, int(top_k)):
-                    break
+            seen.add(txt.lower())
+            lines.append("- " + json.dumps(
+                self._compact_working_memory_line(txt, max_chars=280), ensure_ascii=False,
+            ))
             if len(lines) >= max(1, int(top_k)):
                 break
 
         if not lines:
             return ""
 
-        return "Task heartbeat:\n" + "\n".join(lines)
+        return (
+            "Task heartbeat (historical conversation notes, not verified current state; "
+            "legacy notes may include mistaken assistant claims):\n" + "\n".join(lines)
+        )
 
     def _build_hardware_followup_context(self, query: str, top_k: int = 3) -> str:
         lowered = str(query or "").lower()
@@ -11288,7 +11638,16 @@ class MK1Core:
                     "mina_capability_snapshot::",
                     "mina_capability_delta::",
                     "intent_alias::",
+                    "hardware_snapshot::",
+                    "test_run_result::",
+                    "code_run_result::",
+                    "path_alias::",
+                    "tool '",
                 )):
+                    return True
+                # Why: the native catalogue already supplies the current tool capabilities.
+                # Guard: retain stored inventory, but do not duplicate stale schemas in recall.
+                if getattr(self, "native_tool_calls", False) and compact.startswith("Mina tool inventory:"):
                     return True
                 if context_chars + len(compact) + 2 > context_char_budget:
                     return False
@@ -15312,9 +15671,6 @@ IMPORTANT RULES:
             ).strip()
 
         text = self._strip_tool_call_markup(text)
-
-        # Detect and execute JSON tool call blocks Mina embedded in her response
-        text = self._execute_inline_tool_calls(text)
 
         return text or ""
 

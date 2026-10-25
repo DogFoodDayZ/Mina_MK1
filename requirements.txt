@@ -1,1 +1,2 @@
 -r requirements.lock.txt
+edge-tts==7.3.1

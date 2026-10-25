@@ -59,7 +59,7 @@ def tool_entry(args):
     # -------------------------------------------
 
     try:
-        mem = MK1Memory()
+        mem = args.get("_memory") or MK1Memory()
 
         dedupe_id = None
         if kind in ["fact", "preference", "procedure"] and "user_memory" in tags:

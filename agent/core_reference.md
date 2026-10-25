@@ -20,7 +20,22 @@ Memory is Mina. Do not replace normal learned behavior with hardcoded chat or ro
 
 ## File Scale Snapshot
 
-- Function count: 396
+- Function count: 409
+- Opt-in compiler evidence is implemented in tool receipts, not routing: ToolLoader defaults off, acceptance enables python_syntax_evidence explicitly. Actual read/before/read-back byte checks flow through unchanged result serialization and nested changes; _tool_action_report retains python_syntax_check for independent GUI reporting. Syntax success never substitutes for saved-file run/output proof. Normal GUI startup remains off pending acceptance.
+- Empty-response protocol: blocking/SSE completions with no final text or native tool calls raise EmptyModelResponseError. Core reports an incomplete request, keeps partial action reports, and does not store a blank completed turn. Empty streams no longer trigger blocking inference; the API does not cache Mina error replies. No private-reasoning fallback, EOS diagnosis, new route or personality/memory rewrite.
+- Observed edit evidence: actual before/read-back byte hashes and bounded text diffs flow through `code_repair.changes`, compact inference and independent GUI reports. Specialist summaries remain unverified; text reads distinguish decoder_used from actual bom bytes (null when absent). Native explanation contract forbids turning decoder choice or a passing test into unsupported diagnosis. No new route or memory/personality edits.
+- Request budgeting now honors actual per-request output caps; native follow-ups use at most1024 output tokens (respect smaller positive config), while initial chat/stream defaults remain unchanged. This fixes a deployed GUI repair saved-write/context-overflow before testing without deleting persona, schemas or current evidence. Live /process code_repair exact-output and independent alternate-values proofs passed; tool selection and specialist explanations are still not universally reliable.
+- Approved `code_repair` workflow owns authorized single-file Python consult/save/run and one actual-diagnostic retry. Nested receipts remain in action reports and repair-completion checks; inference omits explicitly marked nested details, retaining final hashes/output. `file_write.expected_sha256` rejects stale edits. `expected_output` and `exit_code_only` proof scopes remain distinct; review-only still uses proposal-only specialist. Selection is model-owned.
+- Specialist assessments now have validated proposal/no_change/clarify outcomes and an unverified summary surfaced in independent action reports. Native instructions no longer require a separate inspect before consulting: the specialist reads actual source; diagnostics are optional. Healthy-source negative controls must remain unchanged, and natural delegation must be measured rather than inferred from passing file tests.
+- Coding specialist: `tools/coding_specialist.py` exposes an optional local read/propose-only tool, enabled for installed Qwen2.5-Coder in configuration. It checks the model is already loaded; no memory access, model loading, writes or execution. Source-hash proposals still require authorized save/run proof. `agent/inference_gate.py` serializes blocking/streaming model requests and specialist inference in the API process; independent external clients are not coordinated.
+- Experimental focused repair context: disabled unless a test harness explicitly sets `focused_repair_context=True`. After model-selected inspect or a same-target Python read/write/run workflow, retain original personality, authoritative facts, permissions, current request/results and a bounded immediate conversation reference; omit optional older recall for the attempt only. Existing memory is never removed. Live acceptance remains mixed, so this is not enabled in normal GUI startup.
+- Task-note provenance: new heartbeat notes contain user task requests only, not assistant narration. Existing notes are quoted and labeled historical/unverified. Native recall skips duplicate saved tool inventory while retaining preferences; current complete schemas remain available.
+- Native Python repair completion: model-selected `code_execute` inspect declares the repair target without execution; explicit path check/run also establishes verification scope. After a write, require a passing saved-file run of the same SHA-256 and optional exact expected_stdout contract; syntax-only checks, wrong output and stale runs do not pass. Eight bounded native rounds, one completion checkpoint, explicit incomplete error with partial action reports. Ordinary save requests do not authorize execution; textual transport retains three rounds. Compact schema-cost serialization and concise protocol wording preserve context headroom without hiding tools.
+- Independent action reports: tool-loop results feed blocking `actions` responses and opt-in streaming action events, including partial results on errors. Reports do not come from model prose and do not certify application liveness. File-write receipts carry readback/hash proof; execution failures retain explicit errors and diagnostics.
+- Current native tool-loop working set: before follow-up inference, summarize only earlier completed exchanges (bounded actual status/path/hash/output, matching call IDs and explicit omission markers); omit their oversized source arguments and old narration. Preserve the latest exchange verbatim, full dispatcher results/action reports and stored observations. Tool results use compact JSON rather than Python dictionary repr. Required context still fails explicitly if it cannot fit.
+- Native tool history: bounded `native_tool_exchange` note memories preserve actual assistant calls, matching results and historical requests across turns. Rehydrate at most two complete groups within 6500 characters; historical result text over 1800 characters is explicitly marked truncated. Auth arguments are excluded. Historical evidence is not proof of current execution. Failed results retain diagnostics; loop-limit errors identify executed statuses and the unexecuted pending call.
+- Native tool transport: opt-in `model.native_tool_calls`, disabled by default. Blocking and streaming paths dispatch structured calls with matched call IDs; native schemas and assistant-call arguments are included in input estimates. Disposable GUI harness enables Qwen acceptance without changing production config.
+- Context budgeting: before system coalescing, preserve current user/tool exchange; evict optional older retrieved history/recall before recent dialogue, then evict whole oldest turns. Reject oversized required context. UTF-8 token sizing remains approximate; payload correctness does not certify model tool selection.
 - Main classes:
   - `LMStudioClient`
   - `MK1Core`
@@ -36,6 +51,11 @@ Memory is Mina. Do not replace normal learned behavior with hardcoded chat or ro
 - Approx lines: 1-758
 - Responsibility:
   - build/submit chat payloads
+  - honor configured model tuning and output limits; streaming uses the configured socket timeout, not a total generation deadline
+  - send explicitly disabled reasoning as `reasoning_effort: none`; omission retains the backend default
+  - decode backend SSE as UTF-8 even if its response omits a charset
+  - reject empty/reasoning-only completions without retrying; preserve valid tool-only calls and nonempty content parts
+  - resolve unfamiliar vision models from LM Studio capability metadata without synthetic inference probes
   - handle model fallback and role normalization
   - stream responses
 - Critical functions:
@@ -179,16 +199,19 @@ Shutdown changes must prove memory durability is preserved.
   - `_git_push`
 
 ### 12) Main Request Pipelines
-- Approx lines: 10035-10642
+- Approx lines: 9832-10519
 - Responsibility:
   - request processing (`process`, `process_stream`)
-  - reflex entry and orchestration; `tools.reflex_enabled: false` disables both the pre-model reflex and the after-reply `_maybe_rescue_chat_suggested_action` override, so Mina decides tool use
+  - model-owned tool execution in both paths, regardless of legacy reflex settings; no automatic keyword/reflex/rescue dispatch or hardware-based rewriting of her tool and arguments
   - shared message assembly with bounded persisted user/assistant dialogue
   - separately quoted older conversation excerpts with speaker attribution and neighboring context
+  - `process_stream` (the GUI path) runs emitted calls through `_run_process_tool_loop`, independent of user wording; tool markup is held back via `_tool_markup_start`
+  - complete public JSON Schema tool arguments, excluding authorization credentials; no wording-based tool catalogue selection
 - Critical functions:
   - `process`
   - `process_stream`
   - `_build_process_messages`
+  - `_deduplicate_recall_context`: remove exact repeated recall bullets at assembly; authoritative facts and chronological dialogue retain their own roles
   - `_build_recent_conversation_messages`
   - `_build_older_conversation_context`
 
@@ -196,10 +219,11 @@ Maintainer comment:
 Most production regressions land here. Keep changes tiny and test after each one.
 
 ### 13) Context, Formatting, and Tool Output
-- Approx lines: 10644-12556
+- Approx lines: 10520-12909
 - Responsibility:
-  - command-like detection
-  - context assembly
+  - common memory lane for normal conversation; legacy classifiers are not execution gates
+  - identity anchors without unconditional runtime-log replay; query-scoped task recall and advisory reminders
+  - game telemetry scoped to its declared client surface, not user keywords
   - result formatting
   - memorying tool outputs
 - Critical functions:

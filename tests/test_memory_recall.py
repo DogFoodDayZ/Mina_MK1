@@ -197,7 +197,7 @@ def test_build_turn_working_memory_excludes_large_write_payloads():
     out = MK1Core._build_turn_working_memory(core, "what hardware do I have")
 
     assert "file_write" not in out
-    assert "hardware_snapshot::CPU Ryzen 7 GPU RTX 4080" in out
+    assert "hardware_snapshot::" not in out
 
 
 def test_build_context_excludes_verbose_artifact_and_capability_records():
@@ -300,9 +300,53 @@ def test_build_context_includes_active_task_heartbeat_state():
     assert "Task heartbeat:" in context
     assert "avatar fix" in context
     assert "port 8000" in context
+    assert "not verified current state" in context
+    assert "mistaken assistant claims" in context
+    assert '- "Task heartbeat:' in context
 
 
-def test_process_stores_turn_memory_for_reflex_reply():
+def test_fix_followup_heartbeat_does_not_promote_false_assistant_success():
+    """Travis: 'yes all three please' after 'can you fix it ?'."""
+    core = MK1Core.__new__(MK1Core)
+    core.memory = FakeMemory()
+    user = "yes all three please: fix the script, save it and run it"
+    core._store_active_task_heartbeat(
+        user,
+        "THE SCRIPT IS RUNNING! Jellybean chaos mode activated! All fixed!",
+    )
+    assert len(core.memory.writes) == 1
+    record = core.memory.writes[0]
+    assert record["text"] == "Task request: " + user
+    assert "user_request" in record["tags"]
+    assert "RUNNING" not in record["text"] and "activated" not in record["text"]
+    core._store_active_task_heartbeat("hello", "I fixed your script and ran the test")
+    assert len(core.memory.writes) == 1
+
+
+def test_native_recall_omits_duplicate_catalogue_but_preserves_user_preference():
+    class InventoryMemory(FakeMemory):
+        def recent_memories(self, **kwargs):
+            return []
+
+        def search(self, query, **kwargs):
+            if kwargs.get("include_kinds") == ["fact", "tool", "preference", "procedure"]:
+                return [
+                    {"text": "Mina tool inventory: file_write: old tool description"},
+                    {"text": "Travis prefers concise replies"},
+                ]
+            return []
+
+    core = MK1Core.__new__(MK1Core)
+    core.memory = InventoryMemory()
+    core.native_tool_calls = True
+    native = core.build_context("can you fix it ?")
+    assert "Mina tool inventory:" not in native
+    assert "Travis prefers concise replies" in native
+    core.native_tool_calls = False
+    assert "Mina tool inventory:" in core.build_context("can you fix it ?")
+
+
+def test_process_stores_model_reply_without_reflex_routing():
     core = MK1Core.__new__(MK1Core)
     core.memory = FakeMemory()
     core.system_prompt = ""
@@ -338,14 +382,16 @@ def test_process_stores_turn_memory_for_reflex_reply():
         "choices": [{"message": {"content": "Tool says hi"}}]
     }
     core._extract_text = lambda reply: reply["choices"][0]["message"]["content"]
+    core.model = SimpleNamespace(chat=lambda **kwargs: {
+        "choices": [{"message": {"content": "Mina says hi"}}],
+    })
 
     result = MK1Core.process(core, "hardware info")
 
-    assert result["reply"] == "Tool says hi"
-    assert len(core.memory.writes) >= 3
+    assert result["reply"] == "Mina says hi"
+    assert len(core.memory.writes) >= 2
     assert core.memory.writes[0]["kind"] == "interaction"
     assert "short_term" in core.memory.writes[0]["tags"]
-    assert any(item.get("kind") == "note" and "task_state" in (item.get("tags") or []) for item in core.memory.writes)
     assert len(core.memory.promotions) == 1
     assert core.memory.promotions[0]["seed_text"] == "hardware info"
 
@@ -392,7 +438,7 @@ def test_process_adds_retry_policy_prompt_when_failed_lesson_is_recalled():
     core._is_command_like_query = lambda _text: False
     core._should_run_reflex = lambda _text: False
     core._handle_model_response = lambda _messages, reply: reply["choices"][0]["message"]["content"]
-    core._store_turn_memory = lambda user_input, assistant_text, retry_guided=False: None
+    core._store_turn_memory = lambda **kwargs: None
     core.build_context = lambda _query: (
         "Learned lessons:\n"
         "- Retry note: the prior attempt failed, so Mina should try a different approach."
@@ -462,9 +508,8 @@ def test_process_keeps_learned_lessons_for_live_ostranauts_queries():
     core._is_command_like_query = lambda _text: False
     core._should_run_reflex = lambda _text: False
     core._handle_model_response = lambda _messages, reply: reply["choices"][0]["message"]["content"]
-    core._store_turn_memory = lambda user_input, assistant_text, retry_guided=False: None
-    core.build_context = lambda _query: ""
-    core._build_ostranauts_memory_context = lambda _query: (
+    core._store_turn_memory = lambda **kwargs: None
+    core.build_context = lambda _query: (
         "Learned lessons:\n"
         "- Retry attempt: use the reactor control panel path first."
     )
@@ -489,7 +534,10 @@ def test_process_keeps_learned_lessons_for_live_ostranauts_queries():
         core_module.build_ostranauts_context = lambda: "Live telemetry available"
         core_module.is_ostranauts_query = lambda _text: True
 
-        result = MK1Core.process(core, "what should I try at the reactor panel")
+        result = MK1Core.process(
+            core, "what should I try at the reactor panel",
+            request_context={"interface_name": "Ostranauts GUI"},
+        )
     finally:
         core_module.build_ostranauts_context = original_build
         core_module.is_ostranauts_query = original_is_query
@@ -577,13 +625,13 @@ def test_store_turn_memory_records_retry_attempt_note_when_guided():
         retry_guided=True,
     )
 
-    assert len(core.memory.writes) >= 4
+    assert len(core.memory.writes) == 3
     lesson = next(item for item in reversed(core.memory.writes) if item["kind"] == "note" and "learning_lesson" in item.get("tags", []))
     assert "learning_lesson" in lesson["tags"]
     assert "retry_attempt" in lesson["tags"]
     assert "Retry attempt:" in lesson["text"]
     assert "checked the local status endpoint instead" in lesson["text"]
-    assert any(item.get("kind") == "note" and "task_state" in (item.get("tags") or []) for item in core.memory.writes)
+    assert not any("task_state" in (item.get("tags") or []) for item in core.memory.writes)
 
 
 def test_store_turn_memory_records_ostranauts_lesson_note():
@@ -2024,7 +2072,7 @@ def test_build_autonomy_awareness_context_empty_for_unrelated_question():
     assert out == ""
 
 
-def test_build_turn_working_memory_includes_durable_tool_records():
+def test_build_turn_working_memory_does_not_promote_runtime_records_to_identity():
     class WorkingMemoryFake(FakeMemory):
         def recent_memories(self, top_k=6, include_kinds=None, include_tags=None):
             return [
@@ -2041,13 +2089,10 @@ def test_build_turn_working_memory_includes_durable_tool_records():
 
     out = MK1Core._build_turn_working_memory(core, "run tests")
 
-    assert "Turn working memory" in out
-    assert "hardware_snapshot::" in out
-    assert "test_run_result::" in out
-    assert "normal chatter line" not in out
+    assert out == ""
 
 
-def test_build_turn_working_memory_uses_semantic_suggestion_context_hits():
+def test_build_turn_working_memory_does_not_promote_capability_logs_to_identity():
     class WorkingMemorySemanticFake(FakeMemory):
         def recent_memories(self, top_k=6, include_kinds=None, include_tags=None):
             return []
@@ -2060,7 +2105,7 @@ def test_build_turn_working_memory_uses_semantic_suggestion_context_hits():
 
     out = MK1Core._build_turn_working_memory(core, "what changed")
 
-    assert "mina_capability_delta::" in out
+    assert out == ""
 
 
 def test_clean_response_text_strips_internal_db_tone_instruction_line():

@@ -11,7 +11,7 @@ if str(project_root) not in sys.path:
 from tools.file_access_policy import normalize_tool_path
 from tools.file_inspector import inspect_file
 
-def file_read_impl(path: str) -> Dict[str, Any]:
+def file_read_impl(path: str, *, python_syntax_evidence: bool = False) -> Dict[str, Any]:
     try:
         # Reject empty paths early
         if not path:
@@ -31,7 +31,10 @@ def file_read_impl(path: str) -> Dict[str, Any]:
                 "error": f"file_not_found: {path}"
             }
 
-        inspected = inspect_file(path)
+        inspected = (
+            inspect_file(path, python_syntax_evidence=True)
+            if python_syntax_evidence else inspect_file(path)
+        )
         if not inspected.get("ok"):
             return inspected
         return inspected
@@ -41,7 +44,7 @@ def file_read_impl(path: str) -> Dict[str, Any]:
 
 def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
     path = args.get("path") or ""
-    return file_read_impl(path)
+    return file_read_impl(path, python_syntax_evidence=args.get("_python_syntax_evidence") is True)
 
 
 tool_entry.schema = {

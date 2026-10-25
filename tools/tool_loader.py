@@ -1,6 +1,7 @@
 import os
 import importlib.util
 import traceback
+import ast
 from typing import Dict, Any, Callable
 
 
@@ -17,6 +18,8 @@ class ToolLoader:
         self.tools_dir = tools_dir
         self.tools: Dict[str, Callable] = {}
         self.status: Dict[str, Any] = {}
+        self.python_syntax_evidence = False
+        self.memory = None
         self._load_tools()
 
     # ------------------------------------------------------------
@@ -37,6 +40,15 @@ class ToolLoader:
             tool_name = os.path.splitext(filename)[0]
 
             try:
+                with open(tool_path, "r", encoding="utf-8-sig") as source:
+                    tree = ast.parse(source.read(), filename=tool_path)
+                if not any(
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "tool_entry"
+                    for node in tree.body
+                ):
+                    self.status[tool_name] = "invalid: missing tool_entry"
+                    continue
                 spec = importlib.util.spec_from_file_location(tool_name, tool_path)
                 if spec is None or spec.loader is None:
                     continue
@@ -82,6 +94,12 @@ class ToolLoader:
             }
 
         try:
+            if self.python_syntax_evidence and name in {
+                "file_read", "file_write", "code_repair", "code_execute",
+            }:
+                args = {**args, "_python_syntax_evidence": True}
+            if self.memory is not None and name in {"memory_read", "memory_write"}:
+                args = {**args, "_memory": self.memory}
             result = self.tools[name](args)
             self.status[name] = "ok"
             return result

@@ -581,21 +581,13 @@ fn spawn_visible_powershell_file(script_path: &str, cwd: &str) -> Result<u32, St
     #[cfg(not(target_os = "windows"))]
     let mut cmd = Command::new("powershell.exe");
 
-    let script_path_owned = script_path.to_string();
-    let cwd_owned = cwd.to_string();
-
     let mut configured = cmd;
     configured
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
-        .arg("-NoExit")
-        .arg("-Command")
-        .arg(format!(
-            "Set-Location -LiteralPath '{}' ; & '{}'",
-            cwd_owned.replace("'", "''"),
-            script_path_owned.replace("'", "''")
-        ))
+        .arg("-File")
+        .arg(script_path)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -651,10 +643,10 @@ fn set_tracked_pid(pid: Option<u32>) {
 fn find_windows_voice_pid() -> Result<Option<u32>, String> {
     // The standalone monitor runs mina_windows_voice_loop.py. Match that directly
     // (the helper-script name was the old Tauri-native path, now gated off).
-    let probe = "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*mina_windows_voice_loop.py*' } | Select-Object -First 1 -ExpandProperty ProcessId".to_string();
+    let probe = "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" -ErrorAction Stop | Where-Object { $_.CommandLine -match '(?i)(?:^|\\s)\"?[^\"\\r\\n]*\\bmina_windows_voice_loop\\.py\"?(?:\\s|$)' } | Select-Object -First 1 -ExpandProperty ProcessId".to_string();
     let out = run_powershell(&probe)?;
     if !out.status.success() {
-        return Ok(None);
+        return Err(format!("voice process query failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
 
     let raw = String::from_utf8_lossy(&out.stdout).to_string();
@@ -666,11 +658,13 @@ fn find_windows_voice_pid() -> Result<Option<u32>, String> {
 
 fn find_voice_monitor_pid() -> Result<Option<u32>, String> {
     let probe = r#"
-$matches = Get-CimInstance Win32_Process |
+$matches = Get-CimInstance Win32_Process -ErrorAction Stop |
     Where-Object {
         $_.CommandLine -and (
-            $_.CommandLine -like '*start_mina_voice_monitor.ps1*' -or
-            $_.CommandLine -like '*mina_windows_voice_loop.py*'
+            ($_.Name -in @('powershell.exe', 'pwsh.exe') -and
+             $_.CommandLine -match '(?i)-File\s+"?[^"\r\n]*\bstart_mina_voice_monitor\.ps1"?(?:\s|$)') -or
+            ($_.Name -in @('python.exe', 'pythonw.exe') -and
+             $_.CommandLine -match '(?i)(?:^|\s)"?[^"\r\n]*\bmina_windows_voice_loop\.py"?(?:\s|$)')
         )
     } |
     Select-Object -First 1 -ExpandProperty ProcessId
@@ -679,7 +673,7 @@ $matches
 
     let out = run_powershell(probe)?;
     if !out.status.success() {
-        return Ok(None);
+        return Err(format!("voice monitor query failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
 
     let raw = String::from_utf8_lossy(&out.stdout).to_string();
@@ -691,17 +685,9 @@ $matches
 
 fn wait_for_voice_monitor_running(timeout: Duration) -> Result<Option<u32>, String> {
     let started = Instant::now();
-    let pid_file = Path::new(&mk1_root_dir()).join(".mk1_voice_monitor.pid");
-
     while started.elapsed() < timeout {
-        let status = voice_status()?;
-        if status.running {
-            if let Some(pid) = get_tracked_pid() {
-                return Ok(Some(pid));
-            }
-            if let Some(pid) = read_pid_from_file(&pid_file) {
-                return Ok(Some(pid));
-            }
+        if let Some(pid) = find_windows_voice_pid()? {
+            return Ok(Some(pid));
         }
         thread::sleep(Duration::from_millis(400));
     }
@@ -1273,6 +1259,11 @@ fn service_stop_api_local() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 fn service_start_voice_loop_local() -> Result<serde_json::Value, String> {
+    if let Some(pid) = find_windows_voice_pid()? {
+        return Ok(serde_json::json!({
+            "ok": true, "pid": pid, "verified": true, "already_running": true,
+        }));
+    }
     let script = mk1_script_path("start_mina_voice_monitor.ps1");
     if !Path::new(&script).exists() {
         return Ok(serde_json::json!({
@@ -1314,31 +1305,32 @@ fn service_stop_voice_loop_local() -> Result<serde_json::Value, String> {
         let stop_flag = Path::new(&root).join(".mk1_voice_stop.flag");
 
         // Signal an intentional stop so the monitor does NOT restart the loop.
-        let _ = fs::write(&stop_flag, b"stop");
+        fs::write(&stop_flag, b"stop").map_err(|error| format!("voice stop flag write failed: {error}"))?;
 
-        let mut stopped_pid: Option<u32> = None;
-        if let Some(pid) = read_pid_from_file(&pid_file) {
-                if is_pid_running(pid) {
-                        let kill_cmd = format!("Stop-Process -Id {} -Force -ErrorAction SilentlyContinue", pid);
-                        let _ = run_powershell(&kill_cmd);
-                        stopped_pid = Some(pid);
-                }
-        }
+        let stopped_pid = find_voice_monitor_pid()?;
 
         // Fallback: kill known monitor/loop processes by command line.
         let sweep = r#"
-Get-CimInstance Win32_Process |
+Get-CimInstance Win32_Process -ErrorAction Stop |
     Where-Object {
         $_.CommandLine -and (
-            $_.CommandLine -like '*start_mina_voice_monitor.ps1*' -or
-            $_.CommandLine -like '*mina_windows_voice_loop.py*'
+            ($_.Name -in @('powershell.exe', 'pwsh.exe') -and
+             $_.CommandLine -match '(?i)-File\s+"?[^"\r\n]*\bstart_mina_voice_monitor\.ps1"?(?:\s|$)') -or
+            ($_.Name -in @('python.exe', 'pythonw.exe') -and
+             $_.CommandLine -match '(?i)(?:^|\s)"?[^"\r\n]*\bmina_windows_voice_loop\.py"?(?:\s|$)')
         )
     } |
     ForEach-Object {
-        try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
     }
 "#;
-        let _ = run_powershell(sweep);
+        let output = run_powershell(sweep)?;
+        if !output.status.success() {
+            return Err(format!("voice stop failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        }
+        if find_voice_monitor_pid()?.is_some() {
+            return Err("voice stop failed: monitor or loop still running".to_string());
+        }
 
         let _ = fs::remove_file(&pid_file);
         let _ = fs::remove_file(Path::new(&env::temp_dir()).join("mina_voice_monitor.mute"));
@@ -1358,7 +1350,7 @@ fn service_voice_loop_status() -> Result<VoiceStatus, String> {
     // Authoritative check: a voice loop process is actually running. The pid file
     // can go stale (monitor died, pid reused), which made the toggle show the
     // wrong state and start a second loop instead of stopping the first.
-    let loop_running = find_windows_voice_pid().ok().flatten().is_some();
+    let loop_running = find_windows_voice_pid()?.is_some();
 
     if loop_running {
         return Ok(VoiceStatus {
@@ -1373,6 +1365,62 @@ fn service_voice_loop_status() -> Result<VoiceStatus, String> {
         running: false,
         detail: "voice loop not running".into(),
     })
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod voice_process_tests {
+    use super::*;
+
+    #[test]
+    fn active_button_tracks_voice_process_not_its_own_probe() {
+        // Regression: "the button that is supposed to show it's active" flickers.
+        for _ in 0..4 {
+            assert_eq!(find_windows_voice_pid().unwrap(), None);
+            assert_eq!(find_voice_monitor_pid().unwrap(), None);
+            assert!(!service_voice_loop_status().unwrap().running);
+        }
+        let directory = env::temp_dir().join(format!("mina_voice_status_test_{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("mina_windows_voice_loop.py");
+        fs::write(&script, "import time\ntime.sleep(60)\n").unwrap();
+        let python = Path::new(&mk1_root_dir()).join(".venv").join("Scripts").join("python.exe");
+        let mut child = Command::new(python).arg(&script).spawn().unwrap();
+        let result = (|| {
+            let pid = wait_for_voice_monitor_running(Duration::from_secs(5))?;
+            if pid != Some(child.id()) {
+                return Err("real voice process was not detected".to_string());
+            }
+            for _ in 0..4 {
+                if !service_voice_loop_status()?.running {
+                    return Err("live voice process status flickered off".to_string());
+                }
+            }
+            let start = service_start_voice_loop_local()?;
+            if start["already_running"] != true || start["pid"] != child.id() {
+                return Err("start did not reuse the existing loop".to_string());
+            }
+            Ok(())
+        })();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        fs::remove_file(script).unwrap();
+        result.unwrap();
+        assert!(!service_voice_loop_status().unwrap().running);
+        let monitor_script = directory.join("start_mina_voice_monitor.ps1");
+        fs::write(&monitor_script, "Start-Sleep -Seconds 60\n").unwrap();
+        let mut monitor = Command::new(powershell_executable())
+            .args(["-NoProfile", "-File"])
+            .arg(&monitor_script)
+            .creation_flags(0x08000000)
+            .spawn().unwrap();
+        let discovered = find_voice_monitor_pid();
+        monitor.kill().unwrap();
+        monitor.wait().unwrap();
+        fs::remove_file(monitor_script).unwrap();
+        fs::remove_dir(directory).unwrap();
+        assert_eq!(discovered.unwrap(), Some(monitor.id()));
+        assert_eq!(find_voice_monitor_pid().unwrap(), None);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1405,4 +1453,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-

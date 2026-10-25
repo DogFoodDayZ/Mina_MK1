@@ -6,6 +6,8 @@ Ensures failed_decision tags are properly recorded.
 import pytest
 import os
 import sys
+import json
+import sqlite3
 from pathlib import Path
 
 # Add project root to path
@@ -25,10 +27,34 @@ def temp_db(tmp_path):
 
 @pytest.fixture
 def mina_core(temp_db, monkeypatch):
-    """Create MK1Core with temp memory."""
-    monkeypatch.setenv("MK1_DATABASE_PATH", temp_db)
-    monkeypatch.setenv("MK1_SKIP_ROUTE_GUARD", "1")  # Skip startup guard for this test
-    return MK1Core()
+    """Exercise failure capture without starting core or opening production memory."""
+    def forbidden(*args, **kwargs):
+        pytest.fail("Failure-learning tests must not initialize live core or memory.")
+
+    monkeypatch.setattr(MK1Core, "__init__", forbidden)
+    monkeypatch.setattr(MK1Memory, "__init__", forbidden)
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute(
+            "CREATE TABLE memories (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "text TEXT, kind TEXT, tags TEXT, timestamp REAL)"
+        )
+
+    def write(text, kind, tags):
+        with sqlite3.connect(temp_db) as conn:
+            conn.execute(
+                "INSERT INTO memories(text, kind, tags, timestamp) VALUES (?, ?, ?, ?)",
+                (text, kind, json.dumps(tags), 1),
+            )
+
+    memory = MK1Memory.__new__(MK1Memory)
+    memory.db_path = temp_db
+    memory.add_memory = write
+    memory.search = lambda query, top_k=5, include_tags=None: memory._sqlite_keyword_search(
+        query, top_k, include_kinds=None, include_tags=include_tags, since_ts=None,
+    )
+    core = MK1Core.__new__(MK1Core)
+    core.memory = memory
+    return core
 
 
 def test_tool_failure_captured_in_memory(mina_core):

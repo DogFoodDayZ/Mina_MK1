@@ -1,7 +1,8 @@
 {
     "file": "agent/core.py",
     "generated_from": "tmp/core_functions.txt",
-    "function_count": 396,
+    "experimental_compiler_evidence": "ToolLoader opt-in, default off; exact byte compiler facts in read/write/repair receipts, python_syntax_check preserved in core action reports. No routing/schema or execution-permission change; normal startup remains off pending acceptance.",
+    "function_count": 409,
     "owners": {
         "primary": "MK1 runtime",
         "supporting": [
@@ -16,7 +17,7 @@
             "name": "lmstudio_client",
             "line_start": 1,
             "line_end": 758,
-            "responsibility": "Model request formatting, fallback, role normalization, streaming",
+            "responsibility": "Model request formatting, fallback, role normalization, streaming with native tool-call fragment assembly; reject empty/reasoning-only completions without text or native calls using EmptyModelResponseError, without retries; pre-coalescing budget includes native schemas and arguments, evicts optional history/recall before whole old dialogue turns, preserves current exchange and rejects oversized required context; core retains bounded matched native exchanges as note memories for follow-ups",
             "risk": "medium",
             "key_functions": [
                 {
@@ -208,38 +209,42 @@
         },
         {
             "name": "main_processing_pipeline",
-            "line_start": 10035,
-            "line_end": 12551,
-            "responsibility": "Main request processing, streaming, recent dialogue, retrieved older speaker-labelled exchanges, context build, result formatting",
+            "line_start": 9832,
+            "line_end": 12909,
+            "responsibility": "Model-owned execution without keyword routes; code_repair nested receipts feed revision gates; observed changes and explicit decoder/BOM facts survive compact inference and GUI reports; specialist assessments remain unverified; native followups cap output1024 and budget actual request allowance; process-local inference serialization; eight rounds and one checkpoint; bounded dialogue, identity and recall",
             "risk": "critical",
             "key_functions": [
                 {
                     "name": "process",
-                    "line": 10035
+                    "line": 10000
                 },
                 {
                     "name": "process_stream",
-                    "line": 10249
+                    "line": 10154
                 },
                 {
                     "name": "_build_process_messages",
-                    "line": 10439
+                    "line": 10327
+                },
+                {
+                    "name": "_deduplicate_recall_context",
+                    "line": 10429
                 },
                 {
                     "name": "_build_recent_conversation_messages",
-                    "line": 10571
+                    "line": 10447
                 },
                 {
                     "name": "_build_older_conversation_context",
-                    "line": 10577
+                    "line": 10453
                 },
                 {
                     "name": "build_context",
-                    "line": 11244
+                    "line": 11028
                 },
                 {
                     "name": "_format_tool_result",
-                    "line": 11416
+                    "line": 11205
                 }
             ]
         },

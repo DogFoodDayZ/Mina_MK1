@@ -2221,6 +2221,9 @@ class MK1Memory:
             include_kinds=["interaction"],
             include_tags=["short_term"],
         )
+        # Why: repeated assistant replies were promoted to facts, so Mina's own
+        # wording (including her mistakes) became long-term truth.
+        recent = [item for item in recent if "assistant_turn" not in (item.get("tags") or [])]
 
         if not recent:
             return []

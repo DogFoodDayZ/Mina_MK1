@@ -10,11 +10,16 @@ import pytest
 import json
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 # Test configuration
 API_URL = "http://localhost:8000"
 PROCESS_ENDPOINT = f"{API_URL}/process"
+pytestmark = pytest.mark.skipif(
+    os.getenv("MK1_RUN_LIVE_TOOL_TESTS") != "1",
+    reason="Opt-in live mutation test; requires an explicitly prepared disposable API.",
+)
 
 
 def call_api(prompt: str) -> str:

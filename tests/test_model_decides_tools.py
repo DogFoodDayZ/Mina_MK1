@@ -75,14 +75,15 @@ def test_switch_off_core_runs_no_tool_before_or_after_mina():
     assert core.stored == [SUGGESTION]
 
 
-def test_switch_on_still_hijacks_so_this_test_can_detect_regression():
+def test_legacy_switch_on_cannot_hijack_the_conversation_path():
     model = ScriptedModel([SUGGESTION])
     core = _core(model, reflex_enabled=True)
 
     result = MK1Core.process(core, PROMPT)
 
-    assert core.reflex_calls
-    assert result["reply"] == "[core ran ps_run]"
+    assert core.reflex_calls == []
+    assert core.tool_calls == []
+    assert result["reply"] == SUGGESTION
 
 
 def test_mina_own_tool_call_still_runs_and_she_answers_from_result():

@@ -7,6 +7,7 @@ import avatarTalk from "./assets/avatar_talk.png";
 import avatarTalk2 from "./assets/avatar_talk_2.png";
 import avatarSmirk from "./assets/avatar_smirk.png";
 import OstranautsCompanion from "./components/OstranautsCompanion";
+import { formatActionReports } from "./actionReports";
 
 const API_BASE = "http://127.0.0.1:8000";
 const GUI_VOICE_HINT = "en-US-AnaNeural";
@@ -1039,6 +1040,8 @@ export default function App() {
                     if (toolOutput) {
                         appendMessage("TOOL", toolOutput);
                     }
+                    const actionReport = formatActionReports(ev?.actions);
+                    if (actionReport) appendMessage("ACTION REPORT", actionReport);
                 }
 
                 window.sessionStorage.setItem(
@@ -1215,6 +1218,22 @@ export default function App() {
             // token-by-token as it is generated.
             const onChunk = typeof options.onChunk === "function" ? options.onChunk : null;
 
+            if (includeImage) {
+                const result = await requestJson("/process", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                    timeoutMs: 180000,
+                });
+                if (result?.error) throw new Error(result.error);
+                if (String(result?.reply || "").startsWith("(LM Studio error:")) {
+                    throw new Error(result.reply);
+                }
+                const actionReport = formatActionReports(result?.actions);
+                if (actionReport) appendMessage("ACTION REPORT", actionReport);
+                return { text: result.reply || "(no reply)", image: result.image || null, raw: result };
+            }
+
             const controller = new AbortController();
             const timeoutMs = 180000;
             let timedOut = false;
@@ -1241,6 +1260,7 @@ export default function App() {
                 let buffer = "";
                 let replyText = "";
                 let streamError = null;
+                let speechError = null;
 
                 for (; ;) {
                     const { value, done } = await reader.read();
@@ -1267,6 +1287,15 @@ export default function App() {
                             if (onChunk) onChunk(replyText);
                         } else if (evt?.type === "error") {
                             streamError = evt.error || "stream error";
+                        } else if (evt?.type === "actions") {
+                            const actionReport = formatActionReports(evt.actions);
+                            if (actionReport) appendMessage("ACTION REPORT", actionReport);
+                        } else if (evt?.type === "speech") {
+                            if (evt.tts?.ok === false) {
+                                speechError = evt.tts.error || "speech synthesis failed";
+                            } else if (evt.tts_playback?.ok === false) {
+                                speechError = evt.tts_playback.error || "audio playback failed";
+                            }
                         }
                     }
                 }
@@ -1275,6 +1304,10 @@ export default function App() {
                     throw new Error(streamError);
                 }
 
+                if (speechError) {
+                    replyText += `\n\n(Voice output failed: ${speechError})`;
+                    if (onChunk) onChunk(replyText);
+                }
                 replyText = replyText.trim() || "(no reply)";
 
                 return {
@@ -1289,6 +1322,7 @@ export default function App() {
             console.error(err);
             return {
                 text: `(error contacting Mina API: ${err.message})`,
+                error: err.message,
                 image: null,
                 raw: null,
             };
@@ -1529,7 +1563,7 @@ export default function App() {
         }
 
         setVoiceServiceUp(false);
-        appendMessage("SYSTEM", "Voice loop start failed: local launcher unavailable or returned an error.");
+        appendMessage("SYSTEM", `Voice loop start failed: ${local?.detail || local?.error || "local launcher unavailable"}`);
         setActivity("Voice loop start failed.");
         setIsStartingVoice(false);
     }
@@ -1842,6 +1876,10 @@ export default function App() {
 
         const coreReply = await sendToCore(composedPrompt, { includeImage: true });
         streamCoreReply(coreReply.text);
+        if (coreReply.error) {
+            setImageStatus(`Image send failed: ${coreReply.error}`);
+            return;
+        }
 
         const imageMeta = coreReply.image;
         if (imageMeta?.received) {

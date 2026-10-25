@@ -224,7 +224,7 @@ def tool_entry(args):
         return {"ok": False, "error": "No query provided"}
 
     try:
-        mem = MK1Memory()
+        mem = args.get("_memory") or MK1Memory()
 
         if is_broad_self_recall(query):
             merged = []

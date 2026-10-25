@@ -11,6 +11,7 @@ import re
 import wave
 import sys
 import difflib
+from uuid import uuid4
 from collections import deque
 from pathlib import Path
 from datetime import datetime
@@ -36,6 +37,7 @@ except Exception:
 
 from agent.core import MK1Core  # <-- note: from agent.core
 from agent.ostranauts import get_ostranauts_status
+from agent.voice_playback import speaker_guard
 
 
 # ------------------------------------------------------------
@@ -1328,7 +1330,7 @@ def _play_audio_local(path: str) -> dict:
         if ff.returncode == 0:
             subprocess.run(
                 ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", p],
-                check=False,
+                check=True,
             )
             return {"ok": True, "method": "ffplay"}
     except Exception:
@@ -1338,24 +1340,16 @@ def _play_audio_local(path: str) -> dict:
         mci = ctypes.windll.winmm.mciSendStringW
         alias = "mina_server_tts"
         mci(f"close {alias}", None, 0, None)
-        if mci(f'open "{p}" alias {alias}', None, 0, None) == 0:
-            mci(f"play {alias} wait", None, 0, None)
+        error = mci(f'open "{p}" alias {alias}', None, 0, None)
+        if error:
+            raise RuntimeError(f"MCI open failed: {error}")
+        try:
+            error = mci(f"play {alias} wait", None, 0, None)
+            if error:
+                raise RuntimeError(f"MCI playback failed: {error}")
+        finally:
             mci(f"close {alias}", None, 0, None)
-            return {"ok": True, "method": "mci"}
-    except Exception:
-        pass
-
-    try:
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f"Start-Process '{p}'",
-            ],
-            check=False,
-        )
-        return {"ok": True, "method": "start-process"}
+        return {"ok": True, "method": "mci"}
     except Exception as e:
         return {"ok": False, "error": "playback_failed", "detail": str(e)}
 
@@ -1367,9 +1361,12 @@ def _play_audio_local_async(path: str) -> dict:
 
     def _worker() -> None:
         try:
-            _play_audio_local(p)
-        except Exception:
-            pass
+            with speaker_guard():
+                result = _play_audio_local(p)
+                if not result.get("ok"):
+                    raise RuntimeError(str(result))
+        except Exception as error:
+            print(f"Voice playback failed: {error}", file=sys.stderr, flush=True)
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -1465,13 +1462,18 @@ def _transcribe_audio_file(path: str) -> dict:
     2) Else if faster-whisper is installed, use it (CPU-friendly).
     3) Else if vosk is installed, transcribe WAV PCM mono files.
     """
+    config = getattr(core, "config", None)
+    initial_prompt = os.getenv("MK1_STT_INITIAL_PROMPT")
+    if initial_prompt is None:
+        initial_prompt = config.get("voice", "stt_initial_prompt", "") if config else ""
+
     # Whisper fallback (best compatibility)
     try:
         import whisper  # type: ignore
 
         model_name = os.getenv("MK1_STT_MODEL", "base")
         model = whisper.load_model(model_name)
-        result = model.transcribe(path, fp16=False)
+        result = model.transcribe(path, fp16=False, initial_prompt=initial_prompt)
         text = str(result.get("text") or "").strip()
         if text:
             return {"ok": True, "text": text, "engine": f"whisper:{model_name}"}
@@ -1490,6 +1492,7 @@ def _transcribe_audio_file(path: str) -> dict:
             vad_filter=False,
             language="en",
             beam_size=5,
+            initial_prompt=initial_prompt,
         )
         text = " ".join(s.text.strip() for s in segments if s.text and s.text.strip()).strip()
         if text:
@@ -1611,7 +1614,7 @@ def _synthesize_tts(text: str, voice_hint: Optional[str], output_path: Optional[
             if err_box["error"] is not None:
                 raise err_box["error"]
 
-        edge_out = output_path or os.path.join(_safe_logs_dir(), "mina_tts_last.mp3")
+        edge_out = output_path or os.path.join(_safe_logs_dir(), f"mina_tts_{uuid4().hex}.mp3")
         edge_out = os.path.abspath(edge_out)
         os.makedirs(os.path.dirname(edge_out), exist_ok=True)
 
@@ -1643,7 +1646,7 @@ def _synthesize_tts(text: str, voice_hint: Optional[str], output_path: Optional[
             "detail": "Install edge-tts (preferred) or pyttsx3 (fallback) for local TTS support.",
         }
 
-    out = output_path or os.path.join(_safe_logs_dir(), "mina_tts_last.wav")
+    out = output_path or os.path.join(_safe_logs_dir(), f"mina_tts_{uuid4().hex}.wav")
     out = os.path.abspath(out)
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
@@ -1793,6 +1796,18 @@ def phone_avatar(state: str):
 # ------------------------------------------------------------
 # POST /process
 # ------------------------------------------------------------
+def _process_speech_output(reply_text: str, req: ProcessRequest) -> dict:
+    speak = bool(req.speak_response) if req.speak_response is not None else _get_speak_enabled()
+    if not speak or not reply_text.strip():
+        return {}
+    voice_pref = (req.voice_hint or os.getenv("MK1_PROCESS_VOICE", "en-US-AnaNeural") or "").strip()
+    tts = _synthesize_tts(text=reply_text, voice_hint=voice_pref, output_path=None)
+    output = {"tts": tts}
+    if tts.get("ok") and tts.get("audio_path"):
+        output["tts_playback"] = _play_audio_local_async(str(tts["audio_path"]))
+    return output
+
+
 @app.post("/process")
 def process(req: ProcessRequest):
     """
@@ -1825,7 +1840,7 @@ def process(req: ProcessRequest):
                     source=event_source,
                     input_text=req.input,
                     reply_text=str(out.get("reply") or ""),
-                    extra={"deduped": True},
+                    extra={"deduped": True, "actions": out.get("actions", [])},
                 )
                 # Skip optional TTS/playback on deduped requests to avoid repetitive loops.
                 return out
@@ -1854,7 +1869,7 @@ def process(req: ProcessRequest):
 
     reply_text_for_cache = str((out or {}).get("reply") or "") if isinstance(out, dict) else str(out)
     skip_cache = (
-        reply_text_for_cache.strip().startswith("(LM Studio error:")
+        reply_text_for_cache.strip().startswith(("(LM Studio error:", "(Mina error:"))
         or _looks_like_tool_markup_leak(reply_text_for_cache)
     )
 
@@ -1864,25 +1879,7 @@ def process(req: ProcessRequest):
             _process_dedupe_cache["response"] = dict(out) if isinstance(out, dict) else {"reply": str(out)}
             _process_dedupe_cache["ts"] = time.time()
 
-    # The shared speak flag (set by the GUI toggle) is the single source of truth.
-    # An explicit speak_response in the request wins for one-off overrides; otherwise
-    # the shared flag decides, so the GUI toggle actually controls whether Mina speaks.
-    if req.speak_response is not None:
-        speak = bool(req.speak_response)
-    else:
-        speak = _get_speak_enabled()
-
-    if speak:
-        reply_text = str((out or {}).get("reply") or "").strip()
-        if reply_text:
-            voice_pref = (req.voice_hint or os.getenv("MK1_PROCESS_VOICE", "en-US-AnaNeural") or "").strip()
-            tts = _synthesize_tts(text=reply_text, voice_hint=voice_pref, output_path=None)
-            play = None
-            if tts.get("ok") and tts.get("audio_path"):
-                play = _play_audio_local_async(str(tts.get("audio_path")))
-            out["tts"] = tts
-            if play is not None:
-                out["tts_playback"] = play
+    out.update(_process_speech_output(str((out or {}).get("reply") or "").strip(), req))
 
     if isinstance(out, dict):
         out.setdefault("source", event_source)
@@ -1892,7 +1889,7 @@ def process(req: ProcessRequest):
         source=event_source,
         input_text=req.input,
         reply_text=str((out or {}).get("reply") or ""),
-        extra={"deduped": bool(out.get("deduped"))} if isinstance(out, dict) else None,
+        extra={"deduped": bool(out.get("deduped")), "actions": out.get("actions", [])} if isinstance(out, dict) else None,
     )
 
     return out
@@ -1919,11 +1916,16 @@ def process_stream(req: ProcessRequest):
                 image_attachment=req.image_attachment,
                 request_context={
                     "input_source": req.input_source,
+                    "interface_name": req.interface_name,
                     "client_id": req.client_id,
                     "client_token": req.client_token,
+                    "include_action_reports": True,
                 },
             ):
                 if not piece:
+                    continue
+                if isinstance(piece, dict) and piece.get("type") == "actions":
+                    yield f"data: {json.dumps(piece, ensure_ascii=False)}\n\n"
                     continue
                 piece_text = str(piece)
                 full_parts.append(piece_text)
@@ -1940,6 +1942,9 @@ def process_stream(req: ProcessRequest):
                 reply_text=full_reply,
                 extra=None,
             )
+            speech_output = _process_speech_output(full_reply, req)
+            if speech_output:
+                yield f"data: {json.dumps({'type': 'speech', **speech_output}, ensure_ascii=False)}\n\n"
             yield "data: {\"type\":\"done\"}\n\n"
         except Exception as e:
             err = json.dumps(
@@ -2008,6 +2013,7 @@ if MULTIPART_AVAILABLE:
         voice_hint: Optional[str] = None,
         client_id: Optional[str] = None,
         client_token: Optional[str] = None,
+        interface_name: Optional[str] = None,
     ):
         suffix = Path(file.filename or "audio.wav").suffix or ".wav"
         tmp_path = None
@@ -2035,12 +2041,14 @@ if MULTIPART_AVAILABLE:
                     "reply": "",
                     "filtered": "self_echo",
                     "stt_engine": stt.get("engine"),
+                    "actions": proc.get("actions", []),
                 }
 
             proc = core.process(
                 user_text,
                 request_context={
                     "input_source": "voice",
+                    "interface_name": interface_name,
                     "client_id": client_id,
                     "client_token": client_token,
                 },
@@ -2057,16 +2065,16 @@ if MULTIPART_AVAILABLE:
                 "stt_engine": stt.get("engine"),
             }
 
-            if _get_speak_enabled() and reply_text:
-                tts = _synthesize_tts(text=reply_text, voice_hint=voice_hint, output_path=None)
-                response["tts"] = tts
-
             _push_gui_event(
                 source="voice",
                 input_text=user_text,
                 reply_text=reply_text,
-                extra={"stt_engine": stt.get("engine")},
+                extra={"stt_engine": stt.get("engine"), "actions": proc.get("actions", [])},
             )
+
+            if _get_speak_enabled() and reply_text:
+                tts = _synthesize_tts(text=reply_text, voice_hint=voice_hint, output_path=None)
+                response["tts"] = tts
 
             return response
         finally:

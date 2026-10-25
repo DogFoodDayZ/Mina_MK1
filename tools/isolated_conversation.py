@@ -3,8 +3,11 @@
 Run with --root pointing to a NEW disposable directory outside the repository.
 LM Studio and the configured embedding service must already be available.
 Type /quit to close memory cleanly, then reuse the same root to check continuity.
-This deliberately tests conversation without tools or background study; it does
-not change those capabilities in normal Mina.
+Use --model, --max-tokens and --context-window to match an already loaded model
+without changing normal Mina configuration or loading another model.
+Tools are disabled by default. The create_core enable_tools option uses the real
+tool loader and execution paths for explicitly authorized tool acceptance.
+Background study remains disabled; normal Mina configuration is not changed.
 """
 
 import argparse
@@ -57,7 +60,7 @@ class ConversationCore(MK1Core):
     def _maybe_rescue_chat_suggested_action(self, **kwargs):
         return None
 
-    def _run_process_tool_loop(self, messages, reply, user_intent, max_tool_loops=3):
+    def _run_process_tool_loop(self, messages, reply, user_intent, max_tool_loops=8, action_reports=None):
         text = self._extract_text(reply)
         if self._extract_tool_calls_from_text(text):
             raise RuntimeError("The model requested a tool; this is a conversation-only test.")
@@ -88,6 +91,13 @@ class ConversationCore(MK1Core):
 
     def _refresh_file_index(self, force=False):
         return None
+
+
+class ToolConversationCore(ConversationCore):
+    """Keep disposable memory/background isolation but execute model-owned tools."""
+
+    _run_process_tool_loop = MK1Core._run_process_tool_loop
+    _execute_inline_tool_calls = MK1Core._execute_inline_tool_calls
 
 
 def isolated_config(root: Path) -> MK1Config:
@@ -134,8 +144,26 @@ def isolated_config(root: Path) -> MK1Config:
     return config
 
 
-def create_core(root: Path) -> ConversationCore:
+def create_core(
+    root: Path,
+    *,
+    model: str | None = None,
+    max_tokens: int | None = None,
+    context_window: int | None = None,
+    enable_tools: bool = False,
+) -> ConversationCore:
+    if max_tokens is not None and max_tokens <= 0:
+        raise ValueError("max_tokens must be positive.")
+    if context_window is not None and context_window <= 0:
+        raise ValueError("context_window must be positive.")
     config = isolated_config(root)
+    for key, value in (
+        ("default_model", model),
+        ("max_tokens", max_tokens),
+        ("context_window", context_window),
+    ):
+        if value is not None:
+            config.data["model"][key] = value
 
     def scoped_memory(**kwargs):
         kwargs["backup_dir"] = config.get("memory", "backup_dir")
@@ -146,18 +174,26 @@ def create_core(root: Path) -> ConversationCore:
     with (
         patch.object(core_module, "load_config", return_value=config),
         patch.object(core_module, "MK1Memory", side_effect=scoped_memory),
-        patch.object(core_module, "ToolLoader", DisabledTools),
+        patch.object(core_module, "ToolLoader", core_module.ToolLoader if enable_tools else DisabledTools),
         patch.dict(os.environ, {"MK1_OBSIDIAN_VAULT": "", "MK1_REQUIRE_EMBED": "1"}),
     ):
-        core = ConversationCore()
+        core = (ToolConversationCore if enable_tools else ConversationCore)()
     return core
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, type=Path, help="New disposable directory outside the repo.")
+    parser.add_argument("--model", help="Already loaded model identifier; affects only this test.")
+    parser.add_argument("--max-tokens", type=int, help="Positive reply token cap for this test.")
+    parser.add_argument("--context-window", type=int, help="Loaded model context size for this test.")
     args = parser.parse_args()
-    core = create_core(args.root)
+    core = create_core(
+        args.root,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        context_window=args.context_window,
+    )
     print(f"ISOLATED TEST MEMORY: {core.memory.db_path}")
     print("Tools, background work, retention and vault export are disabled only in this test.")
     print("Enter /quit to stop; relaunch with the same --root to test restart continuity.")

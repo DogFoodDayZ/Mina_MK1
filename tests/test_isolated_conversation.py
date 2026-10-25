@@ -8,8 +8,11 @@ import threading
 import pytest
 
 from memory.mk1_memory import MK1Memory
+from agent.core import MK1Core
+from tools.tool_loader import ToolLoader
 from tools.isolated_conversation import (
     ConversationCore,
+    ToolConversationCore,
     DisabledTools,
     REPO_ROOT,
     create_core,
@@ -42,7 +45,8 @@ def test_isolated_config_paths_and_marker(tmp_path, monkeypatch):
         isolated_config(root)
 
 
-def test_real_memory_storage_reopens_only_inside_test_root(tmp_path, monkeypatch):
+@pytest.mark.parametrize("enable_tools", [False, True])
+def test_real_memory_storage_reopens_only_inside_test_root(tmp_path, monkeypatch, enable_tools):
     root = tmp_path / "conversation"
     real_connect = sqlite3.connect
     opened = []
@@ -64,14 +68,25 @@ def test_real_memory_storage_reopens_only_inside_test_root(tmp_path, monkeypatch
     monkeypatch.setenv("MK1_OBSIDIAN_VAULT", str(tmp_path / "forbidden-vault"))
 
     for iteration in range(2):
-        core = create_core(root)
+        core = create_core(root, model="test-loaded-model", max_tokens=512, context_window=8448, enable_tools=enable_tools)
         atexit.unregister(core.close)
         try:
+            assert core.model.max_tokens == core.config.get("model", "max_tokens")
+            assert core.model.context_window == core.config.get("model", "context_window")
+            assert core.model.request_timeout_seconds == core.config.get("model", "request_timeout_seconds")
+            assert core.model.reasoning_effort == core.config.get("model", "reasoning_effort")
+            assert core.model.default_model == "test-loaded-model"
+            assert core.model.max_tokens == 512
+            assert core.model.context_window == 8448
             assert core.memory.obsidian_vault is None
             assert Path(core.memory.backup_dir).is_relative_to(root)
             assert core._turn_clock_thread is None
             assert core.curiosity.enabled is False
-            assert core.tools.get_tool_schemas() == []
+            assert bool(core.tools.get_tool_schemas()) is enable_tools
+            if enable_tools:
+                assert isinstance(core, ToolConversationCore)
+                assert core._run_process_tool_loop.__func__ is MK1Core._run_process_tool_loop
+                assert core._execute_inline_tool_calls.__func__ is MK1Core._execute_inline_tool_calls
             if iteration == 0:
                 assert core.memory.add_memory(
                     "Remember the conversation plan.",
@@ -107,3 +122,20 @@ def test_harness_rejects_model_tool_calls_without_execution():
         )
     with pytest.raises(RuntimeError, match="disabled"):
         DisabledTools("").run("memory_write", {"text": "must not execute"})
+
+
+def test_tool_discovery_does_not_execute_non_tool_maintenance_scripts(tmp_path):
+    """Travis: 'stable memory and functiononig tool calls'."""
+    sentinel = tmp_path / "unexpected-write.txt"
+    (tmp_path / "maintenance.py").write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('side effect')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "fixture.py").write_text(
+        "def tool_entry(args):\n    return {'ok': True, 'result': args}\n",
+        encoding="utf-8",
+    )
+    loader = ToolLoader(str(tmp_path))
+    assert not sentinel.exists()
+    assert list(loader.tools) == ["fixture"]
+    assert loader.run("fixture", {"value": 42}) == {"ok": True, "result": {"value": 42}}

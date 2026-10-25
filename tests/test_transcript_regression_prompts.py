@@ -224,7 +224,7 @@ def test_shared_process_tool_executor_formats_and_captures_failure():
     assert captured["tool_name"] == "ps_run"
 
 
-def test_shared_process_tool_executor_corrects_web_fetch_for_local_hardware_question():
+def test_shared_process_tool_executor_preserves_web_fetch_for_hardware_question():
     core = _core_for_intent_tests()
     core._capture_tool_failure_for_learning = lambda **_kwargs: None
     calls = []
@@ -240,10 +240,9 @@ def test_shared_process_tool_executor_corrects_web_fetch_for_local_hardware_ques
         user_intent="What CPU and GPU are actually installed in this computer?",
     )
 
-    assert tool_name == "ps_run"
+    assert tool_name == "web_fetch"
     assert result["ok"] is True
-    assert calls[0][0] == "ps_run"
-    assert "Win32_Processor" in calls[0][1]["script"]
+    assert calls == [("web_fetch", {"url": "https://example.invalid/invented-by-model"})]
     assert "CPU: Ryzen" in message
 
 
@@ -271,7 +270,7 @@ def test_tool_call_parser_accepts_single_quoted_json_shaped_block():
     assert calls == [("ps_run", '{"script": "Get-Date"}')]
 
 
-def test_shared_process_tool_executor_maps_unknown_system_info_alias():
+def test_shared_process_tool_executor_does_not_invent_system_info_alias():
     core = _core_for_intent_tests()
     core._capture_tool_failure_for_learning = lambda **_kwargs: None
     calls = []
@@ -287,13 +286,12 @@ def test_shared_process_tool_executor_maps_unknown_system_info_alias():
         user_intent="What CPU and GPU are actually installed in this computer?",
     )
 
-    assert tool_name == "ps_run"
+    assert tool_name == "system_info"
     assert result["ok"] is True
-    assert calls[0][0] == "ps_run"
-    assert "Win32_Processor" in calls[0][1]["script"]
+    assert calls == [("system_info", {})]
 
 
-def test_shared_process_tool_executor_blocks_external_search_for_local_hardware():
+def test_shared_process_tool_executor_preserves_minas_search_choice():
     core = _core_for_intent_tests()
     core._capture_tool_failure_for_learning = lambda **_kwargs: None
     calls = []
@@ -309,11 +307,11 @@ def test_shared_process_tool_executor_blocks_external_search_for_local_hardware(
         user_intent="What CPU and GPU are actually installed in this computer?",
     )
 
-    assert tool_name == "ps_run"
-    assert calls[0][0] == "ps_run"
+    assert tool_name == "web_search"
+    assert calls == [("web_search", {"query": "invented query"})]
 
 
-def test_shared_process_tool_executor_recovers_empty_powershell_hardware_call():
+def test_shared_process_tool_executor_does_not_invent_powershell_arguments():
     core = _core_for_intent_tests()
     core._capture_tool_failure_for_learning = lambda **_kwargs: None
     calls = []
@@ -329,12 +327,12 @@ def test_shared_process_tool_executor_recovers_empty_powershell_hardware_call():
         user_intent="What CPU and GPU are actually installed in this computer?",
     )
 
-    assert tool_name == "ps_run"
+    assert tool_name == "powershell"
     assert result["ok"] is True
-    assert calls[0][0] == "ps_run"
+    assert calls == [("powershell", {})]
 
 
-def test_shared_process_tool_executor_recovers_empty_powershell_ram_followup():
+def test_shared_process_tool_executor_does_not_replace_powershell_with_memory():
     core = _core_for_intent_tests()
     core.memory = SimpleNamespace(
         search=lambda *_args, **_kwargs: [
@@ -355,12 +353,12 @@ def test_shared_process_tool_executor_recovers_empty_powershell_ram_followup():
         user_intent="Looks like we need to do something about the RAM situation.",
     )
 
-    assert tool_name == "memory_read"
+    assert tool_name == "powershell"
     assert result["ok"] is True
-    assert calls == []
+    assert calls == [("powershell", {})]
 
 
-def test_shared_process_tool_executor_recovers_empty_ps_run_ram_followup():
+def test_shared_process_tool_executor_does_not_replace_ps_run_with_memory():
     core = _core_for_intent_tests()
     core.memory = SimpleNamespace(
         search=lambda *_args, **_kwargs: [
@@ -381,10 +379,10 @@ def test_shared_process_tool_executor_recovers_empty_ps_run_ram_followup():
         user_intent="Looks like we need to do something about the RAM situation.",
     )
 
-    assert tool_name == "memory_read"
+    assert tool_name == "ps_run"
     assert result["ok"] is True
-    assert "FreePhysicalMemory" in message
-    assert calls == []
+    assert "RAM snapshot" in message
+    assert calls == [("ps_run", {})]
 
 
 def test_hardware_rescue_executes_fenced_powershell_suggestion():
@@ -408,7 +406,7 @@ def test_hardware_rescue_executes_fenced_powershell_suggestion():
     assert "Win32_Processor" in captured["user_input"]
 
 
-def test_hardware_ps_probe_is_upgraded_to_combined_cpu_gpu_query():
+def test_hardware_ps_probe_keeps_the_command_mina_actually_requested():
     core = _core_for_intent_tests()
     core._capture_tool_failure_for_learning = lambda **_kwargs: None
     calls = []
@@ -425,8 +423,7 @@ def test_hardware_ps_probe_is_upgraded_to_combined_cpu_gpu_query():
     )
 
     assert calls[0][0] == "ps_run"
-    assert "Win32_Processor" in calls[0][1]["script"]
-    assert "Win32_VideoController" in calls[0][1]["script"]
+    assert calls[0][1] == {"script": "Get-CimInstance Win32_VideoController | Select-Object Name"}
 
 
 def test_file_path_correction_supersedes_stale_directory_context(tmp_path):
@@ -519,7 +516,7 @@ def test_shared_model_tool_loop_executes_tool_and_stops_on_final_reply():
     assert reply["choices"][0]["message"]["content"] == "done"
     assert len(events) == 1
     assert calls[0][0] == "ps_run"
-    assert messages[-1]["content"] == "{'ok': True, 'result': {'stdout': 'ready'}}"
+    assert messages[-1]["content"] == "[ps_run result]\n{'ok': True, 'result': {'stdout': 'ready'}}"
 
 
 def test_shared_model_tool_loop_stops_repeated_identical_tool_reply():

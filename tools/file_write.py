@@ -1,4 +1,6 @@
 import ast
+import difflib
+import hashlib
 import os
 import sys
 from typing import Any, Dict
@@ -10,6 +12,40 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from tools.file_access_policy import authorize_write_paths, normalize_tool_path
+from tools.python_syntax import inspect_python_syntax
+
+
+def _change_evidence(before: bytes | None, after: bytes) -> Dict[str, Any]:
+    evidence: Dict[str, Any] = {
+        "before_sha256": hashlib.sha256(before).hexdigest() if before is not None else None,
+        "after_sha256": hashlib.sha256(after).hexdigest(),
+        "source": "actual pre-write and read-back bytes",
+    }
+    try:
+        old = (before or b"").decode("utf-8-sig").replace("\r\n", "\n")
+        new = after.decode("utf-8-sig").replace("\r\n", "\n")
+    except UnicodeDecodeError:
+        return {**evidence, "diff_available": False,
+                "reason": "Previous content is not UTF-8; byte hashes do not establish a textual diagnosis."}
+    limit = 3000
+    chunks = []
+    length = 0
+    truncated = False
+    for line in difflib.unified_diff(
+        old.splitlines(), new.splitlines(), fromfile="before", tofile="saved", n=2, lineterm="",
+    ):
+        piece = line + "\n"
+        remaining = limit - length
+        chunks.append(piece[:remaining])
+        length += min(len(piece), remaining)
+        if len(piece) > remaining:
+            truncated = True
+            break
+    return {
+        **evidence, "diff_available": True, "unified_diff": "".join(chunks), "truncated": truncated,
+        "before_final_newline": old.endswith("\n"), "after_final_newline": new.endswith("\n"),
+        "note": "UTF-8 text diff normalizes CRLF; hashes identify exact bytes. A diff is not a diagnosis.",
+    }
 
 
 def _normalize_write_content(content: Any) -> str:
@@ -31,6 +67,8 @@ def file_write_impl(
     overwrite: bool = True,
     authorized_write: bool = False,
     auth_token: str = "",
+    expected_sha256: str = "",
+    python_syntax_evidence: bool = False,
 ) -> Dict[str, Any]:
     try:
         # Reject empty paths early
@@ -51,6 +89,13 @@ def file_write_impl(
         if not allowed:
             return {"ok": False, "result": None, "error": error}
 
+        previous_bytes = Path(path).read_bytes() if os.path.isfile(path) else None
+        if expected_sha256 and (
+            previous_bytes is None or hashlib.sha256(previous_bytes).hexdigest() != expected_sha256
+        ):
+            return {"ok": False, "result": {"written": False, "path": path},
+                    "error": "file_write_source_changed"}
+
         # Ensure parent directory exists
         parent = os.path.dirname(path)
         if parent and not os.path.isdir(parent):
@@ -69,9 +114,31 @@ def file_write_impl(
         with open(path, "w", encoding="utf-8") as f:
             f.write(normalized_content)
 
+        with open(path, "rb") as f:
+            written_bytes = f.read()
+        actual_content = written_bytes.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        if actual_content != normalized_content.replace("\r\n", "\n").replace("\r", "\n"):
+            return {"ok": False, "result": {"written": True, "path": path},
+                    "error": "file_write_verification_failed"}
+        change_evidence = _change_evidence(previous_bytes, written_bytes)
+        if python_syntax_evidence and Path(path).suffix.lower() == ".py":
+            change_evidence["python_syntax_check"] = {
+                "before": inspect_python_syntax(previous_bytes, path) if previous_bytes is not None else None,
+                "saved": inspect_python_syntax(written_bytes, path),
+            }
         return {
             "ok": True,
-            "result": {"written": True, "path": path},
+            "result": {
+                "written": True, "path": path,
+                "changed": previous_bytes != written_bytes,
+                "change_evidence": change_evidence,
+                "verification": {
+                    "exists": True, "content_matches": True,
+                    "sha256": hashlib.sha256(written_bytes).hexdigest(),
+                    "bytes": len(written_bytes),
+                    "first_line": actual_content.splitlines()[0][:160] if actual_content else "",
+                },
+            },
             "error": None
         }
 
@@ -90,6 +157,8 @@ def tool_entry(args: Dict[str, Any]) -> Dict[str, Any]:
         overwrite=overwrite,
         authorized_write=authorized_write,
         auth_token=auth_token,
+        expected_sha256=args.get("expected_sha256", ""),
+        python_syntax_evidence=args.get("_python_syntax_evidence") is True,
     )
 
 
@@ -110,6 +179,10 @@ tool_entry.schema = {
                 "type": "boolean",
                 "description": "Whether to overwrite existing files.",
                 "default": True,
+            },
+            "expected_sha256": {
+                "type": "string",
+                "description": "Optional expected current file SHA-256; reject stale edits before writing.",
             },
             "authorized_write": {
                 "type": "boolean",

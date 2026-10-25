@@ -31,6 +31,7 @@ from pathlib import Path
 import requests
 import sounddevice as sd
 import soundfile as sf
+from agent.voice_playback import playback_active, speaker_guard
 
 
 def clean_text(text: str) -> str:
@@ -56,7 +57,7 @@ def play_audio_windows(path: str) -> None:
     if ff.returncode == 0:
         subprocess.run(
             ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", path],
-            check=False,
+            check=True,
         )
         return
 
@@ -68,21 +69,16 @@ def play_audio_windows(path: str) -> None:
         mci(f"close {alias}", None, 0, None)
         open_cmd = f'open "{safe_path}" alias {alias}'
         if mci(open_cmd, None, 0, None) == 0:
-            mci(f"play {alias} wait", None, 0, None)
-            mci(f"close {alias}", None, 0, None)
+            try:
+                error = mci(f"play {alias} wait", None, 0, None)
+                if error:
+                    raise RuntimeError(f"MCI playback failed: {error}")
+            finally:
+                mci(f"close {alias}", None, 0, None)
             return
-    except Exception:
-        pass
-
-    subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            f"Start-Process '{path}'",
-        ],
-        check=False,
-    )
+    except (AttributeError, OSError) as error:
+        raise RuntimeError(f"Blocking audio playback unavailable: {error}") from error
+    raise RuntimeError("Blocking audio playback unavailable: MCI could not open audio")
 
 
 def record_to_wav(seconds: int, sample_rate: int, input_device: int | None) -> str:
@@ -217,7 +213,8 @@ def _handle_voice_result(out: dict, privacy_file: str | None = None) -> None:
         if os.path.exists(audio_path):
             _touch_privacy_file(privacy_file)
             try:
-                play_audio_windows(audio_path)
+                with speaker_guard():
+                    play_audio_windows(audio_path)
                 time.sleep(2.0)
             finally:
                 _remove_privacy_file(privacy_file)
@@ -294,8 +291,13 @@ def run_continuous_loop(args) -> int:
         last_metrics_post = 0.0
 
         while True:
-            muted = _is_privacy_enabled(effective_privacy_file, args.privacy_env)
+            muted = (
+                _is_privacy_enabled(effective_privacy_file, args.privacy_env)
+                or playback_active()
+            )
             if muted:
+                if stream.active:
+                    stream.abort()
                 if not was_muted:
                     print("[privacy] capture muted")
                     was_muted = True
@@ -309,8 +311,10 @@ def run_continuous_loop(args) -> int:
                 print("[privacy] capture resumed")
                 was_muted = False
 
+            if not stream.active:
+                stream.start()
             chunk, overflowed = stream.read(frame_samples)
-            if overflowed:
+            if overflowed or playback_active():
                 continue
 
             rms = float(np.sqrt((chunk * chunk).mean()))
@@ -361,6 +365,7 @@ def run_continuous_loop(args) -> int:
                     if voiced_count >= min_voice_chunks and frames:
                         audio = np.concatenate(frames, axis=0)
                         print("Sending to Mina...")
+                        stream.abort()
                         _send_audio_to_mina(audio=audio, sr=args.sr, args=args)
                     capturing = False
                     frames = []

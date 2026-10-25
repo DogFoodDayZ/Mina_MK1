@@ -1,4 +1,5 @@
 import base64
+import codecs
 import csv
 import mimetypes
 import os
@@ -8,6 +9,8 @@ import struct
 import wave
 import zipfile
 from typing import Any, Dict, Optional
+
+from tools.python_syntax import inspect_python_syntax
 
 try:
     from charset_normalizer import from_bytes as charset_from_bytes
@@ -80,11 +83,22 @@ def _looks_binary(raw: bytes, path: str) -> bool:
     return sample > 0 and (suspicious / float(sample)) > 0.30
 
 
+def _text_encoding_metadata(raw: bytes, decoder: str) -> Dict[str, Any]:
+    bom = next((
+        name for signature, name in (
+            (codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be"),
+            (codecs.BOM_UTF8, "utf-8"), (codecs.BOM_UTF16_LE, "utf-16-le"),
+            (codecs.BOM_UTF16_BE, "utf-16-be"),
+        ) if raw.startswith(signature)
+    ), None)
+    return {"encoding": decoder, "decoder_used": decoder, "bom": bom}
+
+
 def _decode_text_bytes(raw: bytes) -> Dict[str, Any]:
     if not raw:
         return {"ok": True, "text": "", "encoding": "utf-8", "error": None}
 
-    direct_encodings = ["utf-8-sig"]
+    direct_encodings = ["utf-8-sig" if raw.startswith(codecs.BOM_UTF8) else "utf-8"]
     for encoding in direct_encodings:
         try:
             text = raw.decode(encoding)
@@ -311,7 +325,7 @@ def _inspect_csv_tsv(path: str, raw: bytes, delimiter: str, max_chars: Optional[
         "ok": True,
         "result": {
             "content": shrunk["content"],
-            "encoding": decoded.get("encoding"),
+            **_text_encoding_metadata(raw, decoded["encoding"]),
             "is_text": True,
             "kind": "tabular_text",
             "size": os.path.getsize(path),
@@ -641,7 +655,9 @@ def _inspect_mp4(path: str, raw: bytes, max_chars: Optional[int]) -> Optional[Di
     }
 
 
-def inspect_file(path: str, max_chars: Optional[int] = None) -> Dict[str, Any]:
+def inspect_file(
+    path: str, max_chars: Optional[int] = None, *, python_syntax_evidence: bool = False,
+) -> Dict[str, Any]:
     if not os.path.isfile(path):
         return {"ok": False, "result": None, "error": f"file_not_found: {path}"}
 
@@ -705,11 +721,13 @@ def inspect_file(path: str, max_chars: Optional[int] = None) -> Dict[str, Any]:
                 "ok": True,
                 "result": {
                     "content": shrunk["content"],
-                    "encoding": decoded.get("encoding"),
+                    **_text_encoding_metadata(raw, decoded["encoding"]),
                     "is_text": True,
                     "kind": "structured_text" if ext in STRUCTURED_TEXT_EXTENSIONS else "text",
                     "size": size,
                     "truncated": shrunk["truncated"],
+                    **({"python_syntax_check": inspect_python_syntax(raw, path)}
+                       if python_syntax_evidence and ext == ".py" else {}),
                 },
                 "error": None,
             }
